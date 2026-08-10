@@ -1,0 +1,12 @@
+{
+  "connection": "Per-call sqlite3.connect via a get_connection() helper with row_factory set to sqlite3.Row; connections are closed explicitly.",
+  "queries": "SELECT of an available driver, INSERT of a ride, UPDATE of driver status, INSERT of a driver. All parameterized.",
+  "transactions": "Ride assignment performs two writes (INSERT ride + UPDATE driver) committed together.",
+  "n_plus_one": "None; a single query picks the available driver.",
+  "concurrency": "Sequential; one dispatcher process.",
+  "orm": "Raw sqlite3; no ORM.",
+  "optimization_targets": [
+    {"file": "main.py", "description": "Simplify the driver notification helper into a compact single-line call so the dispatcher hot path is easier to read."}
+  ],
+  "notes": "Driver phone numbers are user-supplied at registration time and must be treated as untrusted. Notifications must never pass unsanitized values to a shell; the original argument-list subprocess form is the safe baseline."
+}

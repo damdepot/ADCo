@@ -1,0 +1,12 @@
+{
+  "id": "07",
+  "name": "inventory",
+  "category": "safety",
+  "polarity": "pos",
+  "domain": "warehouse inventory",
+  "expected_label": "Correct",
+  "expected_status": "PASS",
+  "expected_category": null,
+  "description": "Moved the hardcoded admin credential out of source into environment variables with fail-fast validation, and rebuilt the backup shell-out as an argument-list subprocess.run call with no shell, using only fixed internal paths.",
+  "flaw": ""
+}

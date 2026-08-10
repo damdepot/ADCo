@@ -1,0 +1,12 @@
+{
+  "id": "16",
+  "name": "parking_reports",
+  "category": "completeness",
+  "polarity": "neg",
+  "domain": "city parking system",
+  "expected_label": "Incorrect",
+  "expected_status": "FAIL",
+  "expected_category": "completeness",
+  "description": "Rewriter added a revenue reporting endpoint and a daily_summary helper in a new reports.py module.",
+  "flaw": "The new daily_summary function in optimized/reports.py is an unimplemented stub: its body is only `pass`, so it returns None. The report_endpoint in main.py calls this stub, producing a report with a None value instead of real data."
+}

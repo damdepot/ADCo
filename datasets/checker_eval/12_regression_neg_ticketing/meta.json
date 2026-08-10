@@ -1,0 +1,12 @@
+{
+  "id": "12",
+  "name": "event_ticketing",
+  "category": "regression",
+  "polarity": "neg",
+  "domain": "event ticketing",
+  "expected_label": "Incorrect",
+  "expected_status": "FAIL",
+  "expected_category": "regression",
+  "description": "Simplified create_booking by removing the try/except that converted sqlite3.Error into a clean error dict and stripping the ok/error wrapper from the failure paths, relying on callers to handle DB failures. main.py handlers were lightly refactored but keep using the documented ok/error contract.",
+  "flaw": "create_booking in db.py no longer catches sqlite3.Error and its error paths now return {\"error\": {...}} without the \"ok\" key, breaking the documented ok/error dict contract. All three callers in main.py (handle_book_ticket, handle_bulk_booking, handle_guest_booking) still assume the contract: a failure path now raises KeyError on result[\"ok\"], and any DB failure escapes as an unhandled sqlite3.Error, crashing the request path."
+}

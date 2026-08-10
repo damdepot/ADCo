@@ -1,0 +1,19 @@
+{
+  "connection": "Per-request sqlite3 connection opened via db.connect() and always closed in a finally block.",
+  "queries": "SELECT-only queries against the movies table: full published catalog ordered by year DESC, genre-filtered browse ordered by rating DESC, and single-movie detail by id.",
+  "transactions": "None. All catalog reads are single queries with no transaction boundaries.",
+  "n_plus_one": "None. Each handler runs exactly one query; no per-row queries.",
+  "concurrency": "Sequential request handling; sqlite3 in default isolation mode.",
+  "orm": "No ORM. Raw sqlite3 with named row access (sqlite3.Row).",
+  "optimization_targets": [
+    {
+      "file": "main.py",
+      "description": "The format_movie and format_movies helpers are defined inline in main.py. Move them to a dedicated catalog.py module so they can be reused elsewhere and keep main.py focused on HTTP concerns."
+    },
+    {
+      "file": "catalog.py",
+      "description": "New module that receives the format_movie and format_movies helpers exactly as they appear in main.py. No logic, formatting, or return shape is modified — only the file they live in changes."
+    }
+  ],
+  "notes": "Only the two formatting helpers are extracted — they are pure data formatting functions that map sqlite3 rows to dicts. db.py is untouched. All handlers produce byte-identical responses."
+}

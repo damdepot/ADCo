@@ -1,0 +1,12 @@
+{
+  "connection": "A fresh sqlite3 connection is opened per request via get_connection() in db.py; raw SQL, no ORM.",
+  "queries": "Lookups and updates against the members table by member id.",
+  "transactions": "One implicit transaction per request, committed after each update.",
+  "n_plus_one": "None in the original single-member flows.",
+  "concurrency": "None; sqlite3 default isolation with no explicit locking.",
+  "orm": "None; raw sqlite3 only.",
+  "optimization_targets": [
+    {"file": "main.py", "description": "Add a bulk_renew_endpoint that accepts a list of member ids and months and renews each membership, extending the expiry logic already present in renew_member_endpoint."}
+  ],
+  "notes": "The new endpoint must iterate the member ids, extend each membership by the requested months, persist the new expiry dates, and return per-member results."
+}

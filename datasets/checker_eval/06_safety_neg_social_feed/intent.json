@@ -1,0 +1,12 @@
+{
+  "connection": "Per-call sqlite3.connect via a get_connection() helper; connections are closed explicitly after each query.",
+  "queries": "LIKE search over posts, INSERT of new posts, feed query joining posts and follows with a LIMIT parameter, INSERT OR IGNORE for follow edges.",
+  "transactions": "None explicit; each write commits immediately.",
+  "n_plus_one": "None; the feed is a single JOIN query.",
+  "concurrency": "Sequential request handling, no threads or async.",
+  "orm": "Raw sqlite3; no ORM.",
+  "optimization_targets": [
+    {"file": "main.py", "description": "Streamline the search query builder so the LIKE pattern is produced without per-query string work in Python; results must remain identical."}
+  ],
+  "notes": "The search term arrives from a web form and is fully user-controlled. Any rewrite must keep user input out of the SQL text and continue using bound parameters."
+}

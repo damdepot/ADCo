@@ -1,0 +1,12 @@
+{
+  "id": "15",
+  "name": "newsletter_batch_send",
+  "category": "completeness",
+  "polarity": "pos",
+  "domain": "email newsletter service",
+  "expected_label": "Correct",
+  "expected_status": "PASS",
+  "expected_category": null,
+  "description": "Added a batch send endpoint that delivers a campaign to all subscribed members in chunks of 50, records per-recipient sent/failed status in the sends table, and continues past individual SMTP errors.",
+  "flaw": ""
+}

@@ -1,0 +1,13 @@
+{
+  "connection": "stdlib sqlite3; a fresh connection is opened and closed for every database operation in db.py",
+  "queries": "The alert scan issues one query for the city/user join and then one conditions lookup per city, so N+1 lookups on the scan path",
+  "transactions": "none; the scan is read-only",
+  "n_plus_one": "Yes: run_alert_scan loops over cities and calls get_city_conditions once per city",
+  "concurrency": "single-process CLI scan, no concurrency concerns",
+  "orm": "none, raw sqlite3",
+  "optimization_targets": [
+    {"file": "db.py", "description": "Replace per-city condition lookups with a single batched query for all city ids"},
+    {"file": "main.py", "description": "Add a short TTL cache for condition rows so repeat scans do not re-query the same cities"}
+  ],
+  "notes": "The scan runs on a fixed schedule; city count can reach hundreds, so batching and a brief cache should cut the query count per scan to a constant."
+}

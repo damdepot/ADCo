@@ -1,0 +1,12 @@
+{
+  "id": "14",
+  "name": "gym_bulk_renew",
+  "category": "completeness",
+  "polarity": "neg",
+  "domain": "gym membership service",
+  "expected_label": "Incorrect",
+  "expected_status": "FAIL",
+  "expected_category": "completeness",
+  "description": "Rewriter added a bulk membership renewal endpoint meant to renew multiple members in a single request.",
+  "flaw": "The new bulk_renew_endpoint in optimized/main.py is an unimplemented stub: its body only raises NotImplementedError, so the advertised bulk renewal feature does nothing and would crash when called."
+}

@@ -1,0 +1,12 @@
+{
+  "id": "17",
+  "name": "weather_alert_service",
+  "category": "performance_regression",
+  "polarity": "pos",
+  "domain": "weather alert service",
+  "expected_label": "Correct",
+  "expected_status": "PASS",
+  "expected_category": null,
+  "description": "The alert scan previously fetched the latest weather conditions with one query per city. The rewrite batches all condition lookups into a single query and adds a small 60-second time-based cache on top, without changing behavior.",
+  "flaw": ""
+}

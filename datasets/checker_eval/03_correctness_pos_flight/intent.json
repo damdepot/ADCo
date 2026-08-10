@@ -1,0 +1,19 @@
+{
+  "connection": "per-call sqlite3.connect via get_connection() helper (sqlite3 stdlib)",
+  "queries": "availability query on flights (route, date, seats_available) plus one price lookup per flight executed inside a loop",
+  "transactions": "read-only queries, no transactions",
+  "n_plus_one": "yes: one price query per available flight inside the loop in search_flights",
+  "concurrency": "sequential, single-process HTTP-style handlers",
+  "orm": "raw SQL with sqlite3",
+  "optimization_targets": [
+    {
+      "file": "main.py",
+      "description": "Replace the availability query plus per-flight price lookups with a single JOIN of flights and prices so one round trip returns all data"
+    },
+    {
+      "file": "db.py",
+      "description": "Add an index on (origin, destination, flight_date) to support the search WHERE clause"
+    }
+  ],
+  "notes": "Flights without a price row must still be excluded, results must be ordered by departure time, and the lowest-fare helper must return the same fare or None"
+}

@@ -1,0 +1,12 @@
+{
+  "id": "03",
+  "name": "flight_booking_search",
+  "category": "correctness",
+  "polarity": "pos",
+  "domain": "flight booking search",
+  "expected_label": "Correct",
+  "expected_status": "PASS",
+  "expected_category": null,
+  "description": "The availability query plus per-flight price lookups were replaced by a single JOIN of flights and prices with the same WHERE conditions, ordering, and price-row exclusion, and an index was added on (origin, destination, flight_date).",
+  "flaw": ""
+}

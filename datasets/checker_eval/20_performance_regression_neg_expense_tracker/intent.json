@@ -1,0 +1,13 @@
+{
+  "connection": "stdlib sqlite3; a fresh connection per helper call",
+  "queries": "Rates are read via fetch_latest_rate; conversions hit the cache first and only fall back to the table on a miss or expiry",
+  "transactions": "rate seeding inserts with a single commit each",
+  "n_plus_one": "No: conversions reuse the cached rate within the TTL window",
+  "concurrency": "single-process CLI, no shared mutable state beyond the cache",
+  "orm": "none, raw sqlite3",
+  "optimization_targets": [
+    {"file": "db.py", "description": "Preserve the TTL cache for exchange rates so repeated conversions of the same pair stay in memory"},
+    {"file": "main.py", "description": "Keep get_rate cache-first so report generation does not re-query rates per expense row"}
+  ],
+  "notes": "Monthly reports can contain thousands of expense rows across a handful of currency pairs; the intended optimization is to guarantee at most one lookup per pair per report."
+}

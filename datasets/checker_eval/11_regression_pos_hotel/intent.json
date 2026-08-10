@@ -1,0 +1,19 @@
+{
+  "connection": "Per-request sqlite3 connection opened via get_connection() and always closed in a finally block.",
+  "queries": "SELECT COUNT(*) to check whether a room is already booked for a date, INSERT for creating bookings.",
+  "transactions": "Single INSERT with explicit commit.",
+  "n_plus_one": "None.",
+  "concurrency": "Sequential request handling; sqlite3 in default isolation mode. The schema's UNIQUE(room_id, booking_date) constraint backstops concurrent duplicate bookings.",
+  "orm": "No ORM. Raw sqlite3 with named row access (sqlite3.Row).",
+  "optimization_targets": [
+    {
+      "file": "main.py",
+      "description": "The format_reservation helper is defined inline in main.py. Move it to a dedicated reservation_utils.py module so it can be reused by other handlers and keep main.py focused on the booking logic."
+    },
+    {
+      "file": "reservation_utils.py",
+      "description": "New module that receives the format_reservation helper exactly as it appears in main.py. No logic, formatting, or return shape is modified — only the file it lives in changes."
+    }
+  ],
+  "notes": "Only format_reservation is extracted — it is a pure data formatting function that maps the booking fields to a dict. db.py is untouched. The handler produces byte-identical responses."
+}

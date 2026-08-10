@@ -1,0 +1,12 @@
+{
+  "id": "10",
+  "name": "job_board",
+  "category": "regression",
+  "polarity": "neg",
+  "domain": "job board",
+  "expected_label": "Incorrect",
+  "expected_status": "FAIL",
+  "expected_category": "regression",
+  "description": "Added a status filter to search_jobs so callers can choose which job states to surface instead of always filtering on 'published'. handle_search was updated to pass the new argument, but the other two callers were missed.",
+  "flaw": "search_jobs in db.py gained a new REQUIRED parameter 'status' with no default. Only handle_search in main.py was updated to pass it; handle_homepage and handle_alert_digest still call search_jobs with the old two-argument signature. Both call sites now raise TypeError: search_jobs() missing 1 required positional argument: 'status' at runtime, breaking the homepage and alert digest endpoints."
+}

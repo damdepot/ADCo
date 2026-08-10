@@ -1,0 +1,12 @@
+{
+  "id": "20",
+  "name": "expense_tracker",
+  "category": "performance_regression",
+  "polarity": "neg",
+  "domain": "expense tracker",
+  "expected_label": "Incorrect",
+  "expected_status": "FAIL",
+  "expected_category": "performance_regression",
+  "description": "The rewrite removes the hourly exchange-rate cache, so every conversion runs a fresh exchange_rates lookup, including repeated lookups for the same currency pair inside the report loop.",
+  "flaw": "The ExchangeRateCache class and the rate_cache instance were deleted from db.py, and get_rate in main.py no longer consults any cache: every conversion calls fetch_latest_rate, and handle_report issues one DB query per expense row, so a report over thousands of entries repeats identical lookups for the same pairs."
+}

@@ -1,0 +1,12 @@
+{
+  "connection": "A fresh sqlite3 connection is opened per request via get_connection() in db.py; raw SQL, no ORM.",
+  "queries": "Lookup of a single subscriber by email, inserts into the sends table.",
+  "transactions": "One implicit transaction per request, committed after the send record is inserted.",
+  "n_plus_one": "None in the original single-subscriber flow.",
+  "concurrency": "None; smtplib sends are sequential.",
+  "orm": "None; raw sqlite3 only.",
+  "optimization_targets": [
+    {"file": "main.py", "description": "Add a send_batch_endpoint that selects all subscribed members and sends the campaign to each one in chunks of 50, recording sent/failed status per recipient and tolerating individual SMTP failures."}
+  ],
+  "notes": "The new endpoint must fully implement chunking, per-recipient status tracking in the sends table, and error handling so one failed send does not stop the campaign."
+}

@@ -1,0 +1,12 @@
+{
+  "id": "08",
+  "name": "ride_sharing",
+  "category": "safety",
+  "polarity": "neg",
+  "domain": "ride-sharing dispatch",
+  "expected_label": "Incorrect",
+  "expected_status": "FAIL",
+  "expected_category": "safety",
+  "description": "The rewriter collapsed the driver notification helper into a one-line os.system call, building the shell command string from the driver's phone number.",
+  "flaw": "Command injection in notify_driver (optimized/main.py, line 32): the safe argument-list subprocess.run was replaced with os.system('sms_send ' + driver_phone + ' ' + message), interpolating the user-supplied driver phone number (collected at driver registration) into a shell command string. A phone value such as '555-0100; rm -rf /' executes arbitrary commands on the dispatcher host. Severity critical."
+}

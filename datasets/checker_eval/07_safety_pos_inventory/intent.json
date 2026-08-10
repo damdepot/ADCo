@@ -1,0 +1,13 @@
+{
+  "connection": "Direct sqlite3.connect(config.DB_PATH) per operation, closed manually after each call.",
+  "queries": "Parameterized upsert on stock (sku, quantity), SELECT for stock level, COUNT aggregations for the admin report.",
+  "transactions": "None explicit; single-statement writes commit per call.",
+  "n_plus_one": "None.",
+  "concurrency": "Sequential, single process.",
+  "orm": "Raw sqlite3; no ORM.",
+  "optimization_targets": [
+    {"file": "config.py", "description": "Move the hardcoded admin credential out of source control and load it from the environment with fail-fast validation at import time."},
+    {"file": "main.py", "description": "Rebuild the backup shell-out as an argument-list subprocess call with no shell so fixed internal paths cannot be mangled by shell quoting rules."}
+  ],
+  "notes": "The backup command targets fixed internal paths only and never includes user input; that property must be preserved. The admin key is compared against the configured secret before any audit data is returned."
+}

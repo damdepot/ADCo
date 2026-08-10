@@ -1,0 +1,12 @@
+{
+  "id": "05",
+  "name": "blogging_cms",
+  "category": "safety",
+  "polarity": "pos",
+  "domain": "blogging CMS",
+  "expected_label": "Correct",
+  "expected_status": "PASS",
+  "expected_category": null,
+  "description": "Parameterized every SQL query in the blog handlers, replacing f-string interpolation of handler arguments with bound parameters, and centralized connection handling in a context-managed helper that always commits and closes.",
+  "flaw": ""
+}

@@ -1,0 +1,15 @@
+{
+  "connection": "per-call sqlite3.connect via get_connection() helper (sqlite3 stdlib)",
+  "queries": "INSERT INTO orders; per-item INSERT INTO order_items executed inside a loop; SELECT COUNT(*) for the customer's total order count",
+  "transactions": "single transaction per checkout via conn.commit() after the inserts",
+  "n_plus_one": "yes: N separate item inserts for N items, plus a separate count query right after the order insert",
+  "concurrency": "sequential, single-process HTTP-style handlers",
+  "orm": "raw SQL with sqlite3",
+  "optimization_targets": [
+    {
+      "file": "main.py",
+      "description": "Replace the loop of per-item INSERTs with a single batched executemany insert; keep the customer order-count lookup as a separate query"
+    }
+  ],
+  "notes": "Checkout must keep the order status, item rows, returned order id, and customer total order count identical to the original behavior"
+}

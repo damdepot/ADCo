@@ -1,0 +1,12 @@
+{
+  "id": "04",
+  "name": "food_delivery_order_stats",
+  "category": "correctness",
+  "polarity": "neg",
+  "domain": "food delivery order stats",
+  "expected_label": "Incorrect",
+  "expected_status": "FAIL",
+  "expected_category": "correctness",
+  "description": "The Python loop that summed item totals per order was replaced by a single SQL aggregation query to cut data transfer and memory usage.",
+  "flaw": "The aggregation query in optimized/main.py is missing 'GROUP BY oi.order_id'. With SUM() but no GROUP BY, SQLite collapses every matching row into a single row: all orders' items are summed together and the total is keyed to one arbitrary order id, so every order's total is wrong and most orders are missing from the result."
+}

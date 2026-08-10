@@ -1,0 +1,12 @@
+{
+  "id": "01",
+  "name": "ecommerce_checkout",
+  "category": "correctness",
+  "polarity": "pos",
+  "domain": "e-commerce checkout",
+  "expected_label": "Correct",
+  "expected_status": "PASS",
+  "expected_category": null,
+  "description": "The per-item INSERT loop in create_order was replaced by a single batched executemany insert. The customer order-count lookup is preserved as a separate query to avoid introducing complex query patterns. Order status, insertion order, and the returned order id and count are preserved.",
+  "flaw": ""
+}

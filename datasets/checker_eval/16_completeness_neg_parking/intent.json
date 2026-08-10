@@ -1,0 +1,13 @@
+{
+  "connection": "A fresh sqlite3 connection is opened per request via get_connection() in db.py; raw SQL, no ORM.",
+  "queries": "Insert of a parking session at check-in, lookup of a session by id and update of exit_time and fee at check-out, select all sessions for the report endpoint.",
+  "transactions": "One implicit transaction per request, committed explicitly.",
+  "n_plus_one": "None in the original check-in/check-out flows; the report endpoint fetches all sessions in one query.",
+  "concurrency": "None; sqlite3 default isolation with no explicit locking.",
+  "orm": "None; raw sqlite3 only.",
+  "optimization_targets": [
+    {"file": "reports.py", "description": "Add a new daily_summary helper that aggregates parking sessions into a revenue summary."},
+    {"file": "main.py", "description": "Add a new report_endpoint that calls daily_summary and returns the aggregated report."}
+  ],
+  "notes": "The daily_summary function must be fully implemented before deployment — leaving it as a stub will cause the report endpoint to return invalid data."
+}

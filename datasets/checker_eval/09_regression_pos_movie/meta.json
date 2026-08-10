@@ -1,0 +1,12 @@
+{
+  "id": "09",
+  "name": "movie_streaming",
+  "category": "regression",
+  "polarity": "pos",
+  "domain": "movie streaming catalog",
+  "expected_label": "Correct",
+  "expected_status": "PASS",
+  "expected_category": null,
+  "description": "Extracted the format_movie and format_movies helpers from main.py into a new catalog.py module. Both functions are byte-for-byte identical — only their module location changed. All handlers produce byte-identical responses with the same signatures, same return types, same error codes, and same connection lifecycle. db.py is untouched.",
+  "flaw": ""
+}

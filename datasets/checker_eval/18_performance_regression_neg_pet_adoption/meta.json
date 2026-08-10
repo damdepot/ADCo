@@ -1,0 +1,12 @@
+{
+  "id": "18",
+  "name": "pet_adoption_listings",
+  "category": "performance_regression",
+  "polarity": "neg",
+  "domain": "pet adoption listings",
+  "expected_label": "Incorrect",
+  "expected_status": "FAIL",
+  "expected_category": "performance_regression",
+  "description": "The rewrite splits the listings query into a base listings query plus a shelter lookup per row, introducing an N+1 query pattern on the hot listings endpoint.",
+  "flaw": "The rewrite replaced the single JOIN query with a per-row get_shelter_by_id call inside the response-building loop of handle_listings (optimized/main.py, the 'for row in rows' loop near line 10). With up to 200 listings this issues 1 + N queries instead of 1, an N+1 regression on the hot path."
+}

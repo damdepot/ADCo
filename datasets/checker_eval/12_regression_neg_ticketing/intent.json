@@ -1,0 +1,19 @@
+{
+  "connection": "Per-request sqlite3 connection via db.connect(), closed in a finally block.",
+  "queries": "Availability and price lookup on events, INSERT into bookings, and a decrement UPDATE on events.available.",
+  "transactions": "Manual commit after the INSERT + UPDATE pair; no rollback handling.",
+  "n_plus_one": "None.",
+  "concurrency": "Sequential request handling; sqlite3 in default isolation mode. Busy/locked databases are possible under concurrent write load.",
+  "orm": "No ORM. Raw sqlite3 with tuple row access.",
+  "optimization_targets": [
+    {
+      "file": "db.py",
+      "description": "create_booking wraps its whole body in a try/except that converts sqlite3.Error into a clean error dict and wraps every failure in an ok/error dict. Simplify the helper: drop the except clause so DB failures surface to the caller, and return the error dict directly on the failure paths."
+    },
+    {
+      "file": "main.py",
+      "description": "Extract the per-item response mapping in handle_bulk_booking into a small shared helper so the handler code stays tidy. The ok/error handling of all three callers is otherwise unchanged."
+    }
+  ],
+  "notes": "The ok/error contract is documented in create_booking's docstring and assumed by every caller in main.py; the simplified failure paths and raised sqlite3.Error break that contract."
+}

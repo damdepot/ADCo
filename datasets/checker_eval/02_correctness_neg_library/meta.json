@@ -1,0 +1,12 @@
+{
+  "id": "02",
+  "name": "library_catalog_search",
+  "category": "correctness",
+  "polarity": "neg",
+  "domain": "library catalog search",
+  "expected_label": "Incorrect",
+  "expected_status": "FAIL",
+  "expected_category": "correctness",
+  "description": "The optional category and max-price filters were pushed from Python into the SQL WHERE clause so the database returns only matching rows instead of filtering after the fetch.",
+  "flaw": "The max-price condition is inverted in optimized/main.py: the rewritten query uses 'unit_price_cents >= ?' where the original semantics require rows priced at or below the limit (the original skips rows with unit_price_cents > max_price_cents). The search returns books priced above the requested maximum instead of at or below it, so the result set is wrong whenever a max price is supplied."
+}

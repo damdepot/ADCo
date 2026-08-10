@@ -1,0 +1,15 @@
+{
+  "connection": "per-call sqlite3.connect via get_connection() helper (sqlite3 stdlib)",
+  "queries": "SELECT * FROM books with a title LIKE filter, then optional category and max-price filters applied in Python after fetching",
+  "transactions": "read-only queries, no transactions",
+  "n_plus_one": "none: single candidate query plus in-memory filtering",
+  "concurrency": "sequential, single-process HTTP-style handlers",
+  "orm": "raw SQL with sqlite3",
+  "optimization_targets": [
+    {
+      "file": "main.py",
+      "description": "Push the optional category and max-price filters into the SQL WHERE clause so the database returns only matching rows instead of filtering in Python"
+    }
+  ],
+  "notes": "Search results must keep title match, optional category equality, price at most the given maximum, and descending publication-date ordering"
+}

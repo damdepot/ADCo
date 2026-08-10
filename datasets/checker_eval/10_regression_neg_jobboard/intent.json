@@ -1,0 +1,19 @@
+{
+  "connection": "Per-request sqlite3 connection opened inside search_jobs and always closed in a finally block.",
+  "queries": "Single SELECT against the jobs table filtered by keyword (title/description LIKE), location LIKE and a status parameter, ordered by posted_at DESC.",
+  "transactions": "None. Read-only searches.",
+  "n_plus_one": "None. One query per search call; handle_alert_digest loops over saved alerts with one query each by design.",
+  "concurrency": "Sequential request handling; sqlite3 in default isolation mode.",
+  "orm": "No ORM. Raw sqlite3 with tuple row access.",
+  "optimization_targets": [
+    {
+      "file": "db.py",
+      "description": "search_jobs(term, location) always filters on status = 'published' hard-coded in SQL. Add a status parameter so callers can choose which job states to surface."
+    },
+    {
+      "file": "main.py",
+      "description": "Update every call site to pass the status explicitly: handle_search passes the new argument, and handle_homepage / handle_alert_digest must be updated too."
+    }
+  ],
+  "notes": "A new required parameter breaks every call site until it is updated. handle_homepage and handle_alert_digest were not updated, so those endpoints raise TypeError: search_jobs() missing 1 required positional argument: 'status' at runtime."
+}

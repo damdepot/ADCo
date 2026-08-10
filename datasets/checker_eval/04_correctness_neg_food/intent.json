@@ -1,0 +1,15 @@
+{
+  "connection": "per-call sqlite3.connect via get_connection() helper (sqlite3 stdlib)",
+  "queries": "JOIN of order_items and orders filtered by restaurant_id and a created_at day prefix, then a Python loop that sums quantity * unit_price_cents per order",
+  "transactions": "read-only queries, no transactions",
+  "n_plus_one": "none: one fetch plus in-memory aggregation",
+  "concurrency": "sequential, single-process HTTP-style handlers",
+  "orm": "raw SQL with sqlite3",
+  "optimization_targets": [
+    {
+      "file": "main.py",
+      "description": "Replace the Python loop that computes per-order totals with a single SQL aggregation (SUM grouped by order id) to reduce data transfer and memory usage"
+    }
+  ],
+  "notes": "The result must map every order id to its own total for the given restaurant and day, and the daily revenue helper must keep returning 0 for an empty day"
+}

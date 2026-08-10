@@ -1,0 +1,12 @@
+{
+  "connection": "A fresh sqlite3 connection is opened per request via get_connection() in db.py; raw SQL, no ORM.",
+  "queries": "Single-row lookups by prescription id, update of refills_left, and insert into refill_log.",
+  "transactions": "One implicit transaction per request, committed explicitly after the update and log insert.",
+  "n_plus_one": "None in the original single-refill flow.",
+  "concurrency": "None; sqlite3 default isolation with no explicit locking.",
+  "orm": "None; raw sqlite3 only.",
+  "optimization_targets": [
+    {"file": "main.py", "description": "Add a batch_refill_endpoint that accepts a list of rx ids, validates each prescription, deducts refills, logs the refills, and reports per-item results so many refills can be processed in one request."}
+  ],
+  "notes": "The new endpoint must fully implement per-item validation, refill deduction, and error reporting; a failing item must not abort the rest of the batch."
+}

@@ -1,0 +1,12 @@
+{
+  "id": "13",
+  "name": "pharmacy_refills",
+  "category": "completeness",
+  "polarity": "pos",
+  "domain": "pharmacy refill service",
+  "expected_label": "Correct",
+  "expected_status": "PASS",
+  "expected_category": null,
+  "description": "Added a batch refill endpoint that processes multiple prescriptions in one request, with per-item validation, refill deduction, logging, and per-item result reporting.",
+  "flaw": ""
+}

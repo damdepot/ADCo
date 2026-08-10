@@ -1,0 +1,19 @@
+# MysqlDriver Configuration File
+# Created 2026-07-03 15:24:39.548734
+[mysql]
+
+# MySQL server hostname
+host                 = 127.0.0.1
+
+# MySQL server port
+port                 = 3306
+
+# MySQL user name
+user                 = root
+
+# MySQL user password
+password             = your_password
+
+# MySQL database name
+database             = tpcc-baseline
+

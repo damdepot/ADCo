@@ -1,0 +1,12 @@
+{
+  "id": "19",
+  "name": "quiz_platform",
+  "category": "performance_regression",
+  "polarity": "pos",
+  "domain": "online quiz platform",
+  "expected_label": "Correct",
+  "expected_status": "PASS",
+  "expected_category": null,
+  "description": "Async handlers now reuse a small pool of sqlite3 connections instead of opening one per request, and question choices are fetched in a single batched query instead of one query per question.",
+  "flaw": ""
+}

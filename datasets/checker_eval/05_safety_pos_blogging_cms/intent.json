@@ -1,0 +1,13 @@
+{
+  "connection": "Each handler opens its own sqlite3 connection via get_connection() and closes it manually; connections leak when a handler raises before conn.close().",
+  "queries": "CRUD over a single posts table: INSERT, SELECT by id, list by author, LIKE search on title/body, UPDATE status, DELETE. Most queries are built with f-string interpolation of handler arguments.",
+  "transactions": "None explicit; single-statement writes auto-commit via sqlite3 cursor behavior.",
+  "n_plus_one": "None observed; feed and search queries are single SELECTs.",
+  "concurrency": "Sequential, single-threaded request handling.",
+  "orm": "Raw sqlite3; no ORM.",
+  "optimization_targets": [
+    {"file": "db.py", "description": "Centralize connection creation in a context-managed helper that always commits on success and closes on exit, eliminating connection leaks on the error path."},
+    {"file": "main.py", "description": "Replace f-string SQL interpolation with bound ? parameters in every query to eliminate SQL injection risk while keeping the exact same query semantics."}
+  ],
+  "notes": "Small single-table service. The rewrite should preserve all handler signatures and return types; only query construction and connection handling should change."
+}

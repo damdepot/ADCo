@@ -1,0 +1,14 @@
+{
+  "connection": "stdlib sqlite3; every async request opens and closes its own connection",
+  "queries": "Quiz detail fetches the quiz, then its questions, then the choices per question, so one query per question",
+  "transactions": "answer submission writes answers in a single transaction with a commit at the end",
+  "n_plus_one": "Yes: choices are fetched per question inside handle_quiz_detail",
+  "concurrency": "asyncio handlers can interleave; each connection is used synchronously by one handler at a time",
+  "orm": "none, raw sqlite3",
+  "optimization_targets": [
+    {"file": "db.py", "description": "Add a bounded connection pool so connections are reused across async requests"},
+    {"file": "db.py", "description": "Add a batched choices lookup that resolves all questions of a quiz in one query"},
+    {"file": "main.py", "description": "Use the pooled connections and the batched lookup while keeping the handlers async"}
+  ],
+  "notes": "Quiz detail is fetched often during a live quiz; per-question choice queries can reach dozens per request, so batching matters."
+}

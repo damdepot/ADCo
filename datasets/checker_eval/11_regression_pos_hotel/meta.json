@@ -1,0 +1,12 @@
+{
+  "id": "11",
+  "name": "hotel_booking",
+  "category": "regression",
+  "polarity": "pos",
+  "domain": "hotel booking",
+  "expected_label": "Correct",
+  "expected_status": "PASS",
+  "expected_category": null,
+  "description": "Extracted the format_reservation helper from main.py into a new reservation_utils.py module. The function is byte-for-byte identical — only its module location changed. The handle_reservation handler produces byte-identical responses with the same signature, same return type, and same behavior. db.py is untouched.",
+  "flaw": ""
+}
