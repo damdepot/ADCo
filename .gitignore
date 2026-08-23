@@ -221,6 +221,7 @@ __marimo__/
 
 # Project-specific environment
 AGENTS.md
+opencode.json
 *.config
 proposal.txt
 .agents
