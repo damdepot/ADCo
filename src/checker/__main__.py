@@ -4,7 +4,7 @@ Usage:
     uv run python -m checker <sandbox_dir> [--model <model_name>]
 """
 
-from checker.main import main
+from src.checker.main import main
 
 if __name__ == "__main__":
     main()

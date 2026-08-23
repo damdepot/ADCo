@@ -3,8 +3,9 @@
 from google.adk.agents import LlmAgent
 from google.genai import types
 
-from rewriter.sub_agents.verifier import prompt, tools
-from rewriter.sub_agents.verifier.models import VerifierOutput
+from src.rewriter.sub_agents.verifier import tools
+from src.rewriter.sub_agents.verifier.models import VerifierOutput
+from src.rewriter.sub_agents.verifier import prompt
 
 
 def create_verifier_agent(model: str = "gemini-2.5-flash") -> LlmAgent:

@@ -3,8 +3,9 @@
 from google.adk.agents import LlmAgent
 from google.genai import types
 
-from checker import prompt, tools
-from checker.models import CheckerOutput
+from src.checker import tools
+from src.checker.models import CheckerOutput
+from src.checker import prompt
 
 
 def create_checker_agent(model: str = "gemini-2.5-flash") -> LlmAgent:

@@ -30,7 +30,7 @@ class ScanResult:
 IGNORE_DIRS = {
     ".git", "__pycache__", ".venv", "venv", "node_modules",
     ".mypy_cache", ".pytest_cache", ".tox", "dist", "build",
-    "sandbox", ".env", "egg-info",
+    "sandbox", "output_sandbox", "output", ".env", "egg-info",
 }
 
 IGNORE_EXTENSIONS = {

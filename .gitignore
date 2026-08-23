@@ -227,7 +227,7 @@ proposal.txt
 telemetry/telemetry.db
 telemetry/telemetry.db-wal
 telemetry/telemetry.db-shm
-sandbox/*/
+output/*/
 scripts/*/
 notebooks/*.csv
 skills-lock.json

@@ -1,8 +1,8 @@
 """File selector LlmAgent — picks files related to database interaction."""
 from google.adk.agents import LlmAgent
 from google.genai import types
-from rewriter.sub_agents.file_selector.models import FileSelectorOutput
-from rewriter.sub_agents.file_selector import prompt
+from src.rewriter.sub_agents.file_selector.models import FileSelectorOutput
+from src.rewriter.sub_agents.file_selector import prompt
 
 
 def create_file_selector_agent(model: str = "gemini-2.5-flash") -> LlmAgent:

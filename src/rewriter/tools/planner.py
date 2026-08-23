@@ -28,7 +28,7 @@ class StrategyDef:
 
 
 KB_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "..", "docs", "kb", "query_rewrite_methods.md"
+    os.path.dirname(__file__), "..", "..", "..", "knowledge_base", "query_rewrite_methods.md"
 )
 
 

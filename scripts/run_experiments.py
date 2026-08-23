@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / "scripts" / "results"
 
 BENCHMARK_DIRS: dict[str, Path] = {
-    "tpcc": ROOT / "benchmarks" / "tpcc",
-    "smallbank": ROOT / "benchmarks" / "smallbank",
+    "tpcc": ROOT / "benchmarks" / "benchmark_tpcc",
+    "smallbank": ROOT / "benchmarks" / "benchmark_smallbank",
 }
 
 TPCC_ARGS = [
@@ -187,7 +187,7 @@ def run_pipeline(bench_type: str, model: str) -> dict[str, Any]:
     print(f"\n{'─' * 60}")
     print(f"[REWRITE] {bench_type} from {source_dir}")
     rc, stdout, stderr, dur = run_command([
-        "uv", "run", "python", "-m", "rewriter", str(source_dir),
+        "uv", "run", "python", "-m", "src.rewriter", str(source_dir),
         "--model", model,
     ])
     result["rewrite_duration"] = dur
@@ -210,7 +210,7 @@ def run_pipeline(bench_type: str, model: str) -> dict[str, Any]:
     # ── step 2: check ──
     print(f"\n[CHECK] {sandbox}")
     rc, stdout, stderr, dur = run_command([
-        "uv", "run", "python", "-m", "checker", sandbox,
+        "uv", "run", "python", "-m", "src.checker", sandbox,
         "--model", model,
     ])
     result["check_duration"] = dur
@@ -224,7 +224,7 @@ def run_pipeline(bench_type: str, model: str) -> dict[str, Any]:
     print(f"\n[BENCHMARK] {bench_type} from {sandbox}")
 
     bench_base_cmd = [
-        "uv", "run", "python", "-m", "benchmark_runner",
+        "uv", "run", "python", "-m", "benchmarks.src",
         sandbox, "--type", bench_type,
     ]
     if bench_type == "tpcc":

@@ -1,6 +1,6 @@
 """Tests for rewriter.tools.planner."""
 
-from rewriter.tools.planner import _parse_kb, plan, _clean_name
+from src.rewriter.tools.planner import _parse_kb, plan, _clean_name
 
 
 def test_parse_kb_returns_70_plus_strategies():

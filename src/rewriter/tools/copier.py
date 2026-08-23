@@ -10,7 +10,7 @@ from pathlib import Path
 
 from google.adk.tools import ToolContext
 
-SANDBOX_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "sandbox")
+SANDBOX_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..", "output")
 
 _CODE_EXTENSIONS = {".py", ".pyx", ".pyi"}
 
@@ -25,7 +25,7 @@ def copy_entire(source_root: str, sandbox_id: str | None = None) -> str:
 
     shutil.copytree(source_root, dest, ignore=shutil.ignore_patterns(
         ".git", "__pycache__", ".venv", "venv", "node_modules",
-        "*.pyc", ".mypy_cache", ".pytest_cache",
+        "*.pyc", ".mypy_cache", ".pytest_cache", "sandbox", "output_sandbox", "output"
     ))
 
     return os.path.abspath(dest)

@@ -7,14 +7,14 @@ SHELL := /bin/bash
 # ── Generate optimized code ──
 rewrite:
 	@echo "Generating optimized code..."
-	uv run python -m rewriter $(DIR) \
+	uv run python -m src.rewriter $(DIR) \
 		--model=gemini-3.5-flash-lite \
 		--verbose
 
 # ── Run TPCC benchmark ──	
 tpcc:
 	@echo "Running TPCC benchmark..."
-	uv run python -m benchmark_runner $(DIR) --type tpcc \
+	uv run python -m benchmarks.src $(DIR) --type tpcc \
 		mysql \
 		--config=$(DIR)/configs/mysql.config \
 		--clients=1 \
@@ -25,7 +25,7 @@ tpcc:
 # ── Run SmallBank benchmark ──
 smallbank:
 	@echo "Running SmallBank benchmark..."
-	uv run python -m benchmark_runner $(DIR) --type smallbank \
+	uv run python -m benchmarks.src $(DIR) --type smallbank \
 		test \
 		--accounts 100000 \
 		--transactions 30000 \
@@ -34,7 +34,7 @@ smallbank:
 # ── Run correctness checker on the sandbox ──
 check:
 	@echo "Running correctness checker..."
-	uv run python -m checker $(DIR) \
+	uv run python -m src.checker $(DIR) \
 		--model=gemini-3.5-flash-lite
 
 # ── Cleanup ──
