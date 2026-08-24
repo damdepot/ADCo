@@ -1,7 +1,7 @@
 [project]
-name = "pytpcc-setup"
-version = "0.1.0"
-description = "Add your description here"
+name = "ADCo"
+version = "1.0.0-alpha"
+description = "Application Database Co-design"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
