@@ -10,22 +10,25 @@ from pathlib import Path
 
 from google.adk.tools import ToolContext
 
-SANDBOX_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..", "output")
+SANDBOX_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..", "out")
 
 _CODE_EXTENSIONS = {".py", ".pyx", ".pyi"}
 
 
-def copy_entire(source_root: str, sandbox_id: str | None = None) -> str:
+def copy_entire(source_root: str, sandbox_id: str | None = None, dest_override: str | None = None) -> str:
     """Copy entire *source_root* into a sandbox."""
-    sid = sandbox_id or uuid.uuid4().hex[:12]
-    dest = os.path.join(SANDBOX_ROOT, sid)
+    if dest_override:
+        dest = dest_override
+    else:
+        sid = sandbox_id or uuid.uuid4().hex[:12]
+        dest = os.path.join(SANDBOX_ROOT, sid)
 
     if os.path.exists(dest):
         shutil.rmtree(dest)
 
     shutil.copytree(source_root, dest, ignore=shutil.ignore_patterns(
         ".git", "__pycache__", ".venv", "venv", "node_modules",
-        "*.pyc", ".mypy_cache", ".pytest_cache", "sandbox", "output_sandbox", "output"
+        "*.pyc", ".mypy_cache", ".pytest_cache", "sandbox", "output_sandbox", "out"
     ))
 
     return os.path.abspath(dest)
@@ -135,7 +138,8 @@ def copy_to_sandbox(tool_context: ToolContext) -> str:
     target = tool_context.state.get("target", "")
     if not target:
         return "ERROR: target path not set in state"
-    sandbox = copy_entire(target)
+    output_path = tool_context.state.get("output_path")
+    sandbox = copy_entire(target, dest_override=output_path)
     n = rewrite_imports(sandbox, target)
     tool_context.state["sandbox"] = sandbox
     return f"OK: sandbox created at {sandbox} ({n} files had imports rewritten)"
