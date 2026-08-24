@@ -3,7 +3,7 @@ name = "pytpcc-setup"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "google-genai>=2.12.0",
     "mysqlclient>=2.2.8",
