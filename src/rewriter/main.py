@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+import re
 import sys
 import uuid
 
@@ -22,6 +24,18 @@ from google.adk.sessions import InMemorySessionService
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+
+def _maybe_parse(value: object) -> dict:
+    """Return *value* as a dict, JSON-parsing strings (stripping markdown fences)."""
+    if isinstance(value, str):
+        stripped = re.sub(r"^```[a-z]*\n?", "", value.strip(), flags=re.MULTILINE)
+        stripped = re.sub(r"```$", "", stripped.strip())
+        try:
+            return json.loads(stripped.strip())
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return value if isinstance(value, dict) else {}
 
 
 def main() -> None:
@@ -63,8 +77,8 @@ def main() -> None:
         print(f"\n=== Pipeline FAILED ===\nError: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    verdict = result.get("verifier_output", {})
-    status = verdict.get("status", "FAIL") if isinstance(verdict, dict) else "FAIL"
+    verdict = _maybe_parse(result.get("verifier_output", {}))
+    status = verdict.get("status", "FAIL")
     sandbox = result.get("sandbox", "")
     modified = result.get("modified_files", [])
 
