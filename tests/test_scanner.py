@@ -35,15 +35,15 @@ def test_scan_excludes_sandbox():
         Path(os.path.join(tmp, "src", "app.py")).write_text("x = 1")
         os.makedirs(os.path.join(tmp, "sandbox"))
         Path(os.path.join(tmp, "sandbox", "secret.py")).write_text("secret = 42")
-        os.makedirs(os.path.join(tmp, "output"))
-        Path(os.path.join(tmp, "output", "secret_output.py")).write_text("secret = 100")
+        os.makedirs(os.path.join(tmp, "out"))
+        Path(os.path.join(tmp, "out", "secret_output.py")).write_text("secret = 100")
 
         result = scan(tmp)
 
         file_names = [f.relative_path for f in result.files]
         assert any("app.py" in p for p in file_names)
         assert not any("sandbox" in p for p in file_names)
-        assert not any("output" in p for p in file_names)
+        assert not any("out/" in p for p in file_names)
 
 
 def test_scan_produces_file_info():

@@ -34,9 +34,9 @@ Read-only post-hoc audit of the sandbox. Finds files tagged `ADCO_OPTIMIZED`, re
 
 ```bash
 make rewrite DIR=benchmarks/tools/tpcc   # optimize code
-make check   DIR=output/<sandbox-id>         # safety audit
-make tpcc    DIR=output/<sandbox-id>         # benchmark (TPC-C)
-make smallbank DIR=output/<sandbox-id>       # benchmark (SmallBank)
+make check   DIR=out/<sandbox-id>            # safety audit
+make tpcc    DIR=out/<sandbox-id>            # benchmark (TPC-C)
+make smallbank DIR=out/<sandbox-id>          # benchmark (SmallBank)
 
 uv run pytest                                # tests
 ```

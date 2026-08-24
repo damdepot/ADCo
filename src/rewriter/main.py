@@ -38,14 +38,15 @@ def main() -> None:
         help=f"Gemini model to use for all agents (default: {DEFAULT_MODEL})",
     )
     parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output result as JSON",
-    )
-    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Print detailed progress of each pipeline step",
+    )
+    parser.add_argument(
+        "--output-path",
+        default=None,
+        metavar="DIR",
+        help="Directory to write the output project into (skips sandbox-id sub-dir)",
     )
     args = parser.parse_args()
 
@@ -54,8 +55,10 @@ def main() -> None:
         print(f"ERROR: target is not a directory: {target}", file=sys.stderr)
         sys.exit(2)
 
+    output_path = os.path.abspath(args.output_path) if args.output_path else None
+
     try:
-        result = asyncio.run(_run_pipeline(target, model=args.model, verbose=args.verbose))
+        result = asyncio.run(_run_pipeline(target, model=args.model, verbose=args.verbose, output_path=output_path))
     except Exception as exc:
         print(f"\n=== Pipeline FAILED ===\nError: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -79,7 +82,7 @@ def main() -> None:
     sys.exit(0 if status == "PASS" else 1)
 
 
-async def _run_pipeline(target: str, model: str = DEFAULT_MODEL, verbose: bool = False) -> dict:
+async def _run_pipeline(target: str, model: str = DEFAULT_MODEL, verbose: bool = False, output_path: str | None = None) -> dict:
     session_service = InMemorySessionService()
     sid = uuid.uuid4().hex[:12]
     app_name = "adco_rewriter"
@@ -88,7 +91,7 @@ async def _run_pipeline(target: str, model: str = DEFAULT_MODEL, verbose: bool =
         app_name=app_name,
         user_id="pipeline",
         session_id=sid,
-        state={"target": target},
+        state={"target": target, "output_path": output_path},
     )
 
     agent = create_root_agent(model)

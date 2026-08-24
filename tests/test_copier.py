@@ -34,6 +34,17 @@ def test_copy_entire_copies_files_to_sandbox(temp_sandbox_root):
         assert os.path.isfile(os.path.join(dest, "lib", "helpers.py"))
 
 
+def test_copy_entire_dest_override(temp_sandbox_root):
+    with tempfile.TemporaryDirectory() as source:
+        Path(os.path.join(source, "app.py")).write_text("print('hello')")
+        with tempfile.TemporaryDirectory() as dest_override:
+            custom_dest = os.path.join(dest_override, "my_custom_sandbox")
+            dest = copy_entire(source, dest_override=custom_dest)
+            assert dest == os.path.abspath(custom_dest)
+            assert os.path.isdir(dest)
+            assert os.path.isfile(os.path.join(dest, "app.py"))
+
+
 def test_copy_entire_excludes_pycache_and_git(temp_sandbox_root):
     with tempfile.TemporaryDirectory() as source:
         Path(os.path.join(source, "main.py")).write_text("x=1")
