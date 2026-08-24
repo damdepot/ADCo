@@ -30,7 +30,7 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 # -----------------------------------------------------------------------
 
-import constants
+import benchmarks.tools.tpcc.constants as constants
 
 def makeDefault(warehouses):
     return ScaleParameters(constants.NUM_ITEMS, \

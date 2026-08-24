@@ -5,7 +5,7 @@ import random
 import concurrent.futures as cf
 from typing import Optional
 
-from constants import (
+from benchmarks.tools.smallbank.constants import (
     TABLENAME_ACCOUNTS,
     TABLENAME_SAVINGS,
     TABLENAME_CHECKING,

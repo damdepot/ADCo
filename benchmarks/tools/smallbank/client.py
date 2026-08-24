@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from typing import Optional, Callable
 
-from constants import (
+from benchmarks.tools.smallbank.constants import (
     FREQUENCY_AMALGAMATE,
     FREQUENCY_BALANCE,
     FREQUENCY_DEPOSIT_CHECKING,
@@ -15,7 +15,7 @@ from constants import (
     HOTSPOT_USE_FIXED_SIZE,
     HOTSPOT_FIXED_SIZE,
 )
-from drivers.mysqldriver import (
+from benchmarks.tools.smallbank.drivers.mysqldriver import (
     amalgamate,
     balance,
     deposit_checking,

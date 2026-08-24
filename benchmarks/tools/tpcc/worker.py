@@ -34,14 +34,14 @@ import re
 import argparse
 import glob
 import time
-import message
+import benchmarks.tools.tpcc.message as message
 import pickle
 import traceback
 from pprint import pprint, pformat
 
-from util import *
-from runtime import *
-import drivers
+from benchmarks.tools.tpcc.util import *
+from benchmarks.tools.tpcc.runtime import *
+import benchmarks.tools.tpcc.drivers as drivers
 
 ## ==============================================
 ## createDriverClass

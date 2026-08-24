@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / "scripts" / "results"
 
 BENCHMARK_DIRS: dict[str, Path] = {
-    "tpcc": ROOT / "benchmarks" / "benchmark_tpcc",
-    "smallbank": ROOT / "benchmarks" / "benchmark_smallbank",
+    "tpcc": ROOT / "benchmarks" / "tools" / "tpcc",
+    "smallbank": ROOT / "benchmarks" / "tools" / "smallbank",
 }
 
 TPCC_ARGS = [

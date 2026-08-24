@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from constants import TABLENAME_ACCOUNTS, TABLENAME_SAVINGS, TABLENAME_CHECKING
+from benchmarks.tools.smallbank.constants import TABLENAME_ACCOUNTS, TABLENAME_SAVINGS, TABLENAME_CHECKING
 
 
 class InsufficientFunds(Exception):

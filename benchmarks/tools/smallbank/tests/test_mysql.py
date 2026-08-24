@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pymysql
 
-from drivers.mysqldriver import (
+from benchmarks.tools.smallbank.drivers.mysqldriver import (
     amalgamate, balance, deposit_checking, send_payment,
     transact_savings, write_check, InvalidAccount, InsufficientFunds,
 )
@@ -269,7 +269,7 @@ def _conn_factory():
 
 
 def test_loader():
-    from loader import SmallBankLoader
+    from benchmarks.tools.smallbank.loader import SmallBankLoader
 
     _setup_tables()
     loader = SmallBankLoader(
@@ -291,8 +291,8 @@ def test_loader():
 
 
 def test_client_basic():
-    from client import SmallBankClient
-    from loader import SmallBankLoader
+    from benchmarks.tools.smallbank.client import SmallBankClient
+    from benchmarks.tools.smallbank.loader import SmallBankLoader
 
     _setup_tables()
     loader = SmallBankLoader(

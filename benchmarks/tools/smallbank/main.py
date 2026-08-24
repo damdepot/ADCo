@@ -9,8 +9,8 @@ import time
 
 import pymysql
 
-from loader import SmallBankLoader
-from client import SmallBankClient
+from benchmarks.tools.smallbank.loader import SmallBankLoader
+from benchmarks.tools.smallbank.client import SmallBankClient
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mysql.config")
 

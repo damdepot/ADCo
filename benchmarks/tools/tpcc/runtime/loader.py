@@ -37,8 +37,8 @@ from datetime import datetime
 from random import shuffle
 from pprint import pprint,pformat
 
-import constants
-from util import *
+import benchmarks.tools.tpcc.constants as constants
+from benchmarks.tools.tpcc.util import *
 
 class Loader:
     

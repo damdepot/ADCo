@@ -39,9 +39,9 @@ import multiprocessing
 from configparser import ConfigParser
 from pprint import pprint, pformat
 
-from util import *
-from runtime import *
-import drivers
+from benchmarks.tools.tpcc.util import *
+from benchmarks.tools.tpcc.runtime import *
+import benchmarks.tools.tpcc.drivers as drivers
 
 logging.basicConfig(level = logging.INFO,
                     format="%(asctime)s [%(funcName)s:%(lineno)03d] %(levelname)-5s: %(message)s",

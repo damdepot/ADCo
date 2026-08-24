@@ -232,3 +232,4 @@ output/*/
 scripts/*/
 notebooks/*.csv
 skills-lock.json
+logs/
