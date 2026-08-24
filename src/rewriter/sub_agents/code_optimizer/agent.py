@@ -5,7 +5,6 @@ from google.adk.workflow._retry_config import RetryConfig
 from google.genai import types
 
 from src.rewriter.sub_agents.code_optimizer import tools
-from src.rewriter.sub_agents.code_optimizer.models import CodeOptimizerOutput
 from src.rewriter.sub_agents.code_optimizer import prompt
 
 
@@ -26,7 +25,6 @@ def create_code_optimizer_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgen
         description="Optimizes database interaction code using rewrite strategies. Reads files from sandbox, writes optimized versions.",
         tools=[tools.read_file, tools.write_file, tools.list_sandbox, tools.get_optimization_context],
         output_key="code_optimizer_output",
-        output_schema=CodeOptimizerOutput,
         retry_config=_CODE_OPTIMIZER_RETRY_CONFIG,
         generate_content_config=types.GenerateContentConfig(
             max_output_tokens=65536,

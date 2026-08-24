@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from google.adk.tools import ToolContext
+
+
+def _maybe_parse(value: object) -> dict:
+    """Return *value* as a dict, JSON-parsing strings (stripping markdown fences)."""
+    if isinstance(value, str):
+        stripped = re.sub(r"^```[a-z]*\n?", "", value.strip(), flags=re.MULTILINE)
+        stripped = re.sub(r"```$", "", stripped.strip())
+        try:
+            return json.loads(stripped.strip())
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return value if isinstance(value, dict) else {}
 
 
 @dataclass
@@ -112,8 +125,8 @@ def get_optimization_strategies(tool_context: ToolContext) -> str:
     optimization_targets file/description entries), then selects applicable
     strategies. Stores the strategy summary text back to state as ``strategies``.
     """
-    intent_output = tool_context.state.get("intent_extractor_output")
-    if not intent_output or not isinstance(intent_output, dict):
+    intent_output = _maybe_parse(tool_context.state.get("intent_extractor_output"))
+    if not intent_output:
         return "ERROR: intent_extractor_output not set in state — call intent_extractor first"
     lines = [
         f"CONNECTION: {intent_output.get('connection', '')}",

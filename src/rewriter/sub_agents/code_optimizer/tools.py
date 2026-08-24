@@ -1,9 +1,22 @@
 """Tools for the code optimizer agent — sandbox file read/write/list."""
 
+import json
 import os
 import re
 from pathlib import Path
 from google.adk.tools import ToolContext
+
+
+def _maybe_parse(value: object) -> dict:
+    """Return *value* as a dict, JSON-parsing strings (stripping markdown fences)."""
+    if isinstance(value, str):
+        stripped = re.sub(r"^```[a-z]*\n?", "", value.strip(), flags=re.MULTILINE)
+        stripped = re.sub(r"```$", "", stripped.strip())
+        try:
+            return json.loads(stripped.strip())
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return value if isinstance(value, dict) else {}
 
 _ADCO_TAG_RE = re.compile(r"^[#-]{1,2}\s*ADCO_OPTIMIZED:.*\n?", re.MULTILINE)
 
@@ -99,8 +112,8 @@ def get_optimization_context(tool_context: ToolContext) -> str:
     On retry attempts (after a verifier FAIL), this also includes the verifier's
     failure category, reason, and detail so the optimizer can fix specific issues.
     """
-    intent_output = tool_context.state.get("intent_extractor_output")
-    if not intent_output or not isinstance(intent_output, dict):
+    intent_output = _maybe_parse(tool_context.state.get("intent_extractor_output"))
+    if not intent_output:
         return "ERROR: intent_extractor_output not set in state — call intent_extractor first"
     optimization_targets = intent_output.get("optimization_targets") or []
     if not optimization_targets:
@@ -127,8 +140,8 @@ def get_optimization_context(tool_context: ToolContext) -> str:
     if sandbox:
         sections.append(f"## Sandbox directory\n{sandbox}")
 
-    verifier_output = tool_context.state.get("verifier_output")
-    if verifier_output and isinstance(verifier_output, dict) and verifier_output.get("status") == "FAIL":
+    verifier_output = _maybe_parse(tool_context.state.get("verifier_output"))
+    if verifier_output and verifier_output.get("status") == "FAIL":
 
         failure_section = (
             "## Prior verifier failure (MUST FIX)\n"
