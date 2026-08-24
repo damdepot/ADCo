@@ -49,4 +49,4 @@ uv run python scripts/run_experiments.py --type smallbank --runs 10
 uv run python scripts/run_experiments.py --type both      --runs 10   # 20 total
 ```
 
-Options: `--delay <sec>` cooldown between runs, `--model <model>`. Results print as a summary table and save to `scripts/results/experiments_<type>_<timestamp>.csv`.
+Options: `--delay <sec>` cooldown between runs, `--model <model>` (default: `gemini-3.5-flash-lite`). Results print as a summary table and save to `scripts/results/experiments_<type>_<timestamp>.csv`.

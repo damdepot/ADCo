@@ -274,7 +274,7 @@ def test_read_original_file_no_original():
 
 def test_create_checker_agent():
     from src.checker.agent import create_checker_agent
-    agent = create_checker_agent("gemini-2.5-flash")
+    agent = create_checker_agent("gemini-3.5-flash-lite")
     assert agent.name == "adco_checker"
     assert agent.output_key == "checker_output"
     assert agent.output_schema == CheckerOutput

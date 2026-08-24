@@ -2,7 +2,7 @@
 
 Usage:
     uv run python scripts/eval_checker.py [--data datasets/checker_eval]
-        [--model gemini-2.5-flash] [--limit N] [--delay SEC]
+        [--model gemini-3.5-flash-lite] [--limit N] [--delay SEC]
         [--verbose] [--no-strict]
 
 Results are printed to stdout as summary tables and saved as CSV/JSON under
@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 import src.checker.main
 RESULTS_DIR = ROOT / "scripts" / "results"
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 VALID_STATUSES = ("PASS", "WARN", "FAIL")
 

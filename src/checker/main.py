@@ -22,7 +22,7 @@ from google.adk.sessions import InMemorySessionService
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "rewriter", ".env"))
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 
 def main() -> None:

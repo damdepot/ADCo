@@ -8,7 +8,7 @@ from src.rewriter.sub_agents.intent_extractor.models import IntentExtractorOutpu
 from src.rewriter.sub_agents.intent_extractor import prompt
 
 
-def create_intent_extractor_agent(model: str = "gemini-2.5-flash") -> LlmAgent:
+def create_intent_extractor_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
     return LlmAgent(
         name="intent_extractor",
         model=model,
