@@ -13,6 +13,7 @@ dependencies = [
     "sqlparse>=0.5.5",
     "google-adk>=2.5.0",
     "pymysql>=1.2.0",
+    "psycopg2-binary>=2.9.12",
 ]
 
 [tool.pytest.ini_options]

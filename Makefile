@@ -2,7 +2,17 @@
 SHELL := /bin/bash
 
 # Define shortcuts/tasks that do not generate output files
-.PHONY: rewrite run check test gen-run chain clean clean-all
+.PHONY: rewrite knob-tune run check test gen-run chain clean clean-all
+
+# ── Knob tuner pipeline ──
+knob-tune:
+	@echo "Running knob tuner..."
+	uv run python -m src.knob_tuner $(DIR) \
+		--model=gemini-3.5-flash-lite \
+		--db-type=$(DB_TYPE) \
+		--cpu-cores=2 \
+		--memory=3 \
+		--verbose
 
 # ── Generate optimized code ──
 rewrite:
@@ -14,8 +24,7 @@ rewrite:
 # ── Run TPCC benchmark ──	
 tpcc:
 	@echo "Running TPCC benchmark..."
-	uv run python -m benchmarks.src $(DIR) --type tpcc \
-		mysql \
+	uv run python -m benchmarks.src $(DIR) --type tpcc postgres \
 		--config=$(DIR)/configs/mysql.config \
 		--clients=1 \
 		--warehouses=1 \
@@ -25,10 +34,10 @@ tpcc:
 # ── Run SmallBank benchmark ──
 smallbank:
 	@echo "Running SmallBank benchmark..."
-	uv run python -m benchmarks.src $(DIR) --type smallbank \
-		test \
+	uv run python -m benchmarks.src $(DIR) --type smallbank test \
+		--driver postgres \
 		--accounts 100000 \
-		--transactions 30000 \
+		--transactions 10000 \
 		--threads 1
 
 # ── Run correctness checker on the sandbox ──
