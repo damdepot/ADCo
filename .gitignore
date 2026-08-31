@@ -233,4 +233,3 @@ scripts/*/
 notebooks/*.csv
 skills-lock.json
 logs/
-bemchmarks/tools/*
