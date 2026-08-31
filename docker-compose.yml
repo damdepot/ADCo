@@ -12,6 +12,11 @@ services:
     volumes:
       - mysql_data:/var/lib/mysql
     command: --mysql-native-password=ON
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 3g
 
   postgres-db:
     image: postgres:17
@@ -25,6 +30,11 @@ services:
       POSTGRES_DB: adco_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 3g
 
 volumes:
   mysql_data:
