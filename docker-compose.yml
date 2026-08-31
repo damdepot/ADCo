@@ -13,5 +13,19 @@ services:
       - mysql_data:/var/lib/mysql
     command: --mysql-native-password=ON
 
+  postgres-db:
+    image: postgres:17
+    container_name: adco-postgres
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: adco_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
 volumes:
   mysql_data:
+  postgres_data:
