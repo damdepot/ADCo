@@ -21,14 +21,14 @@ class MockToolContext:
 # ---------------------------------------------------------------------------
 
 def test_file_selector_output_schema_validates():
-    from src.rewriter.sub_agents.file_selector.models import FileSelectorOutput
+    from src.code_rewriter.sub_agents.file_selector.models import FileSelectorOutput
     m = FileSelectorOutput.model_validate({"files": ["a.py", "b.py"], "entry_point": "main.py"})
     assert m.files == ["a.py", "b.py"]
     assert m.entry_point == "main.py"
 
 
 def test_intent_extractor_output_schema_validates():
-    from src.rewriter.sub_agents.intent_extractor.models import IntentExtractorOutput
+    from src.code_rewriter.sub_agents.intent_extractor.models import IntentExtractorOutput
     data = {
         "connection": "pool", "queries": "crud", "transactions": "manual",
         "n_plus_one": "yes: loop in loader", "concurrency": "sequential",
@@ -42,20 +42,20 @@ def test_intent_extractor_output_schema_validates():
 
 
 def test_code_optimizer_output_schema_validates():
-    from src.rewriter.sub_agents.code_optimizer.models import CodeOptimizerOutput
+    from src.code_rewriter.sub_agents.code_optimizer.models import CodeOptimizerOutput
     m = CodeOptimizerOutput.model_validate({"modified_files": ["a.py"], "summary": "ok"})
     assert m.modified_files == ["a.py"]
     assert m.summary == "ok"
 
 
 def test_verifier_output_schema_validates_pass_and_fail():
-    from src.rewriter.sub_agents.verifier.models import VerifierOutput
+    from src.code_rewriter.sub_agents.verifier.models import VerifierOutput
     assert VerifierOutput.model_validate({"status": "PASS", "category": "NONE", "reason": "ok", "detail": ""}).status == "PASS"
     assert VerifierOutput.model_validate({"status": "FAIL", "category": "name_error", "reason": "boom", "detail": "x"}).status == "FAIL"
 
 
 def test_verifier_output_schema_rejects_invalid_status():
-    from src.rewriter.sub_agents.verifier.models import VerifierOutput
+    from src.code_rewriter.sub_agents.verifier.models import VerifierOutput
     with pytest.raises(Exception):
         VerifierOutput.model_validate({"status": "MAYBE"})
 
@@ -64,7 +64,7 @@ def test_verifier_output_schema_rejects_invalid_status():
 # code_optimizer.tools
 # ---------------------------------------------------------------------------
 
-from src.rewriter.sub_agents.code_optimizer.tools import (
+from src.code_rewriter.sub_agents.code_optimizer.tools import (
     write_file as co_write_file,
     read_file as co_read_file,
     list_sandbox as co_list_sandbox,
@@ -287,7 +287,7 @@ def test_codeopt_get_optimization_context_no_targets():
 # verifier.tools
 # ---------------------------------------------------------------------------
 
-from src.rewriter.sub_agents.verifier.tools import check_syntax, run_application
+from src.code_rewriter.sub_agents.verifier.tools import check_syntax, run_application
 
 
 def test_check_syntax_reports_ok_for_valid_python():
@@ -415,7 +415,7 @@ def test_run_application_classified_as_code_error():
 # intent_extractor.tools
 # ---------------------------------------------------------------------------
 
-from src.rewriter.sub_agents.intent_extractor.tools import read_selected_files
+from src.code_rewriter.sub_agents.intent_extractor.tools import read_selected_files
 
 
 def test_read_selected_files_returns_contents():
@@ -451,9 +451,9 @@ def test_read_selected_files_no_files():
 # tools layer ADK wrappers
 # ---------------------------------------------------------------------------
 
-from src.rewriter.tools.scanner import scan_codebase
-from src.rewriter.tools.copier import copy_to_sandbox
-from src.rewriter.tools.planner import get_optimization_strategies
+from src.code_rewriter.tools.scanner import scan_codebase
+from src.code_rewriter.tools.copier import copy_to_sandbox
+from src.code_rewriter.tools.planner import get_optimization_strategies
 
 
 def test_scan_codebase_writes_scan_result_to_state():

@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-import src.rewriter.tools.copier as copier_mod
-from src.rewriter.tools.copier import copy_entire, rewrite_imports, read_files
+import src.code_rewriter.tools.copier as copier_mod
+from src.code_rewriter.tools.copier import copy_entire, rewrite_imports, read_files
 
 
 @pytest.fixture

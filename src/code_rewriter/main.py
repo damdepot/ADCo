@@ -17,7 +17,7 @@ import uuid
 from dotenv import load_dotenv
 from google.genai import types
 
-from src.rewriter.agent import create_root_agent
+from src.code_rewriter.agent import create_root_agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 

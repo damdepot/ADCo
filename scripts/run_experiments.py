@@ -187,7 +187,7 @@ def run_pipeline(bench_type: str, model: str) -> dict[str, Any]:
     print(f"\n{'─' * 60}")
     print(f"[REWRITE] {bench_type} from {source_dir}")
     rc, stdout, stderr, dur = run_command([
-        "uv", "run", "python", "-m", "src.rewriter", str(source_dir),
+        "uv", "run", "python", "-m", "src.code_rewriter", str(source_dir),
         "--model", model,
     ])
     result["rewrite_duration"] = dur

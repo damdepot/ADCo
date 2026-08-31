@@ -4,7 +4,7 @@ Usage:
     uv run python -m rewriter <target_dir> [--model <model_name>]
 """
 
-from src.rewriter.main import main
+from src.code_rewriter.main import main
 
 if __name__ == "__main__":
     main()

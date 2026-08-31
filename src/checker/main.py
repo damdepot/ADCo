@@ -20,7 +20,7 @@ from src.checker.models import CheckerOutput
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", "rewriter", ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", "code_rewriter", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 

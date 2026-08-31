@@ -3,11 +3,11 @@
 from google.adk.agents import LlmAgent
 from google.adk.tools.agent_tool import AgentTool
 
-from src.rewriter.tools import scan_codebase, copy_to_sandbox, get_optimization_strategies
-from src.rewriter.sub_agents.file_selector.agent import create_file_selector_agent
-from src.rewriter.sub_agents.intent_extractor.agent import create_intent_extractor_agent
-from src.rewriter.sub_agents.code_optimizer.agent import create_code_optimizer_agent
-from src.rewriter.sub_agents.verifier.agent import create_verifier_agent
+from src.code_rewriter.tools import scan_codebase, copy_to_sandbox, get_optimization_strategies
+from src.code_rewriter.sub_agents.file_selector.agent import create_file_selector_agent
+from src.code_rewriter.sub_agents.intent_extractor.agent import create_intent_extractor_agent
+from src.code_rewriter.sub_agents.code_optimizer.agent import create_code_optimizer_agent
+from src.code_rewriter.sub_agents.verifier.agent import create_verifier_agent
 
 ROOT_PROMPT = """You are the ADCo rewriter orchestrator. Your job is to coordinate
 sub-agents and tools to read a source codebase and optimize its database

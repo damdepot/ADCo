@@ -3,8 +3,8 @@
 from google.adk.agents import LlmAgent
 from google.genai import types
 
-from src.rewriter.sub_agents.intent_extractor import tools
-from src.rewriter.sub_agents.intent_extractor import prompt
+from src.code_rewriter.sub_agents.intent_extractor import tools
+from src.code_rewriter.sub_agents.intent_extractor import prompt
 
 
 def create_intent_extractor_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:

@@ -4,8 +4,8 @@ import os
 import tempfile
 from pathlib import Path
 
-from src.rewriter.pycompiler import compile_queries
-from src.rewriter.pydecompiler import decompile_app
+from src.code_rewriter.pycompiler import compile_queries
+from src.code_rewriter.pydecompiler import decompile_app
 
 
 def test_compile_decompile_roundtrip():

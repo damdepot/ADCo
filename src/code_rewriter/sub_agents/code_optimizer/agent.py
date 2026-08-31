@@ -4,8 +4,8 @@ from google.adk.agents import LlmAgent
 from google.adk.workflow._retry_config import RetryConfig
 from google.genai import types
 
-from src.rewriter.sub_agents.code_optimizer import tools
-from src.rewriter.sub_agents.code_optimizer import prompt
+from src.code_rewriter.sub_agents.code_optimizer import tools
+from src.code_rewriter.sub_agents.code_optimizer import prompt
 
 
 _CODE_OPTIMIZER_RETRY_CONFIG = RetryConfig(
