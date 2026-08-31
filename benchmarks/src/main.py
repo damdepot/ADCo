@@ -92,7 +92,7 @@ def main():
     print(f"Sandbox:  {sandbox}")
     print(f"Command:  {' '.join(cmd)}")
 
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": sandbox}
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": os.pathsep.join([sandbox, ROOT])}
     started = time.time()
     try:
         proc = subprocess.run(
