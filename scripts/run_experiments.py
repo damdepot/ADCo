@@ -210,7 +210,7 @@ def run_pipeline(bench_type: str, model: str) -> dict[str, Any]:
     # ── step 2: check ──
     print(f"\n[CHECK] {sandbox}")
     rc, stdout, stderr, dur = run_command([
-        "uv", "run", "python", "-m", "src.checker", sandbox,
+        "uv", "run", "python", "-m", "src.code_checker", sandbox,
         "--model", model,
     ])
     result["check_duration"] = dur

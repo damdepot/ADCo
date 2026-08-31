@@ -34,7 +34,7 @@ smallbank:
 # ── Run correctness checker on the sandbox ──
 check:
 	@echo "Running correctness checker..."
-	uv run python -m src.checker $(DIR) \
+	uv run python -m src.code_checker $(DIR) \
 		--model=gemini-3.5-flash-lite
 
 # ── Cleanup ──

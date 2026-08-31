@@ -15,8 +15,8 @@ import uuid
 from dotenv import load_dotenv
 from google.genai import types
 
-from src.checker.agent import create_checker_agent
-from src.checker.models import CheckerOutput
+from src.code_checker.agent import create_checker_agent
+from src.code_checker.models import CheckerOutput
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 

@@ -25,7 +25,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import src.checker.main
+import src.code_checker.main
 RESULTS_DIR = ROOT / "scripts" / "results"
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
@@ -173,7 +173,7 @@ def run_sample(sample_dir: Path, model: str, verbose: bool) -> dict[str, Any]:
     started = time.time()
     try:
         state = asyncio.run(
-            src.checker.main._run_checker(
+            src.code_checker.main._run_checker(
                 str(sample_dir / "optimized"),
                 original=str(sample_dir / "original"),
                 model=model,
