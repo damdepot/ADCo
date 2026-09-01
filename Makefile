@@ -11,7 +11,7 @@ knob-tune:
 		--model=gemini-3.5-flash-lite \
 		--db-type=$(DB_TYPE) \
 		--cpu-cores=2 \
-		--memory=3 \
+		--memory=2 \
 		--verbose
 
 # ── Generate optimized code ──

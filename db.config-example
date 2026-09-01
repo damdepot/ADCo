@@ -5,7 +5,7 @@ user = root
 password = mysql_root_password
 database = smallbank
 restart_type = docker
-restart_target = adco-mysql
+restart_target = adco-mysql-production
 
 [production.postgres]
 host = 127.0.0.1
@@ -14,22 +14,22 @@ user = postgres
 password = postgres
 database = smallbank
 restart_type = docker
-restart_target = adco-postgres
+restart_target = adco-postgres-production
 
 [staging.mysql]
 host = 127.0.0.1
-port = 3306
+port = 3308
 user = root
 password = mysql_root_password
 database = smallbank
 restart_type = docker
-restart_target = adco-mysql
+restart_target = adco-mysql-staging
 
 [staging.postgres]
 host = 127.0.0.1
-port = 5432
+port = 5434
 user = postgres
 password = postgres
 database = smallbank
 restart_type = docker
-restart_target = adco-postgres
+restart_target = adco-postgres-staging
