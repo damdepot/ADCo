@@ -30,6 +30,17 @@ class StagingCheckDetails(BaseModel):
     crud: bool = Field(default=True, description="Whether CRUD test lifecycle succeeded")
 
 
+class VerifiedKnobDetail(BaseModel):
+    """Details of a verified active knob."""
+
+    knob: str
+    expected_value: str
+    actual_value: str = ""
+    unit: str = ""
+    pending_restart: bool = False
+    status: Literal["VERIFIED", "MISMATCH", "PENDING_RESTART", "UNKNOWN", "NOT_FOUND"] = "UNKNOWN"
+
+
 class StagingTestResults(BaseModel):
     """Option A test report returned from staging validation."""
 
@@ -41,6 +52,7 @@ class StagingTestResults(BaseModel):
     tables_found: list[str] = Field(default_factory=list, description="Tables discovered during scan")
     crud_result: str = Field(default="passed", description="Result of temporary table CRUD lifecycle")
     error: str | None = Field(default=None, description="Error description if any check failed")
+    verified_knobs: list[VerifiedKnobDetail] = Field(default_factory=list)
 
 
 class KnobCheckerOutput(BaseModel):
@@ -61,3 +73,4 @@ class KnobCheckerOutput(BaseModel):
         default="",
         description="Executive summary of staging validation results and readiness for live deployment",
     )
+    verified_knobs: list[VerifiedKnobDetail] = Field(default_factory=list)

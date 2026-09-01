@@ -6,9 +6,9 @@ from typing import Any
 from google.adk.tools import ToolContext
 
 from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
-from src.knob_tuner.tools.db_tools import apply_knobs
+from src.knob_tuner.tools.db_tools import apply_knobs, verify_active_knobs
 from src.knob_tuner.tools.file_tools import read_json_file
-
+from src.knob_tuner.tools.restart_tools import restart_db_by_config
 
 def _get_production_db_config(tool_context: ToolContext) -> DBConfig | None:
     """Extract production database configuration from tool context state."""
@@ -200,10 +200,9 @@ def check_staging_validation(tool_context: ToolContext) -> str:
 
 
 def apply_knobs_production(tool_context: ToolContext) -> str:
-    """Apply validated dynamic configuration knobs to the live production database.
+    """Apply validated configuration knobs to the live production database.
 
     Strict guardrail: requires ``tool_context.state['staging_validated'] == True``.
-    Never restarts production; flags static knobs for maintenance windows.
 
     Args:
         tool_context: ADK tool execution context.
@@ -230,29 +229,43 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
 
     tool_context.state["prod_restart_required_knobs"] = restart_required_knobs
 
+    # Apply ALL knobs (dynamic + static) to persist them in configuration.
     applied_results: list[dict[str, Any]] = []
-    if dynamic_knobs:
+    if knobs:
         try:
-            applied_results = apply_knobs(dynamic_knobs, cfg, dry_run=False)
+            applied_results = apply_knobs(knobs, cfg, dry_run=False)
             tool_context.state["prod_applied_knobs"] = applied_results
         except Exception as e:
             return f"ERROR: Failed to execute live knob application on production: {e}"
     else:
         tool_context.state["prod_applied_knobs"] = []
+        
+    allow_restart = bool(tool_context.state.get("allow_production_restart", False))
+    
+    restarted = False
+    restart_msg = ""
+    if allow_restart and restart_required_knobs:
+        ok, msg = restart_db_by_config(cfg)
+        restarted = ok
+        restart_msg = msg
+
+    # Verification
+    verification = verify_active_knobs(cfg, knobs)
+    tool_context.state["prod_verified_knobs"] = verification.get("knobs", [])
 
     applied_count = sum(1 for r in applied_results if r.get("status") == "applied")
     failed_count = sum(1 for r in applied_results if r.get("status") == "failed")
 
     lines = [
         "## Production Live Tuning Report",
-        f"- **Dynamic Knobs Applied Live**: {applied_count}/{len(dynamic_knobs)} (Failed: {failed_count})",
+        f"- **Knobs Processed**: {applied_count}/{len(knobs)} (Failed: {failed_count})",
         f"- **Static / Restart-Required Knobs Deferred**: {len(restart_required_knobs)}",
-        "- **Auto-Restart Status**: DISABLED (Zero Downtime Policy)",
+        f"- **Auto-Restart Status**: {'EXECUTED (' + restart_msg + ')' if restarted else 'DISABLED (Zero Downtime Policy)'}",
         "",
     ]
 
     if applied_results:
-        lines.append("### Applied Dynamic Knobs")
+        lines.append("### Applied Knobs")
         for r in applied_results:
             kname = r.get("knob", "")
             kval = r.get("value", "")
@@ -262,7 +275,7 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
             lines.append(f"- **{kname}** -> `{kval}`: **{st.upper()}**{err_str}")
         lines.append("")
 
-    if restart_required_knobs:
+    if restart_required_knobs and not restarted:
         lines.append("### Deferred Knobs (Requires Scheduled Maintenance Restart)")
         for rk in restart_required_knobs:
             kname = rk.get("name", "")
@@ -270,5 +283,10 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
             reason = rk.get("reasoning", "")
             reason_str = f" — {reason}" if reason else ""
             lines.append(f"- **{kname}** -> `{kval}` (Static/Restart-Required){reason_str}")
+            
+    lines.append("")
+    lines.append("### Production Knob Verification Status")
+    for vk in verification.get("knobs", []):
+        lines.append(f"- **{vk['knob']}**: Expected `{vk['expected_value']}`, Actual `{vk['actual_value']}` -> {vk['status']}")
 
-    return "\n".join(lines)
+    return "\\n".join(lines)

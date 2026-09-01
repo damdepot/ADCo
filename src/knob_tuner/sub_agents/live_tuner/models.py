@@ -42,6 +42,10 @@ class LiveTunerOutput(BaseModel):
         default_factory=list,
         description="List of knobs requiring server restart, deferred for scheduled maintenance windows",
     )
+    persisted_static_knobs: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="List of static knobs persisted to configuration for next restart",
+    )
     skipped_reason: str = Field(
         default="",
         description="Reason why live application was skipped (e.g. staging validation failed, all knobs static)",
@@ -49,4 +53,8 @@ class LiveTunerOutput(BaseModel):
     summary: str = Field(
         default="",
         description="Executive DBA summary of live tuning operations and recommendations for upcoming maintenance",
+    )
+    next_steps: list[str] = Field(
+        default_factory=list,
+        description="Recommended operational follow-up actions (e.g. scheduled restart instructions)",
     )

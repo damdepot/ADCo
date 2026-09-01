@@ -4,13 +4,14 @@ from typing import Any
 from .db_connector import DBConfig, get_connection
 
 
-def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any) -> str:
+def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any, restart_required: bool = False) -> str:
     """Format SQL statement for applying a knob depending on the database engine.
 
     Args:
         db_type: Database type ('postgres', 'postgresql', 'mysql').
         knob_name: Name of the configuration knob.
         knob_value: Value to set for the knob.
+        restart_required: If True, indicates a static knob requiring restart.
 
     Returns:
         SQL string for setting the parameter.
@@ -29,13 +30,14 @@ def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any) -> str:
             return f"ALTER SYSTEM SET {knob_name} = '{val_str}';"
 
     elif db_type_norm == "mysql":
-        # For MySQL, SET GLOBAL <knob> = <value>;
+        # For MySQL, SET GLOBAL <knob> = <value>; or SET PERSIST_ONLY <knob> = <value>;
+        cmd = "SET PERSIST_ONLY" if restart_required else "SET GLOBAL"
         if isinstance(knob_value, (int, float)):
-            return f"SET GLOBAL {knob_name} = {knob_value};"
+            return f"{cmd} {knob_name} = {knob_value};"
         elif val_str.lower() in ("on", "off", "true", "false") or val_str.isdigit():
-            return f"SET GLOBAL {knob_name} = {val_str};"
+            return f"{cmd} {knob_name} = {val_str};"
         else:
-            return f"SET GLOBAL {knob_name} = '{val_str}';"
+            return f"{cmd} {knob_name} = '{val_str}';"
 
     else:
         raise ValueError(f"Unsupported db_type for knob application: '{db_type}'")
@@ -48,7 +50,7 @@ def apply_knobs(
 
     Args:
         knobs: List of knob specifications, where each element is a dict with
-               'name' (or 'knob') and 'value' keys.
+               'name' (or 'knob'), 'value' keys, and optionally 'restart_required'.
         cfg: DBConfig object.
         dry_run: If True, only plan the SQL queries without executing them.
 
@@ -66,8 +68,9 @@ def apply_knobs(
             if not name:
                 continue
             val = item.get("value")
+            req_restart = item.get("restart_required", False)
             try:
-                sql = _format_knob_sql(cfg.db_type, name, val)
+                sql = _format_knob_sql(cfg.db_type, name, val, restart_required=req_restart)
                 results.append(
                     {
                         "knob": name,
@@ -105,8 +108,9 @@ def apply_knobs(
                 if not name:
                     continue
                 val = item.get("value")
+                req_restart = item.get("restart_required", False)
                 try:
-                    sql = _format_knob_sql(cfg.db_type, name, val)
+                    sql = _format_knob_sql(cfg.db_type, name, val, restart_required=req_restart)
                     cursor.execute(sql)
                     if hasattr(conn, "commit") and not getattr(conn, "autocommit", False):
                         conn.commit()
@@ -129,6 +133,15 @@ def apply_knobs(
                             "error": str(e),
                         }
                     )
+            
+            # For Postgres, reload configuration so dynamic changes take effect across all sessions
+            if cfg.db_type.lower() in ("postgres", "postgresql"):
+                try:
+                    cursor.execute("SELECT pg_reload_conf();")
+                    if hasattr(conn, "commit") and not getattr(conn, "autocommit", False):
+                        conn.commit()
+                except Exception:
+                    pass
         finally:
             cursor.close()
     finally:
@@ -259,5 +272,191 @@ def test_database(cfg: DBConfig) -> dict[str, Any]:
 test_database.__test__ = False  # type: ignore[attr-defined]
 
 
-# Prevent pytest from treating test_database as a test function
 test_database.__test__ = False  # type: ignore[attr-defined]
+
+
+def _normalize_pg_value(val: str, unit: str) -> str:
+    """Normalize postgres memory/time values for comparison."""
+    if not val:
+        return ""
+    val_str = str(val).lower()
+    
+    # Try to parse as purely numeric
+    if not unit:
+        try:
+            return str(float(val_str)) if "." in val_str else str(int(val_str))
+        except ValueError:
+            pass
+            
+    try:
+        # Handling pg units to KB (or raw number)
+        # 8kB pages
+        if unit == "8kB" and val_str.isdigit():
+            return str(int(val_str) * 8) + "kB"
+        if unit == "kB":
+            return val_str + "kB"
+    except ValueError:
+        pass
+        
+    return val_str
+
+
+def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Verify if expected knobs are active on the database."""
+    report: dict[str, Any] = {
+        "status": "ok",
+        "all_verified": True,
+        "knobs": [],
+        "error": None,
+    }
+    
+    if not expected_knobs:
+        return report
+
+    conn = None
+    try:
+        conn = get_connection(cfg)
+        cursor = conn.cursor()
+        
+        db_type = cfg.db_type.lower()
+        if db_type in ("postgres", "postgresql"):
+            cursor.execute("SELECT name, setting, unit, boot_val, reset_val, pending_restart FROM pg_settings;")
+            rows = cursor.fetchall()
+            
+            # pg_settings is list of dicts (if dict cursor) or tuples
+            settings_map = {}
+            for row in rows:
+                if isinstance(row, dict):
+                    settings_map[row["name"]] = row
+                else:
+                    settings_map[row[0]] = {
+                        "name": row[0],
+                        "setting": row[1],
+                        "unit": row[2],
+                        "boot_val": row[3],
+                        "reset_val": row[4],
+                        "pending_restart": row[5] == 't' or row[5] is True
+                    }
+                    
+            for item in expected_knobs:
+                kname = item.get("name") or item.get("knob")
+                kname_str = str(kname).lower()
+                expected_val = str(item.get("value")).strip()
+                
+                # Try finding matching kname
+                matched_name = None
+                for name in settings_map.keys():
+                    if name.lower() == kname_str:
+                        matched_name = name
+                        break
+                        
+                if not matched_name:
+                    report["knobs"].append({
+                        "knob": kname,
+                        "expected_value": expected_val,
+                        "actual_value": "",
+                        "unit": "",
+                        "pending_restart": False,
+                        "status": "NOT_FOUND"
+                    })
+                    report["all_verified"] = False
+                    continue
+                    
+                s = settings_map[matched_name]
+                actual_val = s["setting"]
+                unit = s.get("unit") or ""
+                pending = s["pending_restart"]
+                
+                # We can do a simplistic check: if pending_restart is True, it's PENDING_RESTART
+                if pending:
+                    status = "PENDING_RESTART"
+                    report["all_verified"] = False
+                else:
+                    # Let's do a loose compare of expected vs actual. If expected is in actual or vice versa, or same when stripped of MB/GB etc.
+                    # As this can be complex, a simple string match or checking numeric equivalency.
+                    norm_exp = expected_val.lower().replace(" ", "")
+                    norm_act = str(actual_val).lower().replace(" ", "")
+                    
+                    if norm_exp == norm_act or (norm_act + unit) == norm_exp or norm_act == norm_exp.replace(unit.lower(), ""):
+                         status = "VERIFIED"
+                    else:
+                         status = "MISMATCH"
+                         report["all_verified"] = False
+                         
+                report["knobs"].append({
+                    "knob": matched_name,
+                    "expected_value": expected_val,
+                    "actual_value": str(actual_val),
+                    "unit": unit,
+                    "pending_restart": pending,
+                    "status": status
+                })
+
+        elif db_type == "mysql":
+            try:
+                cursor.execute("SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_variables;")
+            except Exception:
+                cursor.execute("SHOW GLOBAL VARIABLES;")
+                
+            rows = cursor.fetchall()
+            settings_map = {}
+            for row in rows:
+                if isinstance(row, dict):
+                    k = row.get("VARIABLE_NAME") or row.get("Variable_name")
+                    v = row.get("VARIABLE_VALUE") or row.get("Value")
+                    if k: settings_map[k.lower()] = v
+                else:
+                    settings_map[str(row[0]).lower()] = row[1]
+                    
+            for item in expected_knobs:
+                kname = item.get("name") or item.get("knob")
+                kname_str = str(kname).lower()
+                expected_val = str(item.get("value")).strip()
+                
+                if kname_str not in settings_map:
+                    report["knobs"].append({
+                        "knob": kname,
+                        "expected_value": expected_val,
+                        "actual_value": "",
+                        "unit": "",
+                        "pending_restart": False,
+                        "status": "NOT_FOUND"
+                    })
+                    report["all_verified"] = False
+                    continue
+                    
+                actual_val = settings_map[kname_str]
+                norm_exp = expected_val.lower().replace(" ", "")
+                norm_act = str(actual_val).lower().replace(" ", "")
+                
+                if norm_exp == norm_act:
+                    status = "VERIFIED"
+                else:
+                    status = "MISMATCH"
+                    report["all_verified"] = False
+                    
+                report["knobs"].append({
+                    "knob": kname,
+                    "expected_value": expected_val,
+                    "actual_value": str(actual_val),
+                    "unit": "",
+                    "pending_restart": False,
+                    "status": status
+                })
+
+        else:
+            report["status"] = "error"
+            report["error"] = f"Unsupported database type: {db_type}"
+
+    except Exception as e:
+        report["status"] = "error"
+        report["error"] = str(e)
+        report["all_verified"] = False
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+                
+    return report

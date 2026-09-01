@@ -15,6 +15,7 @@ def create_knob_recommender_agent(model: str = "gemini-3.5-flash-lite") -> LlmAg
         instruction=prompt.KNOB_RECOMMENDER_PROMPT,
         description="Recommends optimal database configuration knobs based on workload patterns, hardware limits, and DBA best practices.",
         tools=[
+            tools.get_knob_strategies,
             tools.read_knobs_file,
             tools.write_selected_knobs,
         ],

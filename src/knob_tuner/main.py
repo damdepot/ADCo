@@ -409,6 +409,22 @@ def main() -> None:
             if sugg:
                 print(f"     Suggestion: {sugg}")
 
+    # Next Steps section
+    restart_knobs = (
+        live_output.get("restart_required_knobs", [])
+        or result.get("prod_restart_required_knobs", [])
+    )
+    print("\n=== Next Steps ===")
+    if restart_knobs:
+        knob_names = [k.get("knob") or k.get("name") or str(k) for k in restart_knobs]
+        knob_names_str = ", ".join(filter(None, knob_names[:3]))
+        print(f"[!] Static configuration parameters have been persisted to configuration (e.g. postgresql.auto.conf).")
+        print(f"To activate these parameters ({knob_names_str}), please restart the database during your next scheduled maintenance window:")
+        print("  - Docker:  docker restart <container_name>")
+        print("  - Systemd: sudo systemctl restart postgresql (or mysql)")
+    else:
+        print("All tuned configuration parameters are active live. No database restart is required.")
+
     is_success = (checker_status == "PASS" or args.dry_run)
     sys.exit(0 if is_success else 1)
 

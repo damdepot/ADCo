@@ -6,7 +6,7 @@ from typing import Any
 from google.adk.tools import ToolContext
 
 from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
-from src.knob_tuner.tools.db_tools import apply_knobs, test_database
+from src.knob_tuner.tools.db_tools import apply_knobs, test_database, verify_active_knobs
 from src.knob_tuner.tools.file_tools import read_json_file
 from src.knob_tuner.tools.restart_tools import restart_db_by_config
 
@@ -221,7 +221,8 @@ def restart_database_staging(tool_context: ToolContext) -> str:
 def test_database_staging(tool_context: ToolContext) -> str:
     """Execute Option A database validation tests on the staging database.
 
-    Runs connectivity check, ping, schema discovery, and CRUD lifecycle tests.
+    Runs connectivity check, ping, schema discovery, CRUD lifecycle tests,
+    and active knob verification.
     Sets ``tool_context.state['staging_validated'] = (status == 'PASS')``.
 
     Args:
@@ -237,9 +238,25 @@ def test_database_staging(tool_context: ToolContext) -> str:
 
     try:
         report = test_database(cfg)
-        tool_context.state["staging_test_results"] = report
-
         is_pass = (report.get("status") == "ok")
+        
+        # Knob verification
+        selected_knobs = _load_selected_knobs(tool_context)
+        report["verified_knobs"] = []
+        if selected_knobs:
+            verification = verify_active_knobs(cfg, selected_knobs)
+            report["verified_knobs"] = verification.get("knobs", [])
+            tool_context.state["staging_verified_knobs"] = report["verified_knobs"]
+            
+            for vk in report["verified_knobs"]:
+                if vk.get("status") in ("MISMATCH", "PENDING_RESTART"):
+                    is_pass = False
+                    if not report.get("error"):
+                        report["error"] = "Knob verification mismatch or pending restart"
+        else:
+            tool_context.state["staging_verified_knobs"] = []
+            
+        tool_context.state["staging_test_results"] = report
         tool_context.state["staging_validated"] = is_pass
 
         status_str = "PASS" if is_pass else "FAIL"
@@ -257,11 +274,19 @@ def test_database_staging(tool_context: ToolContext) -> str:
             f"- **CRUD Lifecycle**: {'OK' if checks.get('crud') else 'FAILED'}",
             f"- **Tables Discovered**: {', '.join(details.get('tables_found', [])) or 'None'}",
             f"- **CRUD Result**: {details.get('crud_result', 'not_run')}",
+            "",
+            "## Knob Verification",
         ]
-        if err:
-            lines.append(f"- **Error Details**: {err}")
+        if report.get("verified_knobs"):
+            for vk in report["verified_knobs"]:
+                lines.append(f"- **{vk['knob']}**: Expected `{vk['expected_value']}`, Actual `{vk['actual_value']}` -> {vk['status']}")
+        else:
+            lines.append("- No knobs verified.")
 
-        return "\n".join(lines)
+        if err:
+            lines.append(f"\\n- **Error Details**: {err}")
+
+        return "\\n".join(lines)
     except Exception as e:
         tool_context.state["staging_validated"] = False
         return f"ERROR: Option A test suite threw an exception: {e}"

@@ -8,6 +8,14 @@ from google.adk.tools import ToolContext
 
 from src.knob_tuner.sub_agents.knob_recommender.models import KnobRecommendation
 from src.knob_tuner.tools.file_tools import read_json_file, write_json_file
+from src.knob_tuner.tools.kb_planner import get_knob_strategies
+
+
+__all__ = [
+    "read_knobs_file",
+    "write_selected_knobs",
+    "get_knob_strategies",
+]
 
 
 def read_knobs_file(tool_context: ToolContext) -> str:
