@@ -276,6 +276,9 @@ test_database.__test__ = False  # type: ignore[attr-defined]
 test_database.__test__ = False  # type: ignore[attr-defined]
 
 
+_PG_MEMORY_UNITS = {"b", "kb", "mb", "gb", "tb", "8kb", "16kb", "32kb", "64kb"}
+_PG_TIME_UNITS = {"us", "ms", "s", "min", "h", "d"}
+
 def _parse_memory_to_bytes(val: str, default_unit: str = "") -> float | None:
     """Parse a memory string to bytes."""
     units = {
@@ -310,6 +313,7 @@ def _parse_memory_to_bytes(val: str, default_unit: str = "") -> float | None:
 def _parse_time_to_ms(val: str, default_unit: str = "") -> float | None:
     """Parse a time string to milliseconds."""
     units = {
+        "us": 0.001,
         "ms": 1,
         "s": 1000,
         "min": 60 * 1000,
@@ -334,50 +338,92 @@ def _parse_time_to_ms(val: str, default_unit: str = "") -> float | None:
         return num
     return None
 
-def _values_are_equivalent(expected_val: Any, actual_val: Any, unit: str = "") -> bool:
-    """Check if expected and actual values are equivalent, considering units."""
-    exp_str = str(expected_val).strip("'\" ").lower()
-    act_str = str(actual_val).strip("'\" ").lower()
-    
-    if exp_str == act_str:
-        return True
-        
-    # Booleans
+def _parse_enumvals(raw: Any) -> set[str]:
+    if not raw:
+        return set()
+    if isinstance(raw, (list, tuple)):
+        return {str(x).strip().lower() for x in raw}
+    raw_str = str(raw).strip()
+    if raw_str.startswith("{") and raw_str.endswith("}"):
+        raw_str = raw_str[1:-1]
+    return {x.strip().lower() for x in raw_str.split(",") if x.strip()}
+
+def _compare_bool(exp: str, act: str) -> bool:
     truthy = {"on", "true", "1", "yes"}
     falsy = {"off", "false", "0", "no"}
-    if exp_str in truthy and act_str in truthy:
+    if exp in truthy and act in truthy:
         return True
-    if exp_str in falsy and act_str in falsy:
+    if exp in falsy and act in falsy:
+        return True
+    return False
+
+def _compare_enum(exp: str, act: str, enumvals: set[str]) -> bool:
+    if exp == act:
+        return True
+    truthy = {"on", "true", "1", "yes"}
+    falsy = {"off", "false", "0", "no"}
+    
+    exp_mapped = "on" if exp in truthy and "on" in enumvals else ("off" if exp in falsy and "off" in enumvals else exp)
+    act_mapped = "on" if act in truthy and "on" in enumvals else ("off" if act in falsy and "off" in enumvals else act)
+    
+    if exp_mapped == act_mapped:
         return True
         
-    # Floats
+    if enumvals and exp_mapped in enumvals and act_mapped in enumvals:
+        if (exp_mapped in falsy) != (act_mapped in falsy):
+            return False
+        return True
+        
+    return False
+
+def _compare_numeric(exp: str, act: str, unit: str) -> bool:
     try:
-        if float(exp_str) == float(act_str):
+        if float(exp) == float(act):
             return True
     except ValueError:
         pass
-        
-    # Memory
-    exp_bytes = _parse_memory_to_bytes(exp_str)
-    act_bytes = _parse_memory_to_bytes(act_str, unit)
-    if exp_bytes is not None and act_bytes is not None and exp_bytes == act_bytes:
-        return True
-        
-    # Time
-    exp_ms = _parse_time_to_ms(exp_str)
-    act_ms = _parse_time_to_ms(act_str, unit)
-    if exp_ms is not None and act_ms is not None and exp_ms == act_ms:
-        return True
-        
-    # Fallback normal string equality ignoring spaces
-    if exp_str.replace(" ", "") == act_str.replace(" ", ""):
-        return True
-    if unit and (act_str + unit.lower()) == exp_str.replace(" ", ""):
-         return True
-    if unit and act_str == exp_str.replace(" ", "").replace(unit.lower(), ""):
-         return True
-         
+
+    unit_lower = unit.lower() if unit else ""
+    
+    if unit_lower in _PG_MEMORY_UNITS or (not unit_lower and _parse_memory_to_bytes(exp) is not None):
+        exp_bytes = _parse_memory_to_bytes(exp)
+        act_bytes = _parse_memory_to_bytes(act, unit)
+        if exp_bytes is not None and act_bytes is not None and exp_bytes == act_bytes:
+            return True
+            
+    if unit_lower in _PG_TIME_UNITS or (not unit_lower and _parse_time_to_ms(exp) is not None):
+        exp_ms = _parse_time_to_ms(exp)
+        act_ms = _parse_time_to_ms(act, unit)
+        if exp_ms is not None and act_ms is not None and exp_ms == act_ms:
+            return True
+            
     return False
+
+def _compare_string(exp: str, act: str) -> bool:
+    if "," in exp or "," in act:
+        exp_list = [x.strip().strip("'\"") for x in exp.split(",") if x.strip()]
+        act_list = [x.strip().strip("'\"") for x in act.split(",") if x.strip()]
+        if exp_list == act_list:
+            return True
+    return exp == act
+
+def _values_are_equivalent(expected_val: Any, actual_val: Any, unit: str = "", vartype: str = "", enumvals: Any = None) -> bool:
+    """Check if expected and actual values are equivalent, considering units and types."""
+    exp_str = str(expected_val).strip("'\" ").lower()
+    act_str = str(actual_val).strip("'\" ").lower()
+    vt = vartype.lower()
+
+    if vt == "bool":
+        return _compare_bool(exp_str, act_str)
+    elif vt == "enum":
+        parsed_enumvals = _parse_enumvals(enumvals)
+        return _compare_enum(exp_str, act_str, parsed_enumvals)
+    elif vt in ("integer", "real"):
+        return _compare_numeric(exp_str, act_str, unit)
+    elif vt == "string":
+        return _compare_string(exp_str, act_str)
+    else:
+        return _compare_bool(exp_str, act_str) or _compare_numeric(exp_str, act_str, unit) or _compare_string(exp_str, act_str)
 
 
 
@@ -400,8 +446,15 @@ def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> 
         
         db_type = cfg.db_type.lower()
         if db_type in ("postgres", "postgresql"):
-            cursor.execute("SELECT name, setting, unit, boot_val, reset_val, pending_restart FROM pg_settings;")
-            rows = cursor.fetchall()
+            try:
+                cursor.execute("SELECT name, setting, unit, boot_val, reset_val, pending_restart, vartype, enumvals, context FROM pg_settings;")
+                rows = cursor.fetchall()
+            except Exception:
+                # Fallback to 6-column query
+                if hasattr(conn, "rollback"):
+                    conn.rollback()
+                cursor.execute("SELECT name, setting, unit, boot_val, reset_val, pending_restart FROM pg_settings;")
+                rows = cursor.fetchall()
             
             # pg_settings is list of dicts (if dict cursor) or tuples
             settings_map = {}
@@ -409,7 +462,7 @@ def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> 
                 if isinstance(row, dict):
                     settings_map[row["name"]] = row
                 else:
-                    settings_map[row[0]] = {
+                    s_dict = {
                         "name": row[0],
                         "setting": row[1],
                         "unit": row[2],
@@ -417,6 +470,11 @@ def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> 
                         "reset_val": row[4],
                         "pending_restart": row[5] == 't' or row[5] is True
                     }
+                    if len(row) >= 9:
+                        s_dict["vartype"] = row[6]
+                        s_dict["enumvals"] = row[7]
+                        s_dict["context"] = row[8]
+                    settings_map[row[0]] = s_dict
                     
             for item in expected_knobs:
                 kname = item.get("name") or item.get("knob")
@@ -446,13 +504,15 @@ def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> 
                 actual_val = s["setting"]
                 unit = s.get("unit") or ""
                 pending = s["pending_restart"]
+                vt = s.get("vartype", "")
+                evals = s.get("enumvals")
                 
                 # We can do a simplistic check: if pending_restart is True, it's PENDING_RESTART
                 if pending:
                     status = "PENDING_RESTART"
                     report["all_verified"] = False
                 else:
-                    if _values_are_equivalent(expected_val, actual_val, unit):
+                    if _values_are_equivalent(expected_val, actual_val, unit=unit, vartype=vt, enumvals=evals):
                         status = "VERIFIED"
                     else:
                         status = "MISMATCH"
