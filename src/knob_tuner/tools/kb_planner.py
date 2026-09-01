@@ -143,7 +143,7 @@ def plan_knob_tuning(db_type: str, workload_text: str = "", memory_gb: float = 1
     keyword_map: dict[str, list[str]] = {
         "PG_SHARED_MEMORY_MANAGEMENT": ["cache", "read", "memory", "buffer", "oltp"],
         "PG_PER_QUERY_EXECUTION_MEMORY": ["sort", "join", "hash", "aggregate", "olap", "batch", "complex", "spill", "temp"],
-        "PG_WAL_CHECKPOINTING_AND_DURABILITY": ["write", "wal", "checkpoint", "insert", "update", "load"],
+        "PG_WAL_CHECKPOINTING_AND_DURABILITY": ["write", "wal", "checkpoint", "insert", "update", "load", "oltp", "commit", "throughput", "batch"],
         "PG_QUERY_PLANNER_AND_IO_CONCURRENCY": ["scan", "ssd", "hdd", "index", "plan", "cost"],
         "PG_CONCURRENCY_AND_PARALLEL_WORKERS": ["connection", "parallel", "worker", "concurrent", "pool"],
         "PG_AUTOVACUUM_BACKGROUND_MAINTENANCE": ["vacuum", "bloat", "dead tuple", "update", "delete", "churn"],
@@ -151,7 +151,7 @@ def plan_knob_tuning(db_type: str, workload_text: str = "", memory_gb: float = 1
         
         "MYSQL_GLOBAL_BUFFER_POOL_MANAGEMENT": ["cache", "read", "memory", "buffer", "pool"],
         "MYSQL_PER_SESSION_BUFFERS_AND_TEMP_TABLES": ["sort", "join", "temp", "heap", "group by", "order by", "olap"],
-        "MYSQL_REDO_LOGGING_AND_TRANSACTION_DURABILITY": ["write", "redo", "flush", "commit", "insert", "update"],
+        "MYSQL_REDO_LOGGING_AND_TRANSACTION_DURABILITY": ["write", "redo", "flush", "commit", "insert", "update", "oltp", "throughput", "batch"],
         "MYSQL_STORAGE_IO_THREADS_AND_CAPACITY": ["io", "ssd", "nvme", "thread", "flush", "capacity"],
         "MYSQL_CONNECTIONS_AND_THREAD_CACHING": ["connection", "thread", "concurrent", "open"],
         "MYSQL_INNODB_PURGE_AND_BACKGROUND_MAINTENANCE": ["purge", "cleaner", "undo", "update", "delete"],
