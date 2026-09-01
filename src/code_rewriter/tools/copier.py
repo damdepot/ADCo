@@ -138,8 +138,8 @@ def copy_to_sandbox(tool_context: ToolContext) -> str:
     target = tool_context.state.get("target", "")
     if not target:
         return "ERROR: target path not set in state"
-    output_path = tool_context.state.get("output_path")
-    sandbox = copy_entire(target, dest_override=output_path)
+    dest_override = tool_context.state.get("sandbox_dir") or tool_context.state.get("dest_override")
+    sandbox = copy_entire(target, dest_override=dest_override)
     n = rewrite_imports(sandbox, target)
     tool_context.state["sandbox"] = sandbox
     return f"OK: sandbox created at {sandbox} ({n} files had imports rewritten)"

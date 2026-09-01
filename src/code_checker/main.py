@@ -1,16 +1,20 @@
 """CLI entry point for the ADCo checker.
 
 Usage:
-    uv run python -m checker <sandbox_dir> [--model MODEL] [--verbose]
+    uv run python -m checker <sandbox_dir> [OPTIONS]
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
+import json
 import os
+import re
 import sys
 import uuid
+from typing import Any
 
 from dotenv import load_dotenv
 from google.genai import types
@@ -25,7 +29,36 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 
-def main() -> None:
+def _maybe_parse(value: Any) -> dict:
+    """Return *value* as a dict, JSON-parsing strings (stripping markdown fences)."""
+    if isinstance(value, str):
+        stripped = re.sub(r"^```[a-z]*\n?", "", value.strip(), flags=re.MULTILINE)
+        stripped = re.sub(r"```$", "", stripped.strip())
+        try:
+            return json.loads(stripped.strip())
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    return value if isinstance(value, dict) else {}
+
+
+def _log_event(msg: str, log_file: str | None = None, verbose: bool = False) -> None:
+    """Write log entry to file and optionally stdout."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted_msg = f"[{timestamp}] {msg}"
+    if verbose:
+        print(formatted_msg)
+    if log_file:
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(formatted_msg + "\n")
+        except Exception:
+            pass
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct and return the argument parser for checker CLI."""
     parser = argparse.ArgumentParser(
         description="ADCo Checker — safety audit for sandbox-optimized code",
     )
@@ -44,77 +77,67 @@ def main() -> None:
         help="Path to the original (pre-rewrite) codebase directory for diff comparison",
     )
     parser.add_argument(
+        "--log-file",
+        default="logs/code_checker.log",
+        help="Path to execution log file (default: logs/code_checker.log)",
+    )
+    parser.add_argument(
+        "--output-path",
+        default="out/code_checker/result.json",
+        help="Path to write final checker result output (default: out/code_checker/result.json)",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Print detailed agent activity",
     )
-    args = parser.parse_args()
-
-    sandbox = os.path.abspath(args.sandbox_dir)
-    if not os.path.isdir(sandbox):
-        print(f"ERROR: not a directory: {sandbox}", file=sys.stderr)
-        sys.exit(2)
-
-    try:
-        result = asyncio.run(
-            _run_checker(sandbox, original=args.original, model=args.model, verbose=args.verbose)
-        )
-    except Exception as exc:
-        print(f"\n=== Checker ===")
-        print(f"Run:      fail")
-        print(f"Error:    {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    checker_output = result.get("checker_output", {})
-    if isinstance(checker_output, dict):
-        check_status = checker_output.get("status", "FAIL")
-        issues = checker_output.get("issues", [])
-        summary = checker_output.get("summary", "")
-    elif isinstance(checker_output, CheckerOutput):
-        check_status = checker_output.status
-        issues = checker_output.issues
-        summary = checker_output.summary
-    else:
-        check_status = "FAIL"
-        issues = []
-        summary = "Failed to parse checker output"
-
-    print(f"\n=== Checker ===")
-    print(f"Run:      success")
-    print(f"Result:   {check_status}")
-    print(f"Sandbox:  {sandbox}")
-    print(f"Model:    {args.model}")
-    print(f"Issues:   {len(issues)}")
-
-    if summary:
-        print(f"Summary:  {summary}")
-
-    if issues:
-        print("\nIssues found:")
-        for i, issue in enumerate(issues, 1):
-            if isinstance(issue, dict):
-                print(
-                    f"  {i}. [{issue.get('severity', '?')}] [{issue.get('category', '?')}] "
-                    f"{issue.get('file', '?')}:{issue.get('line', 0)} — "
-                    f"{issue.get('description', '')}"
-                )
-            else:
-                print(
-                    f"  {i}. [{issue.severity}] [{issue.category}] "
-                    f"{issue.file}:{issue.line} — {issue.description}"
-                )
-
-    sys.exit(0)
+    return parser
 
 
-async def _run_checker(
-    sandbox: str, original: str = "", model: str = DEFAULT_MODEL, verbose: bool = False
-) -> dict:
+def _write_output_result(output_path: str, state: dict[str, Any], model: str = "") -> None:
+    """Serialize and write final checker outcome to the output path."""
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    checker_output = _maybe_parse(state.get("checker_output", {}))
+    issues = checker_output.get("issues", [])
+    
+    result_data = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "sandbox": state.get("sandbox"),
+        "original": state.get("original", ""),
+        "model": model,
+        "status": checker_output.get("status", "FAIL"),
+        "issues_count": len(issues),
+        "issues": issues,
+        "summary": checker_output.get("summary", ""),
+        "checker_output": checker_output,
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result_data, f, indent=2, default=str)
+
+
+async def run_checker(
+    sandbox: str,
+    original: str = "",
+    model: str = DEFAULT_MODEL,
+    log_file: str = "logs/code_checker.log",
+    output_path: str = "out/code_checker/result.json",
+    verbose: bool = False
+) -> dict[str, Any]:
+    """Execute the checker pipeline using Google ADK Runner and session service."""
+    sandbox_abs = os.path.abspath(sandbox)
+    output_path_abs = os.path.abspath(output_path)
+    log_file_abs = os.path.abspath(log_file)
+
+    os.makedirs(os.path.dirname(log_file_abs), exist_ok=True)
+    os.makedirs(os.path.dirname(output_path_abs), exist_ok=True)
+
     session_service = InMemorySessionService()
     sid = uuid.uuid4().hex[:12]
     app_name = "adco_checker"
 
-    state = {"sandbox": sandbox}
+    state = {"sandbox": sandbox_abs}
     if original and os.path.isdir(original):
         state["original"] = os.path.abspath(original)
 
@@ -133,17 +156,23 @@ async def _run_checker(
     original_note = ""
     if original and os.path.isdir(original):
         original_note = (
-            f"\nThe original (pre-rewrite) codebase is at: {original}\n"
+            f"\nThe original (pre-rewrite) codebase is at: {state['original']}\n"
             f"Use read_original_file() to compare against the optimized code "
             f"for every regression check."
         )
 
     user_message = (
-        f"Audit the sandbox-optimized codebase at: {sandbox}\n"
+        f"Audit the sandbox-optimized codebase at: {sandbox_abs}\n"
         f"{original_note}\n"
         f"Find modified files, read them, and check for correctness, "
         f"safety, regression, completeness, and performance issues. "
         f"Report your findings as structured JSON."
+    )
+
+    _log_event(
+        f"Starting code_checker (model={model}, sandbox={sandbox_abs}, original={original})",
+        log_file=log_file_abs,
+        verbose=verbose,
     )
 
     async for event in runner.run_async(
@@ -153,21 +182,90 @@ async def _run_checker(
             role="user", parts=[types.Part(text=user_message)]
         ),
     ):
-        if event.content and event.content.parts:
-            for part in event.content.parts:
-                if part.function_call and verbose:
-                    print(
-                        f"  [tool] {part.function_call.name}({part.function_call.args})"
-                    )
-                if part.function_response and verbose:
-                    resp = str(part.function_response.response)
-                    print(f"  [tool result] {resp[:160]}")
-                if part.text and not event.partial and verbose:
-                    print(part.text, end="")
+        if not event.content or not event.content.parts:
+            continue
+            
+        for part in event.content.parts:
+            if part.function_call:
+                name = part.function_call.name or ""
+                args = part.function_call.args
+                _log_event(f"  [tool call] {name}({args})", log_file=log_file_abs, verbose=verbose)
+                
+            if part.function_response:
+                resp = str(part.function_response.response)
+                preview = resp[:200] + "..." if len(resp) > 200 else resp
+                _log_event(f"  [tool result] {preview}", log_file=log_file_abs, verbose=verbose)
+                
+            if part.text and not event.partial:
+                _log_event(f"  [agent] {part.text.strip()}", log_file=log_file_abs, verbose=verbose)
 
     session = await session_service.get_session(
         app_name=app_name, user_id="checker", session_id=sid
     )
-    state = dict(session.state)
+    final_state = dict(session.state)
 
-    return state
+    _write_output_result(output_path_abs, final_state, model=model)
+    _log_event(f"Checker completed. Output written to {output_path_abs}", log_file=log_file_abs, verbose=verbose)
+
+    return final_state
+
+# Alias for backwards compatibility
+_run_checker = run_checker
+
+def main() -> None:
+    """CLI main entry point."""
+    parser = build_parser()
+    args = parser.parse_args()
+
+    sandbox = os.path.abspath(args.sandbox_dir)
+    if not os.path.isdir(sandbox):
+        print(f"ERROR: not a directory: {sandbox}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        result = asyncio.run(
+            run_checker(
+                sandbox=sandbox, 
+                original=args.original, 
+                model=args.model,
+                log_file=args.log_file,
+                output_path=args.output_path,
+                verbose=args.verbose
+            )
+        )
+    except Exception as exc:
+        print(f"\n=== Checker ===")
+        print(f"Run:      fail")
+        print(f"Error:    {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    checker_output = _maybe_parse(result.get("checker_output", {}))
+    check_status = checker_output.get("status", "FAIL")
+    issues = checker_output.get("issues", [])
+    summary = checker_output.get("summary", "")
+
+    print(f"\n=== Checker ===")
+    print(f"Run:      success")
+    print(f"Result:   {check_status}")
+    print(f"Sandbox:  {sandbox}")
+    print(f"Model:    {args.model}")
+    print(f"Issues:   {len(issues)}")
+
+    if summary:
+        print(f"Summary:  {summary}")
+
+    if issues:
+        print("\nIssues found:")
+        for i, issue in enumerate(issues, 1):
+            severity = issue.get('severity', '?')
+            category = issue.get('category', '?')
+            file_path = issue.get('file', '?')
+            line = issue.get('line', 0)
+            desc = issue.get('description', '')
+            print(f"  {i}. [{severity}] [{category}] {file_path}:{line} — {desc}")
+
+    sys.exit(0 if check_status == "PASS" else 1)
+
+
+if __name__ == "__main__":
+    main()

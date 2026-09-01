@@ -17,7 +17,7 @@ knob-tune:
 # ── Generate optimized code ──
 rewrite:
 	@echo "Generating optimized code..."
-	uv run python -m src.rewriter $(DIR) \
+	uv run python -m src.code_rewriter $(DIR) \
 		--model=gemini-3.5-flash-lite \
 		--verbose
 
