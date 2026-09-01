@@ -25,6 +25,7 @@ services:
       - "3307:3306"
     volumes:
       - mysql_baseline_data:/var/lib/mysql
+      - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
     deploy:
       resources:
         limits:
@@ -39,6 +40,7 @@ services:
       - "3308:3306"
     volumes:
       - mysql_staging_data:/var/lib/mysql
+      - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
     deploy:
       resources:
         limits:
@@ -53,6 +55,7 @@ services:
       - "3306:3306"
     volumes:
       - mysql_production_data:/var/lib/mysql
+      - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
     deploy:
       resources:
         limits:
@@ -67,6 +70,7 @@ services:
       - "5433:5432"
     volumes:
       - postgres_baseline_data:/var/lib/postgresql/data
+      - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
     deploy:
       resources:
         limits:
@@ -81,6 +85,7 @@ services:
       - "5434:5432"
     volumes:
       - postgres_staging_data:/var/lib/postgresql/data
+      - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
     deploy:
       resources:
         limits:
@@ -95,6 +100,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_production_data:/var/lib/postgresql/data
+      - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
     deploy:
       resources:
         limits:
