@@ -131,11 +131,21 @@ def test_apply_knobs_production_guardrail_blocks_unvalidated(mock_db_config_pg):
     assert "ERROR: Guardrail check failed" in result
 
 
+@patch("src.knob_tuner.sub_agents.live_tuner.tools.verify_active_knobs")
 @patch("src.knob_tuner.sub_agents.live_tuner.tools.apply_knobs")
-def test_apply_knobs_production_success_splits_dynamic_and_static(mock_apply, mock_db_config_pg):
+def test_apply_knobs_production_success_splits_dynamic_and_static(mock_apply, mock_verify, mock_db_config_pg):
     mock_apply.return_value = [
-        {"knob": "work_mem", "value": "32MB", "status": "applied", "error": None}
+        {"knob": "work_mem", "value": "32MB", "status": "applied", "error": None},
+        {"knob": "shared_buffers", "value": "4GB", "status": "applied", "error": None},
     ]
+    mock_verify.return_value = {
+        "status": "ok",
+        "all_verified": True,
+        "knobs": [
+            {"knob": "work_mem", "expected_value": "32MB", "actual_value": "32MB", "status": "VERIFIED"},
+            {"knob": "shared_buffers", "expected_value": "4GB", "actual_value": "4GB", "status": "PENDING_RESTART"},
+        ],
+    }
     knobs = [
         {"knob": "work_mem", "recommended_value": "32MB", "restart_required": False},
         {"knob": "shared_buffers", "recommended_value": "4GB", "restart_required": True, "reasoning": "25% RAM"},
@@ -149,18 +159,31 @@ def test_apply_knobs_production_success_splits_dynamic_and_static(mock_apply, mo
     result = apply_knobs_production(tc)
 
     assert "Production Live Tuning Report" in result
-    assert "**Dynamic Knobs Applied Live**: 1/1" in result
+    assert "**Knobs Processed**: 2/2" in result
     assert "**Static / Restart-Required Knobs Deferred**: 1" in result
     assert "**Auto-Restart Status**: DISABLED" in result
     assert "shared_buffers" in result
     assert "work_mem" in result
     assert tc.state["prod_restart_required_knobs"][0]["name"] == "shared_buffers"
-    assert len(tc.state["prod_applied_knobs"]) == 1
+    assert len(tc.state["prod_applied_knobs"]) == 2
     mock_apply.assert_called_once()
 
 
+@patch("src.knob_tuner.sub_agents.live_tuner.tools.verify_active_knobs")
 @patch("src.knob_tuner.sub_agents.live_tuner.tools.apply_knobs")
-def test_apply_knobs_production_all_static_knobs(mock_apply, mock_db_config_pg):
+def test_apply_knobs_production_all_static_knobs(mock_apply, mock_verify, mock_db_config_pg):
+    mock_apply.return_value = [
+        {"knob": "shared_buffers", "value": "4GB", "status": "applied", "error": None},
+        {"knob": "max_connections", "value": "500", "status": "applied", "error": None},
+    ]
+    mock_verify.return_value = {
+        "status": "ok",
+        "all_verified": False,
+        "knobs": [
+            {"knob": "shared_buffers", "expected_value": "4GB", "actual_value": "128MB", "status": "PENDING_RESTART"},
+            {"knob": "max_connections", "expected_value": "500", "actual_value": "100", "status": "PENDING_RESTART"},
+        ],
+    }
     knobs = [
         {"knob": "shared_buffers", "recommended_value": "4GB", "restart_required": True},
         {"knob": "max_connections", "recommended_value": "500", "restart_required": True},
@@ -173,9 +196,9 @@ def test_apply_knobs_production_all_static_knobs(mock_apply, mock_db_config_pg):
 
     result = apply_knobs_production(tc)
 
-    assert "**Dynamic Knobs Applied Live**: 0/0" in result
+    assert "**Knobs Processed**: 2/2" in result
     assert "**Static / Restart-Required Knobs Deferred**: 2" in result
-    mock_apply.assert_not_called()
+    mock_apply.assert_called_once()
 
 
 def test_apply_knobs_production_missing_config():

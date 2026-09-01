@@ -104,10 +104,11 @@ def test_create_knob_recommender_agent():
     assert agent.name == "knob_recommender"
     assert agent.output_key == "knob_recommender_output"
     assert agent.output_schema == KnobRecommenderOutput
-    assert len(agent.tools) == 2
+    assert len(agent.tools) == 3
     tool_names = [t.__name__ for t in agent.tools]
     assert "read_knobs_file" in tool_names
     assert "write_selected_knobs" in tool_names
+    assert "get_knob_strategies" in tool_names
 
 
 # ===========================================================================
