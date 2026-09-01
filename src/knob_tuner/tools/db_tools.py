@@ -1,5 +1,6 @@
 """Database tuning tools: applying database knobs and running health/connectivity tests."""
 
+import re
 from typing import Any
 from .db_connector import DBConfig, get_connection
 
@@ -275,30 +276,109 @@ test_database.__test__ = False  # type: ignore[attr-defined]
 test_database.__test__ = False  # type: ignore[attr-defined]
 
 
-def _normalize_pg_value(val: str, unit: str) -> str:
-    """Normalize postgres memory/time values for comparison."""
-    if not val:
-        return ""
-    val_str = str(val).lower()
+def _parse_memory_to_bytes(val: str, default_unit: str = "") -> float | None:
+    """Parse a memory string to bytes."""
+    units = {
+        "b": 1,
+        "kb": 1024,
+        "mb": 1024**2,
+        "gb": 1024**3,
+        "tb": 1024**4,
+        "8kb": 8192,
+        "16kb": 16384,
+        "32kb": 32768,
+        "64kb": 65536,
+    }
+    val = val.lower().replace(" ", "").strip("'\"")
+    match = re.match(r"^([\d\.]+)([a-z]*)$", val)
+    if not match:
+        return None
     
-    # Try to parse as purely numeric
-    if not unit:
-        try:
-            return str(float(val_str)) if "." in val_str else str(int(val_str))
-        except ValueError:
-            pass
-            
+    num_part, unit_part = match.groups()
     try:
-        # Handling pg units to KB (or raw number)
-        # 8kB pages
-        if unit == "8kB" and val_str.isdigit():
-            return str(int(val_str) * 8) + "kB"
-        if unit == "kB":
-            return val_str + "kB"
+        num = float(num_part)
+    except ValueError:
+        return None
+        
+    unit_part = unit_part or default_unit.lower()
+    if unit_part and unit_part in units:
+        return num * units[unit_part]
+    if not unit_part:
+        return num
+    return None
+
+def _parse_time_to_ms(val: str, default_unit: str = "") -> float | None:
+    """Parse a time string to milliseconds."""
+    units = {
+        "ms": 1,
+        "s": 1000,
+        "min": 60 * 1000,
+        "h": 60 * 60 * 1000,
+        "d": 24 * 60 * 60 * 1000,
+    }
+    val = val.lower().replace(" ", "").strip("'\"")
+    match = re.match(r"^([\d\.]+)([a-z]*)$", val)
+    if not match:
+        return None
+        
+    num_part, unit_part = match.groups()
+    try:
+        num = float(num_part)
+    except ValueError:
+        return None
+        
+    unit_part = unit_part or default_unit.lower()
+    if unit_part and unit_part in units:
+        return num * units[unit_part]
+    if not unit_part:
+        return num
+    return None
+
+def _values_are_equivalent(expected_val: Any, actual_val: Any, unit: str = "") -> bool:
+    """Check if expected and actual values are equivalent, considering units."""
+    exp_str = str(expected_val).strip("'\" ").lower()
+    act_str = str(actual_val).strip("'\" ").lower()
+    
+    if exp_str == act_str:
+        return True
+        
+    # Booleans
+    truthy = {"on", "true", "1", "yes"}
+    falsy = {"off", "false", "0", "no"}
+    if exp_str in truthy and act_str in truthy:
+        return True
+    if exp_str in falsy and act_str in falsy:
+        return True
+        
+    # Floats
+    try:
+        if float(exp_str) == float(act_str):
+            return True
     except ValueError:
         pass
         
-    return val_str
+    # Memory
+    exp_bytes = _parse_memory_to_bytes(exp_str)
+    act_bytes = _parse_memory_to_bytes(act_str, unit)
+    if exp_bytes is not None and act_bytes is not None and exp_bytes == act_bytes:
+        return True
+        
+    # Time
+    exp_ms = _parse_time_to_ms(exp_str)
+    act_ms = _parse_time_to_ms(act_str, unit)
+    if exp_ms is not None and act_ms is not None and exp_ms == act_ms:
+        return True
+        
+    # Fallback normal string equality ignoring spaces
+    if exp_str.replace(" ", "") == act_str.replace(" ", ""):
+        return True
+    if unit and (act_str + unit.lower()) == exp_str.replace(" ", ""):
+         return True
+    if unit and act_str == exp_str.replace(" ", "").replace(unit.lower(), ""):
+         return True
+         
+    return False
+
 
 
 def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -372,16 +452,11 @@ def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> 
                     status = "PENDING_RESTART"
                     report["all_verified"] = False
                 else:
-                    # Let's do a loose compare of expected vs actual. If expected is in actual or vice versa, or same when stripped of MB/GB etc.
-                    # As this can be complex, a simple string match or checking numeric equivalency.
-                    norm_exp = expected_val.lower().replace(" ", "")
-                    norm_act = str(actual_val).lower().replace(" ", "")
-                    
-                    if norm_exp == norm_act or (norm_act + unit) == norm_exp or norm_act == norm_exp.replace(unit.lower(), ""):
-                         status = "VERIFIED"
+                    if _values_are_equivalent(expected_val, actual_val, unit):
+                        status = "VERIFIED"
                     else:
-                         status = "MISMATCH"
-                         report["all_verified"] = False
+                        status = "MISMATCH"
+                        report["all_verified"] = False
                          
                 report["knobs"].append({
                     "knob": matched_name,
@@ -426,10 +501,7 @@ def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> 
                     continue
                     
                 actual_val = settings_map[kname_str]
-                norm_exp = expected_val.lower().replace(" ", "")
-                norm_act = str(actual_val).lower().replace(" ", "")
-                
-                if norm_exp == norm_act:
+                if _values_are_equivalent(expected_val, actual_val):
                     status = "VERIFIED"
                 else:
                     status = "MISMATCH"
