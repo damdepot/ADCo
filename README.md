@@ -36,10 +36,11 @@ Read-only post-hoc audit of the sandbox. Finds files tagged `ADCO_OPTIMIZED`, re
 flowchart TD
     A[("Codebase +<br/>db.config")] --> B["intent_analyzer"]
     B --> C["knob_recommender"]
+    KB[("Knob Tuning<br/>Knowledge Base")] --> C
     C --> D["knob_checker"]
     D -->|PASS| E["live_tuner"]
     D -->|FAIL| C
-    D -.retries exhausted (4).-> F[("Abort")]
+    D -. "retries exhausted (4)" .-> F([Abort])
     E --> G[("Tuned DB")]
 ```
 
