@@ -37,7 +37,7 @@ Labeled toy projects for measuring how well the ADCo checker detects issues that
 
 ### intent.json fields
 
-Mirrors `rewriter/sub_agents/intent_extractor/models.py` (`IntentExtractorOutput`): `connection`, `queries`, `transactions`, `n_plus_one`, `concurrency`, `orm`, `optimization_targets` (list of `{file, description}`), `notes`.
+Mirrors `code_rewriter/sub_agents/intent_extractor/models.py` (`IntentExtractorOutput`): `connection`, `queries`, `transactions`, `n_plus_one`, `concurrency`, `orm`, `optimization_targets` (list of `{file, description}`), `notes`.
 
 ## Planted flaws (negatives)
 

@@ -1,17 +1,116 @@
+x-mysql-base: &mysql-base
+  image: mysql:8.4
+  platform: linux/amd64
+  restart: always
+  environment:
+    MYSQL_ROOT_PASSWORD: mysql_root_password
+    MYSQL_DATABASE: adco_db
+  command: --mysql-native-password=ON
+
+x-postgres-base: &postgres-base
+  image: postgres:17
+  platform: linux/amd64
+  restart: always
+  environment:
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: postgres
+    POSTGRES_DB: adco_db
+
 services:
-  mysql-db:
-    image: mysql:8.4
-    platform: linux/amd64
-    container_name: adco-mysql
-    restart: always
+  mysql-baseline:
+    profiles: ["mysql"]
+    <<: *mysql-base
+    container_name: adco-mysql-baseline
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_baseline_data:/var/lib/mysql
+      - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  mysql-staging:
+    profiles: ["mysql"]
+    <<: *mysql-base
+    container_name: adco-mysql-staging
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql_staging_data:/var/lib/mysql
+      - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  mysql-production:
+    profiles: ["mysql"]
+    <<: *mysql-base
+    container_name: adco-mysql-production
     ports:
       - "3306:3306"
-    environment:
-      MYSQL_ROOT_PASSWORD: mysql_root_password
-      MYSQL_DATABASE: adco_db
     volumes:
-      - mysql_data:/var/lib/mysql
-    command: --mysql-native-password=ON
+      - mysql_production_data:/var/lib/mysql
+      - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  postgres-baseline:
+    profiles: ["postgres"]
+    <<: *postgres-base
+    container_name: adco-postgres-baseline
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_baseline_data:/var/lib/postgresql/data
+      - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  postgres-staging:
+    profiles: ["postgres"]
+    <<: *postgres-base
+    container_name: adco-postgres-staging
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_staging_data:/var/lib/postgresql/data
+      - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  postgres-production:
+    profiles: ["postgres"]
+    <<: *postgres-base
+    container_name: adco-postgres-production
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_production_data:/var/lib/postgresql/data
+      - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
 
 volumes:
-  mysql_data:
+  mysql_baseline_data:
+  mysql_staging_data:
+  mysql_production_data:
+  postgres_baseline_data:
+  postgres_staging_data:
+  postgres_production_data:

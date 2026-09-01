@@ -1,7 +1,7 @@
 [project]
-name = "pytpcc-setup"
-version = "0.1.0"
-description = "Add your description here"
+name = "ADCo"
+version = "1.0.0-alpha"
+description = "Application Database Co-design"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
     "sqlparse>=0.5.5",
     "google-adk>=2.5.0",
     "pymysql>=1.2.0",
+    "psycopg2-binary>=2.9.12",
 ]
 
 [tool.pytest.ini_options]

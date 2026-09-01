@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from src.rewriter.tools.scanner import scan, format_for_llm, FileInfo, ScanResult
+from src.code_rewriter.tools.scanner import scan, format_for_llm, FileInfo, ScanResult
 
 
 def test_scan_finds_python_files():

@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from src.checker.models import CheckerIssue, CheckerOutput
-from src.checker.tools import find_modified_files, read_file, read_original_file, list_sandbox
+from src.code_checker.models import CheckerIssue, CheckerOutput
+from src.code_checker.tools import find_modified_files, read_file, read_original_file, list_sandbox
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +273,7 @@ def test_read_original_file_no_original():
 # ---------------------------------------------------------------------------
 
 def test_create_checker_agent():
-    from src.checker.agent import create_checker_agent
+    from src.code_checker.agent import create_checker_agent
     agent = create_checker_agent("gemini-3.5-flash-lite")
     assert agent.name == "adco_checker"
     assert agent.output_key == "checker_output"
