@@ -23,7 +23,7 @@
 *   **Definition**: Controls the amount of memory allocated for internal sort operations, hash tables, and maintenance tasks.
 *   **Objective**: Prevent disk spills during complex queries (sorts, joins) and speed up maintenance operations like VACUUM and CREATE INDEX.
 *   **Formulas / Baseline**:
-    *   `work_mem`: (Total RAM * 0.25) / max_connections.
+    *   `work_mem`: Start with 2–64 MB per connection; adjust iteratively based on observed disk spills (not a fixed formula, as a single query can run multiple memory-intensive operations simultaneously).
     *   `maintenance_work_mem`: 10% of total RAM, up to 2GB.
     *   `autovacuum_work_mem`: Default to `maintenance_work_mem` or -1.
 *   **Conditions**: Important for OLAP, batch processing, or queries with large aggregations and joins.
@@ -33,14 +33,19 @@
 ## 3. PG_WAL_CHECKPOINTING_AND_DURABILITY
 *   **Engine**: PostgreSQL
 *   **Category**: Write-Ahead Logging
-*   **Knobs**: checkpoint_completion_target, max_wal_size, min_wal_size, wal_buffers, wal_compression
-*   **Definition**: Manages how transactional data is written to disk. Tuning checkpoints spreads write I/O to avoid spikes.
+*   **Knobs**: checkpoint_completion_target, max_wal_size, min_wal_size, wal_buffers, wal_compression, commit_delay, commit_siblings, checkpoint_timeout, bgwriter_delay, bgwriter_lru_maxpages, bgwriter_lru_multiplier
+*   **Definition**: Manages how transactional data is written to disk. Tuning checkpoints spreads write I/O to avoid spikes. Background writer settings help flush dirty pages smoothly.
 *   **Objective**: Optimize write performance, avoid I/O bottlenecks during checkpoints, and maintain durability guarantees.
 *   **Formulas / Baseline**:
     *   `checkpoint_completion_target`: 0.9.
     *   `max_wal_size`: 1GB to 10GB depending on write volume.
     *   `min_wal_size`: 80MB to 1GB.
-    *   `wal_buffers`: 16MB (usually sufficient).
+    *   `wal_buffers`: Default `-1` (auto-calculated as 1/32 of shared_buffers, effectively ~16 MB); increase to 32 MB only for extremely write-intensive workloads.
+    *   `checkpoint_timeout`: 15min to 30min (reduces checkpoint I/O spikes).
+    *   `commit_delay`: 100us to 1000us (e.g. 500us) with `commit_siblings`: 2 to 5 for WAL group commit batching.
+    *   `bgwriter_delay`: Default 200ms; lower only after profiling I/O latency (lowering to 10–20ms causes continuous CPU overhead on most systems).
+    *   `bgwriter_lru_maxpages`: 400 to 1000
+    *   `bgwriter_lru_multiplier`: 2.0 to 4.0
     *   `wal_compression`: 'on'.
 *   **Conditions**: Write-heavy workloads, bulk data loads, and systems with high transaction rates.
 *   **Restart Requirement**: Dynamic for `checkpoint_completion_target` and wal sizes. Static for `wal_buffers`.
@@ -83,7 +88,7 @@
 *   **Definition**: Configures the daemon responsible for reclaiming dead tuples and updating table statistics.
 *   **Objective**: Prevent table bloat, keep statistics fresh, and avoid autovacuum from consuming all I/O.
 *   **Formulas / Baseline**:
-    *   `autovacuum_vacuum_scale_factor`: 0.05 (5%) or lower for large tables.
+    *   `autovacuum_vacuum_scale_factor`: Default 0.2 (20%); lower to 0.05 or less only for large, frequently-updated tables where bloat is critical.
     *   `autovacuum_analyze_scale_factor`: 0.02 (2%).
     *   `autovacuum_vacuum_cost_limit`: 200 to 2000.
     *   `autovacuum_vacuum_cost_delay`: 2ms to 10ms.
@@ -99,7 +104,7 @@
 *   **Objective**: Recover service availability by stepping down aggressive memory or connection settings.
 *   **Formulas / Baseline**:
     *   OOM stepdown: Reduce `work_mem` by 50% if OOM occurs.
-    *   Startup crash: Reduce `shared_buffers` to 128MB or 10% of RAM.
+    *   Startup crash: Reduce `shared_buffers` incrementally (e.g., halve it) until the instance starts; diagnose OS-level limits (e.g., `vm.nr_hugepages`, `kernel.shmmax`) as the root cause rather than applying a fixed fallback value.
     *   Syntax error: Remove unrecognized parameters based on PG version.
 *   **Conditions**: System failure, container OOM kill, or startup errors in logs.
 *   **Restart Requirement**: Static (often needed to recover).
@@ -196,7 +201,7 @@
 ## 14. MYSQL_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY
 *   **Engine**: MySQL
 *   **Category**: Remediation
-*   **Knobs**: innodb_buffer_pool_size, sort_buffer_size, old_passwords
+*   **Knobs**: innodb_buffer_pool_size, sort_buffer_size
 *   **Definition**: Emergency configurations when MySQL fails to start or encounters severe OOM.
 *   **Objective**: Restore uptime by safely reducing memory allocations or removing deprecated syntax.
 *   **Formulas / Baseline**:
