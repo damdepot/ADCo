@@ -129,6 +129,93 @@ def _parse_knob_kb(kb_path: str | None = None, target_engine: str | None = None)
     return strategies
 
 
+KEYWORD_MAP: dict[str, list[str]] = {
+    "PG_SHARED_MEMORY_MANAGEMENT": ["cache", "read", "memory", "buffer", "oltp", "thrashing"],
+    "PG_PER_QUERY_EXECUTION_MEMORY": ["sort", "join", "hash", "aggregate", "olap", "batch", "complex", "spill", "temp"],
+    "PG_WAL_CHECKPOINTING_AND_DURABILITY": ["write", "wal", "checkpoint", "insert", "update", "load", "oltp", "commit", "throughput", "batch", "latency"],
+    "PG_QUERY_PLANNER_AND_IO_CONCURRENCY": ["scan", "ssd", "hdd", "index", "plan", "cost"],
+    "PG_CONCURRENCY_AND_PARALLEL_WORKERS": ["connection", "parallel", "worker", "concurrent", "pool", "contention"],
+    "PG_AUTOVACUUM_BACKGROUND_MAINTENANCE": ["vacuum", "bloat", "dead tuple", "update", "delete", "churn"],
+    "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY": ["crash", "oom", "fail", "error", "restart", "start", "regression"],
+
+    "MYSQL_GLOBAL_BUFFER_POOL_MANAGEMENT": ["cache", "read", "memory", "buffer", "pool", "thrashing"],
+    "MYSQL_PER_SESSION_BUFFERS_AND_TEMP_TABLES": ["sort", "join", "temp", "heap", "group by", "order by", "olap"],
+    "MYSQL_REDO_LOGGING_AND_TRANSACTION_DURABILITY": ["write", "redo", "flush", "commit", "insert", "update", "oltp", "throughput", "batch", "latency"],
+    "MYSQL_STORAGE_IO_THREADS_AND_CAPACITY": ["io", "ssd", "nvme", "thread", "flush", "capacity"],
+    "MYSQL_CONNECTIONS_AND_THREAD_CACHING": ["connection", "thread", "concurrent", "open", "contention"],
+    "MYSQL_INNODB_PURGE_AND_BACKGROUND_MAINTENANCE": ["purge", "cleaner", "undo", "update", "delete"],
+    "MYSQL_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY": ["crash", "oom", "fail", "error", "restart", "start", "deprecated", "regression"],
+}
+
+PERF_FEEDBACK_KEYWORDS: list[str] = [
+    "regression",
+    "performance",
+    "tps",
+    "throughput",
+    "latency",
+]
+
+CRASH_FEEDBACK_KEYWORDS: list[str] = [
+    "crash",
+    "oom",
+    "fail",
+    "error",
+    "restart",
+    "start",
+]
+
+
+def _calculate_strategy_score(
+    strat: KnobStrategyDef,
+    workload_lower: str = "",
+    feedback_lower: str = "",
+    keyword_map: dict[str, list[str]] | None = None,
+) -> int:
+    """Calculate the relevance score for a knob tuning strategy given workload and feedback."""
+    if keyword_map is None:
+        keyword_map = KEYWORD_MAP
+
+    workload = (workload_lower or "").lower()
+    feedback = (feedback_lower or "").lower()
+    score = 0
+
+    keywords = keyword_map.get(strat.name, [])
+    for kw in keywords:
+        if kw in workload:
+            score += 1
+        if kw in feedback:
+            score += 3  # High priority if it's mentioned in feedback/errors
+
+    # Default strategies if score is 0
+    if score == 0:
+        if any(term in strat.name for term in ("MEMORY_MANAGEMENT", "BUFFER_POOL", "WAL", "REDO")):
+            score = 1
+
+    is_remediation = "REMEDIATION" in strat.name or strat.category.lower() == "remediation"
+    if is_remediation and any(kw in feedback for kw in CRASH_FEEDBACK_KEYWORDS):
+        score += 10
+
+    # Score boost when feedback mentions performance regression keywords:
+    # "regression", "performance", "tps", "throughput", "latency"
+    # prioritizing engine performance tuning and remediation strategies.
+    if any(kw in feedback for kw in PERF_FEEDBACK_KEYWORDS):
+        if is_remediation:
+            score += 8
+        elif any(term in strat.name.upper() for term in (
+            "MEMORY_MANAGEMENT", "BUFFER_POOL", "WAL", "REDO",
+            "CONCURRENCY", "CONNECTIONS", "IO", "STORAGE",
+            "EXECUTION_MEMORY", "PLANNER",
+        )) or strat.category.lower() in (
+            "memory management", "write-ahead logging", "concurrency",
+            "execution memory", "planner configuration", "i/o capacity",
+        ):
+            score += 5
+        else:
+            score += 2
+
+    return score
+
+
 def plan_knob_tuning(db_type: str, workload_text: str = "", memory_gb: float = 1.0, cpu_cores: int = 1, feedback: str = "", max_strategies: int = 8) -> tuple[list[KnobStrategyDef], str]:
     """Produce a list of applicable strategies given workload intent, system specs, and failure feedback.
     
@@ -140,43 +227,15 @@ def plan_knob_tuning(db_type: str, workload_text: str = "", memory_gb: float = 1
     workload_lower = workload_text.lower()
     feedback_lower = feedback.lower()
 
-    keyword_map: dict[str, list[str]] = {
-        "PG_SHARED_MEMORY_MANAGEMENT": ["cache", "read", "memory", "buffer", "oltp"],
-        "PG_PER_QUERY_EXECUTION_MEMORY": ["sort", "join", "hash", "aggregate", "olap", "batch", "complex", "spill", "temp"],
-        "PG_WAL_CHECKPOINTING_AND_DURABILITY": ["write", "wal", "checkpoint", "insert", "update", "load", "oltp", "commit", "throughput", "batch"],
-        "PG_QUERY_PLANNER_AND_IO_CONCURRENCY": ["scan", "ssd", "hdd", "index", "plan", "cost"],
-        "PG_CONCURRENCY_AND_PARALLEL_WORKERS": ["connection", "parallel", "worker", "concurrent", "pool"],
-        "PG_AUTOVACUUM_BACKGROUND_MAINTENANCE": ["vacuum", "bloat", "dead tuple", "update", "delete", "churn"],
-        "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY": ["crash", "oom", "fail", "error", "restart", "start"],
-        
-        "MYSQL_GLOBAL_BUFFER_POOL_MANAGEMENT": ["cache", "read", "memory", "buffer", "pool"],
-        "MYSQL_PER_SESSION_BUFFERS_AND_TEMP_TABLES": ["sort", "join", "temp", "heap", "group by", "order by", "olap"],
-        "MYSQL_REDO_LOGGING_AND_TRANSACTION_DURABILITY": ["write", "redo", "flush", "commit", "insert", "update", "oltp", "throughput", "batch"],
-        "MYSQL_STORAGE_IO_THREADS_AND_CAPACITY": ["io", "ssd", "nvme", "thread", "flush", "capacity"],
-        "MYSQL_CONNECTIONS_AND_THREAD_CACHING": ["connection", "thread", "concurrent", "open"],
-        "MYSQL_INNODB_PURGE_AND_BACKGROUND_MAINTENANCE": ["purge", "cleaner", "undo", "update", "delete"],
-        "MYSQL_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY": ["crash", "oom", "fail", "error", "restart", "start", "deprecated"]
-    }
-
     scored: list[tuple[int, KnobStrategyDef]] = []
     
     for strat in all_strategies:
-        score = 0
-        keywords = keyword_map.get(strat.name, [])
-        for kw in keywords:
-            if kw in workload_lower:
-                score += 1
-            if kw in feedback_lower:
-                score += 3  # High priority if it's mentioned in feedback/errors
-                
-        # Default strategies if score is 0
-        if score == 0:
-            if "MEMORY_MANAGEMENT" in strat.name or "BUFFER_POOL" in strat.name or "WAL" in strat.name or "REDO" in strat.name:
-                score = 1
-                
-        if "REMEDIATION" in strat.name and ("crash" in feedback_lower or "oom" in feedback_lower or "error" in feedback_lower or "fail" in feedback_lower):
-            score += 10
-            
+        score = _calculate_strategy_score(
+            strat=strat,
+            workload_lower=workload_lower,
+            feedback_lower=feedback_lower,
+            keyword_map=KEYWORD_MAP,
+        )
         if score > 0:
             scored.append((score, strat))
 

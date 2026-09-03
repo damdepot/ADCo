@@ -12,13 +12,38 @@ class KnobCheckIssue(BaseModel):
         description="Severity of the issue (low, medium, high, critical)"
     )
     category: str = Field(
-        description="Category: crash, connectivity_failure, memory_overflow, crud_failure, invalid_value, syntax_error"
+        description="Category: crash, connectivity_failure, memory_overflow, crud_failure, invalid_value, syntax_error, performance_regression"
     )
     description: str = Field(description="Detailed description of what failed during validation")
     suggestion: str = Field(
         default="",
         description="Suggested remediation or adjusted parameter value for the knob recommender",
     )
+
+
+class SysbenchMetrics(BaseModel):
+    """Metrics recorded from a sysbench benchmark run."""
+
+    tps: float = 0.0
+    qps: float = 0.0
+    latency_avg_ms: float = 0.0
+    latency_p95_ms: float = 0.0
+    errors: int = 0
+
+
+class BenchmarkResult(BaseModel):
+    """Option B sysbench stress test benchmark result comparing baseline vs tuned performance."""
+
+    status: Literal["PASS", "FAIL", "REGRESSION", "SKIPPED", "ERROR", "NOT_RUN"] = "NOT_RUN"
+    baseline: SysbenchMetrics = Field(default_factory=SysbenchMetrics)
+    tuned: SysbenchMetrics = Field(default_factory=SysbenchMetrics)
+    performance_delta_pct: float = 0.0
+    regression_detected: bool = False
+    baseline_tps: float = 0.0
+    tuned_tps: float = 0.0
+    delta_pct: float = 0.0
+    qps: float = 0.0
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class StagingCheckDetails(BaseModel):
@@ -68,6 +93,10 @@ class KnobCheckerOutput(BaseModel):
     test_results: StagingTestResults = Field(
         default_factory=StagingTestResults,
         description="Detailed test results from staging health and CRUD validation",
+    )
+    benchmark_results: BenchmarkResult | None = Field(
+        default=None,
+        description="Option B sysbench stress test benchmark results comparing baseline vs tuned performance",
     )
     summary: str = Field(
         default="",

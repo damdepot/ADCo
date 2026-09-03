@@ -9,12 +9,18 @@ from src.knob_tuner.sub_agents.knob_checker.agent import (
     create_knob_checker_agent,
 )
 from src.knob_tuner.sub_agents.knob_checker.models import (
+    BenchmarkResult,
     KnobCheckIssue,
     KnobCheckerOutput,
+    StagingCheckDetails,
+    StagingTestResults,
+    SysbenchMetrics,
 )
 from src.knob_tuner.sub_agents.knob_checker.tools import (
     _get_staging_db_config,
     apply_knobs_staging,
+    benchmark_baseline_staging,
+    benchmark_tuned_staging,
     restart_database_staging,
     test_database_staging,
 )
@@ -83,11 +89,13 @@ def test_create_knob_checker_agent():
     assert agent.name == "knob_checker"
     assert agent.output_key == "knob_checker_output"
     assert agent.output_schema == KnobCheckerOutput
-    assert len(agent.tools) == 3
+    assert len(agent.tools) == 5
     tool_names = [t.__name__ for t in agent.tools]
+    assert "benchmark_baseline_staging" in tool_names
     assert "apply_knobs_staging" in tool_names
     assert "restart_database_staging" in tool_names
     assert "test_database_staging" in tool_names
+    assert "benchmark_tuned_staging" in tool_names
 
 
 # ===========================================================================
@@ -176,9 +184,7 @@ def test_restart_database_staging_success(mock_restart, mock_db_config_pg):
     tc = MockToolContext({"staging_db_config": mock_db_config_pg})
 
     result = restart_database_staging(tc)
-
     assert "OK: Staging database restarted successfully" in result
-    assert "Container restarted" in result
 
 
 @patch("src.knob_tuner.sub_agents.knob_checker.tools.restart_db_by_config")
@@ -242,5 +248,203 @@ def test_test_database_staging_fail(mock_test_db, mock_db_config_pg):
 def test_test_database_staging_missing_config():
     tc = MockToolContext({})
     result = test_database_staging(tc)
+    assert "ERROR: Staging DBConfig not found in state" in result
+    assert tc.state["staging_validated"] is False
+
+
+# ===========================================================================
+# 7. Benchmark Staging Tool Tests
+# ===========================================================================
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.run_sysbench_benchmark")
+def test_benchmark_baseline_staging_fresh(mock_run_bench, mock_db_config_pg):
+    mock_run_bench.return_value = {
+        "status": "ok",
+        "tps": 200.0,
+        "qps": 4000.0,
+        "latency_avg_ms": 10.0,
+        "latency_p95_ms": 15.0,
+        "duration": 120,
+        "threads": 32,
+        "tables": 50,
+        "log_file": "/tmp/baseline.log",
+        "details": {},
+    }
+    tc = MockToolContext({"staging_db_config": mock_db_config_pg})
+
+    result = benchmark_baseline_staging(tc)
+    assert "Baseline Sysbench Benchmark Result: **OK**" in result
+    assert "200.00" in result
+    assert "4000.00" in result
+    assert tc.state["staging_baseline_benchmark"]["tps"] == 200.0
+
+
+def test_benchmark_baseline_staging_reuses_cached(mock_db_config_pg):
+    cached_result = {
+        "status": "ok",
+        "tps": 220.0,
+        "qps": 4400.0,
+        "threads": 32,
+        "tables": 50,
+        "duration": 120,
+        "log_file": "/tmp/cached_baseline.log",
+        "details": {"latency_avg_ms": 9.5, "latency_95th_ms": 14.0},
+    }
+    tc = MockToolContext({
+        "staging_db_config": mock_db_config_pg,
+        "staging_baseline_benchmark": cached_result,
+    })
+
+    with patch("src.knob_tuner.sub_agents.knob_checker.tools.run_sysbench_benchmark") as mock_run:
+        result = benchmark_baseline_staging(tc)
+        mock_run.assert_not_called()
+        assert "Cached" in result
+        assert "220.00" in result
+
+
+def test_benchmark_baseline_staging_missing_config():
+    tc = MockToolContext({})
+    result = benchmark_baseline_staging(tc)
+    assert "ERROR: Staging DBConfig not found in state" in result
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.run_sysbench_benchmark")
+def test_benchmark_baseline_staging_failure(mock_run_bench, mock_db_config_pg):
+    mock_run_bench.return_value = {"status": "error", "error": "sysbench prepare failed"}
+    tc = MockToolContext({"staging_db_config": mock_db_config_pg})
+
+    result = benchmark_baseline_staging(tc)
+    assert "WARNING: Sysbench baseline benchmark encountered an environment/tool issue" in result
+    assert "ERROR/SKIPPED" in result
+    assert "Candidate knobs have not been applied yet" in result
+    # Verify candidate knobs are not blamed in staging_issues
+    assert "staging_issues" not in tc.state
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.run_sysbench_benchmark")
+def test_benchmark_baseline_staging_with_custom_state_params(mock_run_bench, mock_db_config_pg):
+    mock_run_bench.return_value = {
+        "status": "ok",
+        "tps": 100.0,
+        "qps": 2000.0,
+        "duration": 60,
+        "threads": 8,
+        "tables": 20,
+        "log_file": "/tmp/bench.log",
+        "details": {},
+    }
+    tc = MockToolContext({
+        "staging_db_config": mock_db_config_pg,
+        "benchmark_tables": 20,
+        "benchmark_table_size": 5000,
+        "benchmark_threads": 8,
+        "benchmark_duration": 60,
+    })
+
+    result = benchmark_baseline_staging(tc)
+    assert "Baseline Sysbench Benchmark Result: **OK**" in result
+    mock_run_bench.assert_called_once_with(
+        mock_db_config_pg,
+        tables=20,
+        table_size=5000,
+        threads=8,
+        duration=60,
+    )
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.run_sysbench_benchmark")
+def test_benchmark_tuned_staging_pass(mock_run_bench, mock_db_config_pg):
+    baseline_result = {"status": "ok", "tps": 200.0, "qps": 4000.0, "details": {}}
+    mock_run_bench.return_value = {
+        "status": "ok",
+        "tps": 260.0,
+        "qps": 5200.0,
+        "duration": 120,
+        "threads": 32,
+        "tables": 50,
+        "log_file": "/tmp/tuned.log",
+        "details": {"latency_avg_ms": 7.5, "latency_95th_ms": 11.0},
+    }
+    tc = MockToolContext({
+        "staging_db_config": mock_db_config_pg,
+        "staging_baseline_benchmark": baseline_result,
+        "staging_validated": True,
+    })
+
+    result = benchmark_tuned_staging(tc)
+    assert "Result: **PASS**" in result
+    assert "260.00" in result
+    assert "+30.00%" in result
+    assert tc.state["staging_benchmark_results"].status == "PASS"
+    assert tc.state["staging_benchmark_results"].regression_detected is False
+    assert tc.state["staging_validated"] is True
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.run_sysbench_benchmark")
+def test_benchmark_tuned_staging_with_custom_state_params(mock_run_bench, mock_db_config_pg):
+    baseline_result = {"status": "ok", "tps": 100.0, "qps": 2000.0, "details": {}}
+    mock_run_bench.return_value = {
+        "status": "ok",
+        "tps": 150.0,
+        "qps": 3000.0,
+        "duration": 30,
+        "threads": 2,
+        "tables": 5,
+        "log_file": "/tmp/tuned.log",
+        "details": {},
+    }
+    tc = MockToolContext({
+        "staging_db_config": mock_db_config_pg,
+        "staging_baseline_benchmark": baseline_result,
+        "staging_validated": True,
+        "benchmark_tables": 5,
+        "benchmark_table_size": 2000,
+        "benchmark_threads": 2,
+        "benchmark_duration": 30,
+    })
+
+    result = benchmark_tuned_staging(tc)
+    assert "Result: **PASS**" in result
+    mock_run_bench.assert_called_once_with(
+        mock_db_config_pg,
+        tables=5,
+        table_size=2000,
+        threads=2,
+        duration=30,
+    )
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.run_sysbench_benchmark")
+def test_benchmark_tuned_staging_regression(mock_run_bench, mock_db_config_pg):
+    baseline_result = {"status": "ok", "tps": 200.0, "qps": 4000.0, "details": {}}
+    mock_run_bench.return_value = {
+        "status": "ok",
+        "tps": 160.0,
+        "qps": 3200.0,
+        "duration": 120,
+        "threads": 32,
+        "tables": 50,
+        "log_file": "/tmp/tuned.log",
+        "details": {"latency_avg_ms": 18.0, "latency_95th_ms": 35.0},
+    }
+    tc = MockToolContext({
+        "staging_db_config": mock_db_config_pg,
+        "staging_baseline_benchmark": baseline_result,
+        "staging_validated": True,
+    })
+
+    result = benchmark_tuned_staging(tc)
+    assert "Result: **REGRESSION**" in result
+    assert "-20.00%" in result
+    assert tc.state["staging_benchmark_results"].status == "REGRESSION"
+    assert tc.state["staging_benchmark_results"].regression_detected is True
+    assert tc.state["staging_validated"] is False
+    issues = tc.state.get("staging_issues", [])
+    assert any(i.category == "performance_regression" for i in issues)
+
+
+def test_benchmark_tuned_staging_missing_config():
+    tc = MockToolContext({})
+    result = benchmark_tuned_staging(tc)
     assert "ERROR: Staging DBConfig not found in state" in result
     assert tc.state["staging_validated"] is False

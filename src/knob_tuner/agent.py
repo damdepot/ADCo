@@ -18,7 +18,7 @@ production.
 You have access to 4 specialized sub-agents via tools:
 1. `intent_analyzer` — inspects database schema, retrieves active configuration knobs, hardware capacity, and analyzes application codebase workload patterns.
 2. `knob_recommender` — synthesizes intent findings and formulates tailored database configuration knob recommendations.
-3. `knob_checker` — executes end-to-end verification in staging: applies recommendations, restarts staging database, and runs Option A health/CRUD tests.
+3. `knob_checker` — executes end-to-end 5-step validation in staging: baseline sysbench stress test -> apply knobs -> restart staging DB -> Option A health/CRUD check -> tuned sysbench stress test -> PASS/FAIL evaluation.
 4. `live_tuner` — safely applies validated dynamic knobs to the live production database (only if knob_checker returned PASS).
 
 ## Execution Sequence
@@ -36,16 +36,22 @@ The maximum allowed total attempts is 4 (1 initial attempt + up to 3 retries):
 
 1. **Recommendation**:
    - Delegate to `knob_recommender` to generate configuration knob recommendations based on the intent analysis findings and hardware budget.
-   - If this is a retry attempt following a `knob_checker` failure, include the specific failure reasons, error messages, and remediation suggestions from the previous checker run in your delegation message.
+   - If this is a retry attempt following a `knob_checker` failure, include the specific failure reasons, error messages, benchmark delta (baseline vs tuned TPS/latency), and remediation suggestions from the previous checker run in your delegation message.
 
 2. **Validation**:
-   - Delegate to `knob_checker` to validate the recommended knobs in staging by applying parameters, restarting the staging instance, and running health/CRUD tests.
+   - Delegate to `knob_checker` to execute its 5-step validation workflow in staging:
+     1. Baseline sysbench stress test (measure baseline TPS and latency before changes)
+     2. Apply recommended knobs to staging database
+     3. Restart staging database
+     4. Run Option A health/CRUD checks (connectivity, ping, table scan, CRUD lifecycle)
+     5. Tuned sysbench stress test (measure tuned TPS and latency under new knobs)
+     Followed by PASS/FAIL evaluation.
    - Evaluate the `knob_checker` output verdict (`status`):
-     - **PASS**: Staging validation succeeded. Proceed immediately to Phase 3 (`live_tuner`).
-     - **FAIL**: Staging validation failed (crash, connectivity failure, memory overflow, or rejected parameters).
+     - **PASS**: Staging validation succeeded (database restarted cleanly, Option A health/CRUD checks passed, and tuned TPS >= baseline TPS without latency regression). Proceed immediately to Phase 3 (`live_tuner`).
+     - **FAIL**: Staging validation failed due to either functional failure (database crash, connectivity failure, memory overflow, rejected parameters, CRUD test failure) or performance regression (tuned TPS < baseline TPS, latency degradation).
        - Count how many recommendation-validation attempts have occurred so far (starting at attempt 1).
-       - If total attempts < 4 (attempts 1, 2, or 3): Loop back to Step 1 (Recommendation). Provide the failure details to `knob_recommender` for remediation.
-       - If total attempts >= 4 (attempt 4 failed): STOP the pipeline. Report that maximum retry attempts (1 initial + 3 retries) have been exhausted without achieving a stable staging configuration. Include the final failure details and DO NOT invoke `live_tuner`.
+       - If total attempts < 4 (attempts 1, 2, or 3): Loop back to Step 1 (Recommendation). Forward the failure details and benchmark delta (tuned TPS vs baseline TPS, latency changes, error diagnostics) to `knob_recommender` for remediation.
+       - If total attempts >= 4 (attempt 4 failed): STOP the pipeline. Report that maximum retry attempts (1 initial + 3 retries) have been exhausted without achieving a stable, non-regressing staging configuration. Include the final failure details and DO NOT invoke `live_tuner`.
 
 ### Phase 3: Live Tuning (Production)
 - Only execute this phase if `knob_checker` returned a **PASS** verdict.

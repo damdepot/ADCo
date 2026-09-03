@@ -69,6 +69,11 @@ def test_orchestrator_prompt_contains_rules_and_loop_bounds():
     assert "4" in ORCHESTRATOR_PROMPT  # max 4 attempts (1 initial + 3 retries)
     assert "PASS" in ORCHESTRATOR_PROMPT
     assert "FAIL" in ORCHESTRATOR_PROMPT
+    assert "5-step" in ORCHESTRATOR_PROMPT
+    assert "sysbench" in ORCHESTRATOR_PROMPT
+    assert "performance regression" in ORCHESTRATOR_PROMPT
+    assert "tuned TPS < baseline TPS" in ORCHESTRATOR_PROMPT
+    assert "benchmark delta" in ORCHESTRATOR_PROMPT
 
 
 # ===========================================================================
