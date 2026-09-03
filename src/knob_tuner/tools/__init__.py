@@ -27,6 +27,9 @@ from .kb_planner import (
     get_knob_strategies,
     plan_knob_tuning,
 )
+from .benchmark_tools import (
+    run_sysbench_benchmark,
+)
 
 __all__ = [
     "load_db_config",
@@ -46,4 +49,5 @@ __all__ = [
     "plan_knob_tuning",
     "KnobStrategyDef",
     "_parse_knob_kb",
+    "run_sysbench_benchmark",
 ]

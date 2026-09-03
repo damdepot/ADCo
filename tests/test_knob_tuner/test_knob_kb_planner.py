@@ -6,6 +6,7 @@ import pytest
 from src.knob_tuner.tools.kb_planner import (
     KnobStrategyDef,
     _parse_knob_kb,
+    _calculate_strategy_score,
     plan_knob_tuning,
     get_knob_strategies,
     KB_PATH,
@@ -109,3 +110,54 @@ def test_knob_strategy_def_detailed_format():
     assert "**Category**: Memory Management" in detailed
     assert "**Knobs**: shared_buffers, effective_cache_size" in detailed
     assert "**Formulas / Baseline**: shared_buffers: 25% of RAM" in detailed
+
+
+def test_calculate_strategy_score_performance_regression_keywords():
+    mem_strat = KnobStrategyDef(
+        category="Memory Management",
+        name="PG_SHARED_MEMORY_MANAGEMENT",
+        engine="PostgreSQL",
+        knobs="shared_buffers",
+        definition="Memory pool",
+        objective="Cache data",
+        formulas="25%",
+        conditions="",
+        restart_required="Static",
+        risk_and_guardrails="",
+    )
+    remediation_strat = KnobStrategyDef(
+        category="Remediation",
+        name="PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY",
+        engine="PostgreSQL",
+        knobs="shared_buffers",
+        definition="Remediation",
+        objective="Recover",
+        formulas="stepdown",
+        conditions="",
+        restart_required="Static",
+        risk_and_guardrails="",
+    )
+
+    perf_keywords = ["regression", "performance", "tps", "throughput", "latency"]
+    for kw in perf_keywords:
+        feedback = f"Detected {kw} issue during validation"
+        score_mem = _calculate_strategy_score(mem_strat, feedback_lower=feedback)
+        score_rem = _calculate_strategy_score(remediation_strat, feedback_lower=feedback)
+
+        # Baseline without feedback is 1 for mem_strat and 0 for remediation
+        base_mem = _calculate_strategy_score(mem_strat, feedback_lower="")
+        base_rem = _calculate_strategy_score(remediation_strat, feedback_lower="")
+
+        assert score_mem > base_mem, f"Expected boost for {kw} on engine performance tuning strategy"
+        assert score_rem > base_rem, f"Expected boost for {kw} on remediation strategy"
+
+
+def test_plan_knob_tuning_performance_regression_prioritization():
+    feedback = "sysbench benchmark failed: tuned TPS (120) < baseline TPS (250), performance regression detected"
+    strats, summary = plan_knob_tuning("postgres", feedback=feedback)
+    names = [s.name for s in strats]
+
+    # Remediation and performance tuning strategies must be in top results
+    assert "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY" in names[:3]
+    assert any(n in names[:3] for n in ["PG_SHARED_MEMORY_MANAGEMENT", "PG_WAL_CHECKPOINTING_AND_DURABILITY", "PG_CONCURRENCY_AND_PARALLEL_WORKERS"])
+    assert "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY" in summary

@@ -5,10 +5,16 @@ from typing import Any
 
 from google.adk.tools import ToolContext
 
+from src.knob_tuner.tools.benchmark_tools import run_sysbench_benchmark
 from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
 from src.knob_tuner.tools.db_tools import apply_knobs, test_database, verify_active_knobs
 from src.knob_tuner.tools.file_tools import read_json_file
 from src.knob_tuner.tools.restart_tools import restart_db_by_config
+from src.knob_tuner.sub_agents.knob_checker.models import (
+    BenchmarkResult,
+    KnobCheckIssue,
+    SysbenchMetrics,
+)
 
 
 def _get_staging_db_config(tool_context: ToolContext) -> DBConfig | None:
@@ -86,23 +92,26 @@ def _dict_to_db_config(d: dict[str, Any], default_env: str = "staging") -> DBCon
 
 def _load_selected_knobs(tool_context: ToolContext) -> list[dict[str, Any]]:
     """Helper to retrieve selected knob recommendations from state or file."""
-    # 1. State selected_knobs
-    selected = tool_context.state.get("selected_knobs")
-    if selected and isinstance(selected, list):
-        knobs: list[dict[str, Any]] = []
-        for item in selected:
-            if hasattr(item, "model_dump"):
-                d = item.model_dump()
-            elif isinstance(item, dict):
-                d = item
-            else:
-                continue
-            name = d.get("knob") or d.get("name")
-            val = d.get("recommended_value") or d.get("value")
-            if name and val is not None:
-                knobs.append({"name": name, "value": val, "restart_required": d.get("restart_required", False)})
-        if knobs:
-            return knobs
+    # 1. State selected_knobs or recommended_knobs
+    for state_key in ("selected_knobs", "recommended_knobs"):
+        selected = tool_context.state.get(state_key)
+        if isinstance(selected, dict):
+            return [{"name": k, "value": v, "restart_required": False} for k, v in selected.items()]
+        elif isinstance(selected, list):
+            knobs: list[dict[str, Any]] = []
+            for item in selected:
+                if hasattr(item, "model_dump"):
+                    d = item.model_dump()
+                elif isinstance(item, dict):
+                    d = item
+                else:
+                    continue
+                name = d.get("knob") or d.get("name")
+                val = d.get("recommended_value") or d.get("value")
+                if name and val is not None:
+                    knobs.append({"name": name, "value": val, "restart_required": d.get("restart_required", False)})
+            if knobs:
+                return knobs
 
     # 2. State knob_recommender_output
     output = tool_context.state.get("knob_recommender_output")
@@ -293,3 +302,285 @@ def test_database_staging(tool_context: ToolContext) -> str:
 
 
 test_database_staging.__test__ = False  # type: ignore[attr-defined]
+
+
+def benchmark_baseline_staging(tool_context: ToolContext) -> str:
+    """Run sysbench stress benchmark on the baseline (pre-tuning) staging database.
+
+    Checks if a baseline benchmark result is already cached in state; if so,
+    it reuses the cached result to avoid corrupting baseline measurements across retries.
+    Otherwise, runs sysbench benchmark, stores the result in
+    ``tool_context.state['staging_baseline_benchmark']``, and returns a formatted report.
+
+    Args:
+        tool_context: ADK tool execution context.
+
+    Returns:
+        Formatted markdown report of baseline performance (TPS, QPS, latency) or diagnostic info.
+    """
+    tables = int(tool_context.state.get("benchmark_tables", 10))
+    table_size = int(tool_context.state.get("benchmark_table_size", 10000))
+    threads = int(tool_context.state.get("benchmark_threads", 4))
+    duration = int(tool_context.state.get("benchmark_duration", 120))
+
+    cached = tool_context.state.get("staging_baseline_benchmark")
+    if cached and isinstance(cached, dict):
+        if cached.get("status") == "ok":
+            tps = float(cached.get("tps", 0.0))
+            qps = float(cached.get("qps", 0.0))
+            cached_threads = cached.get("threads", threads)
+            cached_tables = cached.get("tables", tables)
+            cached_duration = cached.get("duration", duration)
+            log_file = cached.get("log_file", "")
+            details = cached.get("details", {})
+            lat_avg = details.get("latency_avg_ms", 0.0)
+            lat_p95 = details.get("latency_95th_ms", 0.0)
+
+            lines = [
+                "## Baseline Sysbench Benchmark Result (Cached): **OK**",
+                "",
+                "- **Status**: OK (from cache)",
+                f"- **Baseline TPS**: {tps:.2f}",
+                f"- **Baseline QPS**: {qps:.2f}",
+                f"- **Avg Latency**: {lat_avg:.2f} ms",
+                f"- **95th Percentile Latency**: {lat_p95:.2f} ms",
+                f"- **Threads**: {cached_threads}",
+                f"- **Tables**: {cached_tables}",
+                f"- **Duration**: {cached_duration}s",
+                f"- **Log File**: `{log_file}`",
+            ]
+            return "\n".join(lines)
+        else:
+            err = cached.get("error", "Unknown baseline error")
+            return (
+                f"WARNING: Baseline sysbench benchmark previously failed (status: ERROR/SKIPPED): {err}. "
+                f"Reusing cached status. Candidate knobs have not been applied yet; this indicates an "
+                f"environmental or tool issue rather than a candidate knob failure."
+            )
+
+    cfg = _get_staging_db_config(tool_context)
+    if not cfg:
+        return "ERROR: Staging DBConfig not found in state"
+
+    try:
+        result = run_sysbench_benchmark(
+            cfg,
+            tables=tables,
+            table_size=table_size,
+            threads=threads,
+            duration=duration,
+        )
+        tool_context.state["staging_baseline_benchmark"] = result
+
+        if result.get("status") != "ok":
+            err = result.get("error", "Unknown error running sysbench")
+            return (
+                f"WARNING: Sysbench baseline benchmark encountered an environment/tool issue (status: ERROR/SKIPPED): {err}. "
+                f"Baseline marked as ERROR/SKIPPED without crashing. "
+                f"Note: Candidate knobs have not been applied yet, so this is an environmental or sysbench issue, "
+                f"not a candidate knob failure."
+            )
+
+        tps = float(result.get("tps", 0.0))
+        qps = float(result.get("qps", 0.0))
+        threads_res = result.get("threads", threads)
+        tables_res = result.get("tables", tables)
+        duration_res = result.get("duration", duration)
+        log_file = result.get("log_file", "")
+        details = result.get("details", {})
+        lat_avg = details.get("latency_avg_ms", 0.0)
+        lat_p95 = details.get("latency_95th_ms", 0.0)
+
+        lines = [
+            "## Baseline Sysbench Benchmark Result: **OK**",
+            "",
+            "- **Status**: OK",
+            f"- **Baseline TPS**: {tps:.2f}",
+            f"- **Baseline QPS**: {qps:.2f}",
+            f"- **Avg Latency**: {lat_avg:.2f} ms",
+            f"- **95th Percentile Latency**: {lat_p95:.2f} ms",
+            f"- **Threads**: {threads_res}",
+            f"- **Tables**: {tables_res}",
+            f"- **Duration**: {duration_res}s",
+            f"- **Log File**: `{log_file}`",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        tool_context.state["staging_baseline_benchmark"] = {
+            "status": "error",
+            "error": str(e),
+            "tps": 0.0,
+            "qps": 0.0,
+            "threads": threads,
+            "tables": tables,
+            "duration": duration,
+            "details": {},
+        }
+        return (
+            f"WARNING: Exception while running baseline benchmark (status: ERROR/SKIPPED): {e}. "
+            f"Candidate knobs have not been applied yet; this indicates an environment issue."
+        )
+
+
+benchmark_baseline_staging.__test__ = False  # type: ignore[attr-defined]
+
+
+def benchmark_tuned_staging(tool_context: ToolContext) -> str:
+    """Run sysbench stress benchmark on tuned staging database and evaluate performance.
+
+    Compares tuned TPS and QPS against baseline stored in
+    ``tool_context.state['staging_baseline_benchmark']``. Calculates percentage delta.
+    If benchmark errors or performance regresses (delta_pct < 0.0, or drop > 5%),
+    flags regression, sets ``staging_validated = False``, and records an issue.
+    Stores ``tool_context.state['staging_tuned_benchmark'] = result`` and
+    ``tool_context.state['staging_benchmark_results'] = BenchmarkResult(...)``.
+
+    Args:
+        tool_context: ADK tool execution context.
+
+    Returns:
+        Formatted markdown comparison report of baseline vs tuned performance.
+    """
+    cfg = _get_staging_db_config(tool_context)
+    if not cfg:
+        tool_context.state["staging_validated"] = False
+        return "ERROR: Staging DBConfig not found in state"
+
+    tables = int(tool_context.state.get("benchmark_tables", 10))
+    table_size = int(tool_context.state.get("benchmark_table_size", 10000))
+    threads = int(tool_context.state.get("benchmark_threads", 4))
+    duration = int(tool_context.state.get("benchmark_duration", 120))
+
+    # Extract baseline metrics
+    baseline_res = tool_context.state.get("staging_baseline_benchmark") or {}
+    baseline_status = baseline_res.get("status") if isinstance(baseline_res, dict) else None
+    baseline_tps = float(baseline_res.get("tps", 0.0)) if isinstance(baseline_res, dict) else 0.0
+    baseline_qps = float(baseline_res.get("qps", 0.0)) if isinstance(baseline_res, dict) else 0.0
+    baseline_details = baseline_res.get("details", {}) if isinstance(baseline_res, dict) else {}
+    baseline_lat_avg = float(baseline_details.get("latency_avg_ms", 0.0))
+    baseline_lat_p95 = float(baseline_details.get("latency_95th_ms", 0.0))
+
+    try:
+        result = run_sysbench_benchmark(
+            cfg,
+            tables=tables,
+            table_size=table_size,
+            threads=threads,
+            duration=duration,
+        )
+        tool_context.state["staging_tuned_benchmark"] = result
+
+        tuned_tps = float(result.get("tps", 0.0))
+        tuned_qps = float(result.get("qps", 0.0))
+        tuned_details = result.get("details", {}) if isinstance(result, dict) else {}
+        tuned_lat_avg = float(tuned_details.get("latency_avg_ms", 0.0))
+        tuned_lat_p95 = float(tuned_details.get("latency_95th_ms", 0.0))
+
+        if baseline_tps > 0.0:
+            delta_pct = ((tuned_tps - baseline_tps) / baseline_tps) * 100.0
+        else:
+            delta_pct = 0.0
+
+        is_error = (result.get("status") != "ok")
+        is_regression = (baseline_status == "ok" and baseline_tps > 0.0 and tuned_tps < baseline_tps)
+
+        if is_error:
+            status_str = "ERROR"
+            regression_detected = True
+            tool_context.state["staging_validated"] = False
+        elif is_regression:
+            status_str = "REGRESSION"
+            regression_detected = True
+            tool_context.state["staging_validated"] = False
+        else:
+            status_str = "PASS"
+            regression_detected = False
+            if tool_context.state.get("staging_validated", True) is not False:
+                tool_context.state["staging_validated"] = True
+
+        baseline_metrics = SysbenchMetrics(
+            tps=baseline_tps,
+            qps=baseline_qps,
+            latency_avg_ms=baseline_lat_avg,
+            latency_p95_ms=baseline_lat_p95,
+            errors=0 if baseline_status == "ok" else 1,
+        )
+        tuned_metrics = SysbenchMetrics(
+            tps=tuned_tps,
+            qps=tuned_qps,
+            latency_avg_ms=tuned_lat_avg,
+            latency_p95_ms=tuned_lat_p95,
+            errors=0 if not is_error else 1,
+        )
+        benchmark_results = BenchmarkResult(
+            status=status_str,
+            baseline=baseline_metrics,
+            tuned=tuned_metrics,
+            performance_delta_pct=round(delta_pct, 2),
+            regression_detected=regression_detected,
+            baseline_tps=baseline_tps,
+            tuned_tps=tuned_tps,
+            delta_pct=round(delta_pct, 2),
+            qps=tuned_qps,
+            details=tuned_details,
+        )
+        tool_context.state["staging_benchmark_results"] = benchmark_results
+
+        if regression_detected:
+            err_msg = result.get("error", "")
+            desc = (
+                f"Sysbench benchmark error on tuned staging database: {err_msg}"
+                if is_error
+                else (
+                    f"Performance regression detected in staging sysbench benchmark: "
+                    f"tuned TPS ({tuned_tps:.2f}) vs baseline TPS ({baseline_tps:.2f}), "
+                    f"delta: {delta_pct:+.2f}%"
+                )
+            )
+            issue = KnobCheckIssue(
+                knob="tuned_configuration",
+                severity="high",
+                category="sysbench_error" if is_error else "performance_regression",
+                description=desc,
+                suggestion="Revert or reduce aggressive memory, worker, or buffer parameters to alleviate contention.",
+            )
+            issues = tool_context.state.setdefault("staging_issues", [])
+            issues.append(issue)
+
+        threads_res = result.get("threads", threads)
+        tables_res = result.get("tables", tables)
+        duration_res = result.get("duration", duration)
+        log_file = result.get("log_file", "")
+
+        lines = [
+            f"Staging Tuned Sysbench Benchmark Result: **{status_str}**",
+            "",
+            "## Performance Comparison",
+            f"- **Baseline TPS**: {baseline_tps:.2f}",
+            f"- **Tuned TPS**: {tuned_tps:.2f}",
+            f"- **Delta**: {delta_pct:+.2f}%",
+            f"- **Tuned QPS**: {tuned_qps:.2f} (Baseline QPS: {baseline_qps:.2f})",
+            f"- **Avg Latency**: {tuned_lat_avg:.2f} ms (Baseline: {baseline_lat_avg:.2f} ms)",
+            f"- **95th Percentile Latency**: {tuned_lat_p95:.2f} ms (Baseline: {baseline_lat_p95:.2f} ms)",
+            f"- **Status**: **{status_str}**",
+            f"- **Threads**: {threads_res}",
+            f"- **Tables**: {tables_res}",
+            f"- **Duration**: {duration_res}s",
+            f"- **Log File**: `{log_file}`",
+        ]
+
+        if is_error:
+            lines.append(f"\n- **Error Details**: {result.get('error')}")
+        elif is_regression:
+            lines.append(
+                f"\n> **WARNING**: Performance regression detected! Tuned throughput dropped by {abs(delta_pct):.2f}% compared to baseline."
+            )
+
+        return "\n".join(lines)
+    except Exception as e:
+        tool_context.state["staging_validated"] = False
+        return f"ERROR: Exception while running tuned benchmark: {e}"
+
+
+benchmark_tuned_staging.__test__ = False  # type: ignore[attr-defined]
+
