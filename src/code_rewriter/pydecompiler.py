@@ -52,7 +52,7 @@ def decompile_app(input_dir: str, output_dir: str) -> None:
                             sql_text = val.s
 
                         if sql_text is not None:
-                            out_path = os.path.join(output_dir, f"query{q_num}-1.sql")
+                            out_path = os.path.join(output_dir, f"query{q_num}.sql")
                             with open(out_path, "w", encoding="utf-8") as out_f:
                                 out_f.write(sql_text + "\n")
                             queries_decompiled += 1
