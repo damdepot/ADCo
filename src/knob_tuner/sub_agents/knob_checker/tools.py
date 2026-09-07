@@ -6,7 +6,7 @@ from typing import Any
 from google.adk.tools import ToolContext
 
 from src.knob_tuner.tools.benchmark_tools import run_sysbench_benchmark
-from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
+from src.knob_tuner.tools.db_connector import DBConfig, load_db_config, get_connection
 from src.knob_tuner.tools.db_tools import apply_knobs, test_database, verify_active_knobs
 from src.knob_tuner.tools.docker_tools import (
     is_docker_available,
@@ -14,7 +14,7 @@ from src.knob_tuner.tools.docker_tools import (
     stop_staging_db,
 )
 from src.knob_tuner.tools.file_tools import read_json_file
-from src.knob_tuner.tools.restart_tools import restart_db_by_config
+from src.knob_tuner.tools.docker_tools import restart_docker_db, recreate_docker_db
 from src.knob_tuner.sub_agents.knob_checker.models import (
     BenchmarkResult,
     KnobCheckIssue,
@@ -188,6 +188,24 @@ def apply_knobs_staging(tool_context: ToolContext) -> str:
         return "ERROR: No selected knob recommendations found to apply to staging"
 
     try:
+        if cfg.db_type.lower() in ("postgres", "postgresql"):
+            try:
+                conn = get_connection(cfg)
+                if conn:
+                    try:
+                        if hasattr(conn, "autocommit"):
+                            try:
+                                conn.autocommit = True
+                            except Exception:
+                                pass
+                        with conn.cursor() as cur:
+                            cur.execute("ALTER SYSTEM RESET ALL;")
+                            cur.execute("SELECT pg_reload_conf();")
+                    finally:
+                        conn.close()
+            except Exception as e:
+                pass  # Ignore if we can't reset, let apply_knobs fail if it's broken
+
         results = apply_knobs(knobs, cfg, dry_run=False)
         tool_context.state["staging_applied_knobs"] = results
 
@@ -213,7 +231,7 @@ def apply_knobs_staging(tool_context: ToolContext) -> str:
 
 
 def restart_database_staging(tool_context: ToolContext) -> str:
-    """Restart the staging database instance to apply changes and verify restart resilience.
+    """Restart the staging database to apply static knobs and verify they persist.
 
     Args:
         tool_context: ADK tool execution context.
@@ -225,14 +243,97 @@ def restart_database_staging(tool_context: ToolContext) -> str:
     if not cfg:
         return "ERROR: Staging DBConfig not found in state"
 
+    container_name = tool_context.state.get("staging_docker_container")
+    if not container_name:
+        return "ERROR: No active staging Docker container to restart."
+
     try:
-        ok, msg = restart_db_by_config(cfg)
+        ok, msg = restart_docker_db(container_name, db_type=cfg.db_type)
         if ok:
             return f"OK: Staging database restarted successfully ({msg})"
         else:
             return f"ERROR: Staging database restart failed: {msg}"
     except Exception as e:
         return f"ERROR: Exception while restarting staging database: {e}"
+
+
+def recreate_database_staging(tool_context: ToolContext) -> str:
+    """Reset and recreate the staging Docker container when candidate knobs fail or for retry attempts.
+
+    Args:
+        tool_context: ADK tool execution context.
+
+    Returns:
+        Status message indicating success or failure of recreation.
+    """
+    cfg = _get_staging_db_config(tool_context)
+    if not cfg:
+        return "ERROR: Staging DBConfig not found in state"
+
+    container_name = tool_context.state.get("staging_docker_container")
+    if not container_name:
+        return setup_staging_docker(tool_context)
+
+    try:
+        intent_output = tool_context.state.get("intent_analyzer_output")
+        db_version = None
+        if intent_output:
+            if hasattr(intent_output, "db_version"):
+                db_version = getattr(intent_output, "db_version", None) or None
+            elif isinstance(intent_output, dict):
+                db_version = intent_output.get("db_version") or None
+
+        if not db_version:
+            db_version = (
+                tool_context.state.get("db_version")
+                or tool_context.state.get("target_db_version")
+                or None
+            )
+
+        db_type = cfg.db_type
+        database = cfg.database
+
+        canonical_type = "postgres" if "post" in db_type.lower() else ("mysql" if "my" in db_type.lower() else db_type)
+        init_dir = None
+        for cand in [
+            f"./db/init/{canonical_type}",
+            f"./db/init/{db_type}",
+            os.path.join(os.getcwd(), "db", "init", canonical_type),
+            os.path.join(os.getcwd(), "db", "init", db_type),
+        ]:
+            if os.path.isdir(cand):
+                init_dir = cand
+                break
+
+        ok, result, new_cfg = recreate_docker_db(
+            container_name=container_name,
+            db_type=db_type,
+            db_version=db_version,
+            database=database,
+            init_dir=init_dir,
+        )
+        if ok:
+            tool_context.state["staging_docker_container"] = result
+            tool_context.state["staging_db_config"] = new_cfg
+            
+            # Clear previous failed state
+            tool_context.state["staging_applied_knobs"] = []
+            tool_context.state["staging_test_results"] = None
+            tool_context.state["staging_verified_knobs"] = []
+            tool_context.state["staging_tuned_benchmark"] = None
+            tool_context.state["staging_validated"] = False
+            
+            return (
+                f"OK: Staging container recreated successfully "
+                f"(container: {result}, port: {new_cfg.port})"
+            )
+        else:
+            return f"ERROR: Staging container recreation failed: {result}"
+    except Exception as e:
+        return f"ERROR: Exception while recreating staging database: {e}"
+
+
+recreate_database_staging.__test__ = False  # type: ignore[attr-defined]
 
 
 def test_database_staging(tool_context: ToolContext) -> str:

@@ -15,12 +15,6 @@ from .file_tools import (
     read_json_file,
     write_json_file,
 )
-from .restart_tools import (
-    restart_db_by_config,
-    restart_docker_db,
-    restart_local_db,
-    restart_remote_db,
-)
 from .kb_planner import (
     KnobStrategyDef,
     _parse_knob_kb,
@@ -36,6 +30,8 @@ from .docker_tools import (
     resolve_docker_image,
     start_staging_db,
     stop_staging_db,
+    restart_docker_db,
+    recreate_docker_db,
 )
 
 __all__ = [
@@ -46,9 +42,7 @@ __all__ = [
     "read_json_file",
     "write_json_file",
     "restart_docker_db",
-    "restart_local_db",
-    "restart_remote_db",
-    "restart_db_by_config",
+    "recreate_docker_db",
     "apply_knobs",
     "test_database",
     "verify_active_knobs",

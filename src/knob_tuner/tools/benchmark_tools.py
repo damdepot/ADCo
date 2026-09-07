@@ -124,13 +124,13 @@ def run_sysbench_benchmark(
         threads: Number of worker threads (default: 4).
         duration: Duration in seconds to run benchmark.
         report_interval: Intermediate report interval in seconds.
-        workdir: Directory to save benchmark and prepare logs. Defaults to './log'.
+        workdir: Directory to save benchmark and prepare logs. Defaults to 'logs/sysbench'.
 
     Returns:
         Dictionary containing benchmark status, tps, qps, duration, threads, tables,
         log_file path, error message (if any), and detailed summary statistics.
     """
-    log_dir = workdir if workdir else "./log"
+    log_dir = workdir if workdir else os.path.join("logs", "sysbench")
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"{int(time.time())}.log")
 

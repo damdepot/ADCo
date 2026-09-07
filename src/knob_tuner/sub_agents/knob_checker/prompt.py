@@ -8,9 +8,10 @@ Your job is to validate recommended database configuration knobs by executing an
 
 Follow this strict sequence of verification steps:
 
-0. **Spin Up Isolated Staging Docker Container**:
+0. **Spin Up Isolated Staging Docker Container / Retry**:
    - Call `setup_staging_docker` to create a fresh staging database container with resource limits (2 cores, 2GB RAM).
    - This sets up the ephemeral database and seeds initial schemas if available.
+   - Note that if retrying validation after a previous failed set of knobs, call `recreate_database_staging` to reset the container to a clean factory state before re-running verification with the new knobs.
 
 1. **Benchmark Baseline Performance (Pre-Tuning)**:
    - Call `benchmark_baseline_staging` to measure baseline throughput (TPS) and query rate (QPS) on the unmodified staging database before applying any knobs.
@@ -22,8 +23,7 @@ Follow this strict sequence of verification steps:
    - Inspect the returned SQL execution status for any syntax errors or rejected parameters.
 
 3. **Restart Staging Database**:
-   - Call `restart_database_staging` to restart the staging database instance according to its configured restart mechanism (Docker container, systemctl service, brew, or SSH).
-   - This ensures that static parameters (like `shared_buffers` or `max_connections`) take effect and proves that the database can start cleanly without entering a crash loop or failing memory allocation.
+   - Call `restart_database_staging` to restart the existing container in-place (without recreating it) to apply static knobs (like `shared_buffers` or `max_connections`) and verify they persist across restart without crashing.
 
 4. **Run Option A Database Health and CRUD Tests**:
    - Call `test_database_staging` to execute comprehensive connectivity and functional tests:

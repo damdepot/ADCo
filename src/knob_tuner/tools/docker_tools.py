@@ -435,3 +435,128 @@ def start_staging_db(
         err_msg += f"\nContainer logs (tail 50):\n{container_logs}"
 
     raise TimeoutError(err_msg)
+
+def restart_docker_db(
+    container_name: str,
+    timeout: int = 60,
+    db_type: str = "postgres",
+    readiness_timeout: int = 60,
+) -> tuple[bool, str]:
+    """Restart a database running inside a Docker container.
+
+    Args:
+        container_name: Docker container name or ID.
+        timeout: Maximum seconds to wait for the docker restart command.
+        db_type: Type of database ('postgres' or 'mysql') used to select
+            the readiness probe command.
+        readiness_timeout: Maximum seconds to wait for the database inside
+            the container to accept connections after restart.
+
+    Returns:
+        Tuple of (success: bool, message: str).
+    """
+    if not container_name or not container_name.strip():
+        return False, "Container name cannot be empty"
+
+    container_name = container_name.strip()
+    try:
+        proc = subprocess.run(
+            ["docker", "restart", container_name],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or proc.stdout.strip()
+            return False, f"Failed to restart container '{container_name}': {err_msg}"
+    except subprocess.TimeoutExpired:
+        return False, f"Timed out restarting container '{container_name}' after {timeout}s"
+    except FileNotFoundError:
+        return False, "docker command not found in PATH"
+    except Exception as e:
+        return False, f"Unexpected error restarting container '{container_name}': {e}"
+
+    # Build the readiness probe command based on db_type
+    if db_type == "mysql":
+        probe_cmd = [
+            "docker", "exec", container_name,
+            "mysqladmin", "ping", "-uroot", "--silent",
+        ]
+    else:
+        # Default to postgres
+        probe_cmd = [
+            "docker", "exec", container_name,
+            "pg_isready", "-U", "postgres", "-h", "127.0.0.1",
+        ]
+
+    # Poll until the database is ready or readiness_timeout elapses
+    elapsed = 0
+    while elapsed < readiness_timeout:
+        try:
+            result = subprocess.run(
+                probe_cmd,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return (
+                    True,
+                    f"Docker container '{container_name}' restarted and ready",
+                )
+        except Exception:
+            pass
+        time.sleep(1)
+        elapsed += 1
+
+    return (
+        False,
+        f"Docker container '{container_name}' restarted but database did not become"
+        f" ready within {readiness_timeout}s",
+    )
+
+
+def recreate_docker_db(
+    container_name: str,
+    db_type: str = "postgres",
+    db_version: str | None = None,
+    database: str = "testdb",
+    cpus: float = 2.0,
+    memory: str = "2g",
+    timeout: int = 60,
+    init_dir: str | None = None,
+) -> tuple[bool, str, object]:
+    """Stop, remove, and recreate a staging Docker container, returning the new config.
+
+    When Docker restarts a container with dynamic port mapping (``-p 127.0.0.1::<port>``),
+    the host port is reassigned on every restart. Recreating the container ensures the
+    new port is captured and stored in state so subsequent tools connect to the right address.
+
+    Args:
+        container_name: Name of the existing staging container to replace.
+        db_type: Database type ('postgres' or 'mysql').
+        db_version: Optional database version string.
+        database: Database name to recreate.
+        cpus: CPU limit for the new container.
+        memory: Memory limit for the new container (e.g. '2g').
+        timeout: Maximum seconds to wait for the new container to become ready.
+        init_dir: Optional path to an initialization directory.
+
+    Returns:
+        Tuple of (success: bool, new_container_name_or_error: str, new_cfg_or_None).
+    """
+    stop_staging_db(container_name)
+
+    try:
+        new_container_name, new_cfg = start_staging_db(
+            db_type=db_type,
+            db_version=db_version,
+            database=database,
+            cpus=cpus,
+            memory=memory,
+            timeout=timeout,
+            init_dir=init_dir,
+        )
+        return True, new_container_name, new_cfg
+    except Exception as e:
+        return False, str(e), None

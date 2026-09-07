@@ -578,3 +578,52 @@ def test_start_staging_db_mysql_with_banner():
         run_call_args = mock_run.call_args_list[0][0][0]
         assert "mysql:8.0" in run_call_args
 
+
+# =====================================================================
+# restart_docker_db and recreate_docker_db tests
+# =====================================================================
+
+def test_restart_docker_db_success():
+    mock_res = MagicMock(returncode=0, stdout="postgres_db\n", stderr="")
+    with patch("subprocess.run", return_value=mock_res):
+        from src.knob_tuner.tools.docker_tools import restart_docker_db
+        ok, msg = restart_docker_db("postgres_db")
+        assert ok is True
+        assert "restarted and ready" in msg
+
+def test_restart_docker_db_failure():
+    mock_res = MagicMock(
+        returncode=1, stdout="", stderr="Error: No such container: bad_container"
+    )
+    with patch("subprocess.run", return_value=mock_res):
+        from src.knob_tuner.tools.docker_tools import restart_docker_db
+        ok, msg = restart_docker_db("bad_container")
+        assert ok is False
+        assert "Failed to restart container 'bad_container'" in msg
+        assert "No such container" in msg
+
+def test_restart_docker_db_empty_name():
+    from src.knob_tuner.tools.docker_tools import restart_docker_db
+    ok, msg = restart_docker_db("   ")
+    assert ok is False
+    assert "Container name cannot be empty" in msg
+
+def test_recreate_docker_db_success():
+    new_cfg = DBConfig(host="10.0.0.1", port=5555, user="u", password="p", database="d", db_type="postgres", env="staging")
+    with patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop, \
+         patch("src.knob_tuner.tools.docker_tools.start_staging_db", return_value=("new-container", new_cfg)) as mock_start:
+        from src.knob_tuner.tools.docker_tools import recreate_docker_db
+        ok, cname, cfg = recreate_docker_db("old-container")
+        assert ok is True
+        assert cname == "new-container"
+        assert cfg == new_cfg
+        mock_stop.assert_called_once_with("old-container")
+
+def test_recreate_docker_db_failure():
+    with patch("src.knob_tuner.tools.docker_tools.stop_staging_db"), \
+         patch("src.knob_tuner.tools.docker_tools.start_staging_db", side_effect=Exception("Failed to start")):
+        from src.knob_tuner.tools.docker_tools import recreate_docker_db
+        ok, err, cfg = recreate_docker_db("old-container")
+        assert ok is False
+        assert "Failed to start" in err
+        assert cfg is None

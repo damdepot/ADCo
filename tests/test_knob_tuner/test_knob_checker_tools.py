@@ -23,6 +23,7 @@ from src.knob_tuner.sub_agents.knob_checker.tools import (
     benchmark_baseline_staging,
     benchmark_tuned_staging,
     cleanup_staging_docker,
+    recreate_database_staging,
     restart_database_staging,
     setup_staging_docker,
     test_database_staging,
@@ -130,12 +131,13 @@ def test_create_knob_checker_agent():
     assert agent.name == "knob_checker"
     assert agent.output_key == "knob_checker_output"
     assert agent.output_schema == KnobCheckerOutput
-    assert len(agent.tools) == 7
+    assert len(agent.tools) == 8
     tool_names = [t.__name__ for t in agent.tools]
     assert "setup_staging_docker" in tool_names
     assert "benchmark_baseline_staging" in tool_names
     assert "apply_knobs_staging" in tool_names
     assert "restart_database_staging" in tool_names
+    assert "recreate_database_staging" in tool_names
     assert "test_database_staging" in tool_names
     assert "benchmark_tuned_staging" in tool_names
     assert "cleanup_staging_docker" in tool_names
@@ -221,24 +223,37 @@ def test_apply_knobs_staging_no_knobs(mock_db_config_pg):
 # 5. restart_database_staging Tool Tests
 # ===========================================================================
 
-@patch("src.knob_tuner.sub_agents.knob_checker.tools.restart_db_by_config")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.restart_docker_db")
 def test_restart_database_staging_success(mock_restart, mock_db_config_pg):
     mock_restart.return_value = (True, "Container restarted")
-    tc = MockToolContext({"staging_db_config": mock_db_config_pg})
+    tc = MockToolContext({
+        "staging_db_config": mock_db_config_pg,
+        "staging_docker_container": "my-staging-container"
+    })
 
     result = restart_database_staging(tc)
     assert "OK: Staging database restarted successfully" in result
+    mock_restart.assert_called_once_with("my-staging-container", db_type=mock_db_config_pg.db_type)
 
 
-@patch("src.knob_tuner.sub_agents.knob_checker.tools.restart_db_by_config")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.restart_docker_db")
 def test_restart_database_staging_failure(mock_restart, mock_db_config_pg):
     mock_restart.return_value = (False, "Timeout waiting for docker container")
-    tc = MockToolContext({"staging_db_config": mock_db_config_pg})
+    tc = MockToolContext({
+        "staging_db_config": mock_db_config_pg,
+        "staging_docker_container": "my-staging-container"
+    })
 
     result = restart_database_staging(tc)
 
     assert "ERROR: Staging database restart failed" in result
     assert "Timeout" in result
+
+
+def test_restart_database_staging_no_container(mock_db_config_pg):
+    tc = MockToolContext({"staging_db_config": mock_db_config_pg})
+    result = restart_database_staging(tc)
+    assert "ERROR: No active staging Docker container to restart." in result
 
 
 def test_restart_database_staging_missing_config():
@@ -708,3 +723,65 @@ def test_cleanup_staging_docker_no_container():
     result = cleanup_staging_docker(tc)
     assert "OK: No active staging Docker container to clean up." in result
 
+
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.recreate_docker_db")
+def test_recreate_database_staging_success(mock_recreate, mock_db_config_pg):
+    new_cfg = DBConfig(host="10.0.0.1", port=5555, user="u", password="p", database="d", db_type="postgres", env="staging")
+    mock_recreate.return_value = (True, "new-container-id", new_cfg)
+
+    mock_db_config_pg.restart_type = "docker"
+    tc = MockToolContext({
+        "staging_db_config": mock_db_config_pg,
+        "staging_docker_container": "old-staging-container",
+        "db_version": "16",
+        "staging_applied_knobs": [{"knob": "k1", "value": "v1"}],
+        "staging_test_results": {"status": "fail"},
+        "staging_verified_knobs": [{"knob": "k1", "status": "FAIL"}],
+        "staging_tuned_benchmark": {"tps": 50},
+        "staging_baseline_benchmark": {"tps": 100},
+    })
+
+    result = recreate_database_staging(tc)
+
+    mock_recreate.assert_called_once()
+    assert "OK: Staging container recreated successfully" in result
+    assert tc.state["staging_docker_container"] == "new-container-id"
+    assert tc.state["staging_db_config"] == new_cfg
+    assert tc.state["staging_applied_knobs"] == []
+    assert tc.state["staging_test_results"] is None
+    assert tc.state["staging_verified_knobs"] == []
+    assert tc.state["staging_tuned_benchmark"] is None
+    assert tc.state["staging_validated"] is False
+    assert tc.state["staging_baseline_benchmark"] == {"tps": 100}
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.recreate_docker_db")
+def test_recreate_database_staging_failure(mock_recreate, mock_db_config_pg):
+    mock_recreate.return_value = (False, "Container recreation failed", None)
+    tc = MockToolContext({
+        "staging_db_config": mock_db_config_pg,
+        "staging_docker_container": "old-container",
+    })
+
+    result = recreate_database_staging(tc)
+
+    assert "ERROR: Staging container recreation failed: Container recreation failed" in result
+
+
+def test_recreate_database_staging_missing_config():
+    tc = MockToolContext({})
+    result = recreate_database_staging(tc)
+    assert "ERROR: Staging DBConfig not found in state" in result
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.setup_staging_docker")
+def test_recreate_database_staging_missing_container_fallback(mock_setup, mock_db_config_pg):
+    mock_setup.return_value = "## Staging Docker Container Initialized: **OK**"
+    tc = MockToolContext({"staging_db_config": mock_db_config_pg})
+
+    result = recreate_database_staging(tc)
+
+    mock_setup.assert_called_once_with(tc)
+    assert "## Staging Docker Container Initialized: **OK**" in result

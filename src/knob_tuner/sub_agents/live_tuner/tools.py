@@ -8,7 +8,6 @@ from google.adk.tools import ToolContext
 from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
 from src.knob_tuner.tools.db_tools import apply_knobs, verify_active_knobs
 from src.knob_tuner.tools.file_tools import read_json_file
-from src.knob_tuner.tools.restart_tools import restart_db_by_config
 
 def _get_production_db_config(tool_context: ToolContext) -> DBConfig | None:
     """Extract production database configuration from tool context state."""
@@ -240,15 +239,6 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
     else:
         tool_context.state["prod_applied_knobs"] = []
         
-    allow_restart = bool(tool_context.state.get("allow_production_restart", False))
-    
-    restarted = False
-    restart_msg = ""
-    if allow_restart and restart_required_knobs:
-        ok, msg = restart_db_by_config(cfg)
-        restarted = ok
-        restart_msg = msg
-
     # Verification
     verification = verify_active_knobs(cfg, knobs)
     tool_context.state["prod_verified_knobs"] = verification.get("knobs", [])
@@ -260,7 +250,7 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
         "## Production Live Tuning Report",
         f"- **Knobs Processed**: {applied_count}/{len(knobs)} (Failed: {failed_count})",
         f"- **Static / Restart-Required Knobs Deferred**: {len(restart_required_knobs)}",
-        f"- **Auto-Restart Status**: {'EXECUTED (' + restart_msg + ')' if restarted else 'DISABLED (Zero Downtime Policy)'}",
+        "- **Auto-Restart Status**: DISABLED (Zero Downtime Policy)",
         "",
     ]
 
@@ -275,7 +265,7 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
             lines.append(f"- **{kname}** -> `{kval}`: **{st.upper()}**{err_str}")
         lines.append("")
 
-    if restart_required_knobs and not restarted:
+    if restart_required_knobs:
         lines.append("### Deferred Knobs (Requires Scheduled Maintenance Restart)")
         for rk in restart_required_knobs:
             kname = rk.get("name", "")

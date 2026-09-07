@@ -19,6 +19,7 @@ def create_knob_checker_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
             tools.benchmark_baseline_staging,
             tools.apply_knobs_staging,
             tools.restart_database_staging,
+            tools.recreate_database_staging,
             tools.test_database_staging,
             tools.benchmark_tuned_staging,
             tools.cleanup_staging_docker,

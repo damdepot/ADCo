@@ -431,3 +431,23 @@ def test_run_sysbench_benchmark_run_segfault_permanent_failure(mock_db_config_pg
         assert "Sysbench encountered a segmentation fault (exit code -11)" in res["error"]
         assert "benchmark run" in res["error"]
 
+
+def test_run_sysbench_benchmark_default_workdir(mock_db_config_pg, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = (50,)
+
+    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
+         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
+
+        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_SYSBENCH_OUTPUT, stderr="")
+
+        res = run_sysbench_benchmark(cfg=mock_db_config_pg, tables=50)
+
+        assert res["status"] == "ok"
+        assert res["log_file"] == os.path.join("logs", "sysbench", os.path.basename(res["log_file"]))
+        assert os.path.isfile(res["log_file"])
+
