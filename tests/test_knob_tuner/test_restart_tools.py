@@ -13,17 +13,12 @@ from src.knob_tuner.tools.restart_tools import (
 
 
 def test_restart_docker_db_success():
+    # docker restart succeeds (returncode=0), readiness probe also succeeds (returncode=0)
     mock_res = MagicMock(returncode=0, stdout="postgres_db\n", stderr="")
-    with patch("subprocess.run", return_value=mock_res) as mock_run:
+    with patch("subprocess.run", return_value=mock_res):
         ok, msg = restart_docker_db("postgres_db")
         assert ok is True
-        assert "restarted successfully" in msg
-        mock_run.assert_called_once_with(
-            ["docker", "restart", "postgres_db"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+        assert "restarted and ready" in msg
 
 
 def test_restart_docker_db_failure():
@@ -173,7 +168,7 @@ def test_restart_db_by_config_docker(mock_db_config_pg):
     with patch("src.knob_tuner.tools.restart_tools.restart_docker_db", return_value=(True, "ok")) as mock_docker:
         ok, msg = restart_db_by_config(mock_db_config_pg)
         assert ok is True
-        mock_docker.assert_called_once_with("staging_postgres_container")
+        mock_docker.assert_called_once_with("staging_postgres_container", db_type="postgres")
 
 
 def test_restart_db_by_config_local(mock_db_config_mysql):

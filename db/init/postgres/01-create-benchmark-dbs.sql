@@ -1,2 +1,2 @@
-CREATE DATABASE smallbank;
-CREATE DATABASE tpcc;
+SELECT 'CREATE DATABASE smallbank' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'smallbank')\gexec
+SELECT 'CREATE DATABASE tpcc' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'tpcc')\gexec

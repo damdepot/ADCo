@@ -5,6 +5,7 @@ import tempfile
 from unittest.mock import MagicMock, patch
 import pytest
 
+from src.knob_tuner.sub_agents.intent_analyzer.models import IntentAnalyzerOutput
 from src.knob_tuner.sub_agents.knob_checker.agent import (
     create_knob_checker_agent,
 )
@@ -21,15 +22,55 @@ from src.knob_tuner.sub_agents.knob_checker.tools import (
     apply_knobs_staging,
     benchmark_baseline_staging,
     benchmark_tuned_staging,
+    cleanup_staging_docker,
     restart_database_staging,
+    setup_staging_docker,
     test_database_staging,
 )
 from src.knob_tuner.tools.db_connector import DBConfig
 
 
+class MockState:
+    """Simulates ADK State class which supports dict-like access but lacks a .pop() method."""
+
+    def __init__(self, data: dict | None = None):
+        self._data = dict(data) if data is not None else {}
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __setitem__(self, key, value):
+        self._data[key] = value
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def setdefault(self, key, default=None):
+        return self._data.setdefault(key, default)
+
+    def keys(self):
+        return self._data.keys()
+
+    def values(self):
+        return self._data.values()
+
+    def items(self):
+        return self._data.items()
+
+
 class MockToolContext:
-    def __init__(self, state: dict | None = None):
-        self.state = state if state is not None else {}
+    def __init__(self, state: dict | MockState | None = None):
+        if isinstance(state, MockState):
+            self.state = state
+        elif isinstance(state, dict):
+            self.state = MockState(state)
+        elif state is None:
+            self.state = MockState({})
+        else:
+            self.state = state
 
 
 # ===========================================================================
@@ -89,13 +130,15 @@ def test_create_knob_checker_agent():
     assert agent.name == "knob_checker"
     assert agent.output_key == "knob_checker_output"
     assert agent.output_schema == KnobCheckerOutput
-    assert len(agent.tools) == 5
+    assert len(agent.tools) == 7
     tool_names = [t.__name__ for t in agent.tools]
+    assert "setup_staging_docker" in tool_names
     assert "benchmark_baseline_staging" in tool_names
     assert "apply_knobs_staging" in tool_names
     assert "restart_database_staging" in tool_names
     assert "test_database_staging" in tool_names
     assert "benchmark_tuned_staging" in tool_names
+    assert "cleanup_staging_docker" in tool_names
 
 
 # ===========================================================================
@@ -448,3 +491,220 @@ def test_benchmark_tuned_staging_missing_config():
     result = benchmark_tuned_staging(tc)
     assert "ERROR: Staging DBConfig not found in state" in result
     assert tc.state["staging_validated"] is False
+
+
+# ===========================================================================
+# 8. setup_staging_docker & cleanup_staging_docker Tool Tests
+# ===========================================================================
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.start_staging_db")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.is_docker_available", return_value=(True, "Docker is ready"))
+def test_setup_staging_docker_with_intent_analyzer_output_model(mock_docker_avail, mock_start_staging, mock_db_config_pg):
+    mock_start_staging.return_value = ("adco-staging-postgres-abc12345", mock_db_config_pg)
+    intent_output = IntentAnalyzerOutput(
+        db_type="postgres",
+        db_version="16.2",
+    )
+    tc = MockToolContext({
+        "intent_analyzer_output": intent_output,
+        "database": "custom_test_db",
+    })
+
+    result = setup_staging_docker(tc)
+
+    assert "## Staging Docker Container Initialized: **OK**" in result
+    assert "adco-staging-postgres-abc12345" in result
+    assert "**Database Version**: `16.2`" in result
+    assert "**Database Engine**: `postgres`" in result
+    assert "**Database**: `custom_test_db`" in result
+    assert tc.state["staging_db_config"] is mock_db_config_pg
+    assert tc.state["staging_docker_container"] == "adco-staging-postgres-abc12345"
+
+    mock_start_staging.assert_called_once()
+    _, kwargs = mock_start_staging.call_args
+    assert kwargs["db_type"] == "postgres"
+    assert kwargs["db_version"] == "16.2"
+    assert kwargs["database"] == "custom_test_db"
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.start_staging_db")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.is_docker_available", return_value=(True, "Docker is ready"))
+def test_setup_staging_docker_with_intent_analyzer_output_dict(mock_docker_avail, mock_start_staging, mock_db_config_mysql):
+    mock_start_staging.return_value = ("adco-staging-mysql-xyz7890", mock_db_config_mysql)
+    intent_dict = {
+        "db_type": "mysql",
+        "db_version": "8.4",
+    }
+    tc = MockToolContext({
+        "intent_analyzer_output": intent_dict,
+    })
+
+    result = setup_staging_docker(tc)
+
+    assert "## Staging Docker Container Initialized: **OK**" in result
+    assert "adco-staging-mysql-xyz7890" in result
+    assert "**Database Version**: `8.4`" in result
+    assert "**Database Engine**: `mysql`" in result
+    assert tc.state["staging_db_config"] is mock_db_config_mysql
+    assert tc.state["staging_docker_container"] == "adco-staging-mysql-xyz7890"
+
+    mock_start_staging.assert_called_once()
+    _, kwargs = mock_start_staging.call_args
+    assert kwargs["db_type"] == "mysql"
+    assert kwargs["db_version"] == "8.4"
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.start_staging_db")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.is_docker_available", return_value=(True, "Docker is ready"))
+def test_setup_staging_docker_with_top_level_db_version(mock_docker_avail, mock_start_staging, mock_db_config_pg):
+    mock_start_staging.return_value = ("adco-staging-postgres-top12345", mock_db_config_pg)
+    tc = MockToolContext({
+        "db_type": "postgres",
+        "db_version": "15.4",
+    })
+
+    result = setup_staging_docker(tc)
+
+    assert "## Staging Docker Container Initialized: **OK**" in result
+    assert "**Database Version**: `15.4`" in result
+    mock_start_staging.assert_called_once()
+    _, kwargs = mock_start_staging.call_args
+    assert kwargs["db_type"] == "postgres"
+    assert kwargs["db_version"] == "15.4"
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.start_staging_db")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.is_docker_available", return_value=(True, "Docker is ready"))
+def test_setup_staging_docker_with_target_db_version_fallback(mock_docker_avail, mock_start_staging, mock_db_config_pg):
+    mock_start_staging.return_value = ("adco-staging-postgres-target123", mock_db_config_pg)
+    tc = MockToolContext({
+        "target_db_version": "14.1",
+    })
+
+    result = setup_staging_docker(tc)
+
+    assert "## Staging Docker Container Initialized: **OK**" in result
+    assert "**Database Version**: `14.1`" in result
+    mock_start_staging.assert_called_once()
+    _, kwargs = mock_start_staging.call_args
+    assert kwargs["db_type"] == "postgres"
+    assert kwargs["db_version"] == "14.1"
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.start_staging_db")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.is_docker_available", return_value=(True, "Docker is ready"))
+def test_setup_staging_docker_no_version_specified(mock_docker_avail, mock_start_staging, mock_db_config_pg):
+    mock_start_staging.return_value = ("adco-staging-postgres-nover123", mock_db_config_pg)
+    tc = MockToolContext({})
+
+    result = setup_staging_docker(tc)
+
+    assert "## Staging Docker Container Initialized: **OK**" in result
+    assert "Database Version" not in result
+    mock_start_staging.assert_called_once()
+    _, kwargs = mock_start_staging.call_args
+    assert kwargs["db_type"] == "postgres"
+    assert kwargs["db_version"] is None
+    assert kwargs["database"] == "testdb"
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.start_staging_db")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.is_docker_available", return_value=(True, "Docker is ready"))
+def test_setup_staging_docker_database_from_staging_config(mock_docker_avail, mock_start_staging, mock_db_config_pg):
+    mock_start_staging.return_value = ("adco-staging-postgres-stgcfg1", mock_db_config_pg)
+    custom_cfg = DBConfig(
+        host="127.0.0.1",
+        port=5432,
+        user="pguser",
+        password="secret",
+        database="from_stg_cfg_db",
+        db_type="postgres",
+    )
+    tc = MockToolContext({
+        "staging_db_config": custom_cfg,
+    })
+
+    result = setup_staging_docker(tc)
+    assert "## Staging Docker Container Initialized: **OK**" in result
+    mock_start_staging.assert_called_once()
+    _, kwargs = mock_start_staging.call_args
+    assert kwargs["database"] == "from_stg_cfg_db"
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.start_staging_db")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.is_docker_available", return_value=(True, "Docker is ready"))
+def test_setup_staging_docker_database_from_dbname_state(mock_docker_avail, mock_start_staging, mock_db_config_pg):
+    mock_start_staging.return_value = ("adco-staging-postgres-dbname1", mock_db_config_pg)
+    tc = MockToolContext({
+        "dbname": "from_dbname_state",
+    })
+
+    result = setup_staging_docker(tc)
+    assert "## Staging Docker Container Initialized: **OK**" in result
+    mock_start_staging.assert_called_once()
+    _, kwargs = mock_start_staging.call_args
+    assert kwargs["database"] == "from_dbname_state"
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.is_docker_available", return_value=(False, "Docker daemon not running"))
+def test_setup_staging_docker_docker_unavailable(mock_docker_avail):
+    tc = MockToolContext({})
+    result = setup_staging_docker(tc)
+    assert "ERROR: Docker daemon is not running or available" in result
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.stop_staging_db")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.start_staging_db")
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.is_docker_available", return_value=(True, "Docker is ready"))
+def test_setup_staging_docker_cleans_up_existing_container(mock_docker_avail, mock_start_staging, mock_stop_staging, mock_db_config_pg):
+    mock_stop_staging.return_value = (True, "stopped")
+    mock_start_staging.return_value = ("adco-staging-postgres-new999", mock_db_config_pg)
+    tc = MockToolContext({
+        "staging_docker_container": "old-staging-container",
+        "db_version": "16",
+    })
+
+    result = setup_staging_docker(tc)
+
+    mock_stop_staging.assert_called_once_with("old-staging-container")
+    assert tc.state["staging_docker_container"] == "adco-staging-postgres-new999"
+    assert "## Staging Docker Container Initialized: **OK**" in result
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.start_staging_db", side_effect=RuntimeError("Docker run failed"))
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.is_docker_available", return_value=(True, "Docker is ready"))
+def test_setup_staging_docker_start_exception(mock_docker_avail, mock_start_staging):
+    tc = MockToolContext({"db_version": "16"})
+    result = setup_staging_docker(tc)
+    assert "ERROR: Failed to start staging Docker container: Docker run failed" in result
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.stop_staging_db", return_value=(True, "Container stopped and removed"))
+def test_cleanup_staging_docker_success(mock_stop_staging):
+    tc = MockToolContext({"staging_docker_container": "adco-staging-pg-cleanup"})
+    assert not hasattr(tc.state, "pop")
+    result = cleanup_staging_docker(tc)
+
+    assert "OK: Staging Docker container 'adco-staging-pg-cleanup' cleaned up successfully" in result
+    assert tc.state.get("staging_docker_container") is None
+    assert tc.state["staging_docker_container"] is None
+    mock_stop_staging.assert_called_once_with("adco-staging-pg-cleanup")
+
+
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.stop_staging_db", return_value=(False, "Failed to remove"))
+def test_cleanup_staging_docker_warning(mock_stop_staging):
+    tc = MockToolContext({"staging_docker_container": "adco-staging-pg-cleanup"})
+    assert not hasattr(tc.state, "pop")
+    result = cleanup_staging_docker(tc)
+
+    assert "WARNING: Staging Docker container 'adco-staging-pg-cleanup' cleanup returned" in result
+    assert tc.state.get("staging_docker_container") is None
+    assert tc.state["staging_docker_container"] is None
+    mock_stop_staging.assert_called_once_with("adco-staging-pg-cleanup")
+
+
+def test_cleanup_staging_docker_no_container():
+    tc = MockToolContext({})
+    result = cleanup_staging_docker(tc)
+    assert "OK: No active staging Docker container to clean up." in result
+

@@ -8,6 +8,10 @@ Your job is to validate recommended database configuration knobs by executing an
 
 Follow this strict sequence of verification steps:
 
+0. **Spin Up Isolated Staging Docker Container**:
+   - Call `setup_staging_docker` to create a fresh staging database container with resource limits (2 cores, 2GB RAM).
+   - This sets up the ephemeral database and seeds initial schemas if available.
+
 1. **Benchmark Baseline Performance (Pre-Tuning)**:
    - Call `benchmark_baseline_staging` to measure baseline throughput (TPS) and query rate (QPS) on the unmodified staging database before applying any knobs.
    - If already measured and cached, this step will reuse the cached baseline to avoid corrupting measurements across retries.
@@ -33,7 +37,10 @@ Follow this strict sequence of verification steps:
    - Call `benchmark_tuned_staging` to run sysbench stress tests on the tuned staging database.
    - This compares tuned TPS and QPS against the baseline, measuring the percentage delta.
 
-6. **PASS / FAIL Evaluation**:
+6. **Tear Down Staging Docker Container**:
+   - Call `cleanup_staging_docker` to cleanly stop and remove the test Docker container and free system resources before returning the final report.
+
+7. **PASS / FAIL Evaluation**:
    - **PASS**: Only if all knobs applied cleanly, the database restarted without error, all Option A health/CRUD tests returned `ok`, and tuned TPS is greater than or equal to baseline TPS without performance regression.
    - **FAIL**: If any knob failed to apply, the staging database failed to restart (e.g. OOM, bad parameter value), connectivity/CRUD tests failed, OR a performance regression is detected (tuned TPS < baseline TPS, or sysbench benchmark error).
    - If baseline benchmark failed due to an environmental or sysbench tool issue before knobs were applied, do NOT falsely attribute that initial baseline failure to the candidate knobs.

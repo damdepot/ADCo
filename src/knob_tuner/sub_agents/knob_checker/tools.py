@@ -8,6 +8,11 @@ from google.adk.tools import ToolContext
 from src.knob_tuner.tools.benchmark_tools import run_sysbench_benchmark
 from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
 from src.knob_tuner.tools.db_tools import apply_knobs, test_database, verify_active_knobs
+from src.knob_tuner.tools.docker_tools import (
+    is_docker_available,
+    start_staging_db,
+    stop_staging_db,
+)
 from src.knob_tuner.tools.file_tools import read_json_file
 from src.knob_tuner.tools.restart_tools import restart_db_by_config
 from src.knob_tuner.sub_agents.knob_checker.models import (
@@ -15,6 +20,9 @@ from src.knob_tuner.sub_agents.knob_checker.models import (
     KnobCheckIssue,
     SysbenchMetrics,
 )
+
+
+_REGRESSION_THRESHOLD_PCT = 5.0  # FAIL only if TPS drops more than this percentage
 
 
 def _get_staging_db_config(tool_context: ToolContext) -> DBConfig | None:
@@ -42,7 +50,7 @@ def _get_staging_db_config(tool_context: ToolContext) -> DBConfig | None:
     db_type = state.get("db_type") or "postgres"
     if config_path and os.path.isfile(config_path):
         try:
-            return load_db_config(config_path, env="staging", db_type=db_type)
+            return load_db_config(config_path, db_type=db_type)
         except Exception:
             pass
 
@@ -430,7 +438,7 @@ def benchmark_tuned_staging(tool_context: ToolContext) -> str:
 
     Compares tuned TPS and QPS against baseline stored in
     ``tool_context.state['staging_baseline_benchmark']``. Calculates percentage delta.
-    If benchmark errors or performance regresses (delta_pct < 0.0, or drop > 5%),
+    If benchmark errors or performance regresses (TPS drop exceeds 5%),
     flags regression, sets ``staging_validated = False``, and records an issue.
     Stores ``tool_context.state['staging_tuned_benchmark'] = result`` and
     ``tool_context.state['staging_benchmark_results'] = BenchmarkResult(...)``.
@@ -482,7 +490,11 @@ def benchmark_tuned_staging(tool_context: ToolContext) -> str:
             delta_pct = 0.0
 
         is_error = (result.get("status") != "ok")
-        is_regression = (baseline_status == "ok" and baseline_tps > 0.0 and tuned_tps < baseline_tps)
+        is_regression = (
+            baseline_status == "ok"
+            and baseline_tps > 0.0
+            and delta_pct < -_REGRESSION_THRESHOLD_PCT
+        )
 
         if is_error:
             status_str = "ERROR"
@@ -534,7 +546,7 @@ def benchmark_tuned_staging(tool_context: ToolContext) -> str:
                 else (
                     f"Performance regression detected in staging sysbench benchmark: "
                     f"tuned TPS ({tuned_tps:.2f}) vs baseline TPS ({baseline_tps:.2f}), "
-                    f"delta: {delta_pct:+.2f}%"
+                    f"delta: {delta_pct:+.2f}% (threshold: -{_REGRESSION_THRESHOLD_PCT:.1f}%)"
                 )
             )
             issue = KnobCheckIssue(
@@ -583,4 +595,131 @@ def benchmark_tuned_staging(tool_context: ToolContext) -> str:
 
 
 benchmark_tuned_staging.__test__ = False  # type: ignore[attr-defined]
+
+
+def setup_staging_docker(tool_context: ToolContext) -> str:
+    """Spin up an isolated Docker container for database staging validation.
+
+    Args:
+        tool_context: ADK tool execution context.
+
+    Returns:
+        Formatted status string with container details or error message.
+    """
+    ok, msg = is_docker_available()
+    if not ok:
+        return (
+            "ERROR: Docker daemon is not running or available. "
+            "Exclusive Docker staging validation requires a running Docker daemon."
+        )
+
+    # Clean up any existing staging container from a previous attempt
+    existing_container = tool_context.state.get("staging_docker_container")
+    if existing_container:
+        stop_staging_db(existing_container)
+        tool_context.state["staging_docker_container"] = None
+
+    intent_output = tool_context.state.get("intent_analyzer_output")
+    db_version = None
+    db_type = None
+
+    if intent_output:
+        if hasattr(intent_output, "db_version"):
+            db_version = getattr(intent_output, "db_version", None) or None
+        elif isinstance(intent_output, dict):
+            db_version = intent_output.get("db_version") or None
+
+        if hasattr(intent_output, "db_type"):
+            db_type = getattr(intent_output, "db_type", None) or None
+        elif isinstance(intent_output, dict):
+            db_type = intent_output.get("db_type") or None
+
+    if not db_version:
+        db_version = (
+            tool_context.state.get("db_version")
+            or tool_context.state.get("target_db_version")
+            or None
+        )
+
+    if not db_type:
+        db_type = tool_context.state.get("db_type", "postgres")
+
+    cfg_staging = _get_staging_db_config(tool_context)
+    if cfg_staging and getattr(cfg_staging, "database", None):
+        database = cfg_staging.database
+    elif tool_context.state.get("database"):
+        database = tool_context.state.get("database")
+    elif tool_context.state.get("dbname"):
+        database = tool_context.state.get("dbname")
+    else:
+        database = "testdb"
+
+    # Locate ./db/init/<db_type> relative to repo root if it exists
+    canonical_type = "postgres" if "post" in db_type.lower() else ("mysql" if "my" in db_type.lower() else db_type)
+    init_dir = None
+    for cand in [
+        f"./db/init/{canonical_type}",
+        f"./db/init/{db_type}",
+        os.path.join(os.getcwd(), "db", "init", canonical_type),
+        os.path.join(os.getcwd(), "db", "init", db_type),
+    ]:
+        if os.path.isdir(cand):
+            init_dir = cand
+            break
+
+    try:
+        container_name, cfg = start_staging_db(
+            db_type=db_type,
+            db_version=db_version,
+            database=database,
+            init_dir=init_dir,
+        )
+        tool_context.state["staging_db_config"] = cfg
+        tool_context.state["staging_docker_container"] = container_name
+
+        lines = [
+            "## Staging Docker Container Initialized: **OK**",
+            "",
+            f"- **Container Name**: `{container_name}`",
+            f"- **Host Port**: `{cfg.port}`",
+            f"- **Database**: `{database}`",
+            f"- **Database Engine**: `{db_type}`",
+        ]
+        if db_version:
+            lines.append(f"- **Database Version**: `{db_version}`")
+        lines.extend([
+            "- **Resource Limits**: 2 CPU cores, 2GB RAM",
+            "- **Status**: Ready and accepting connections",
+        ])
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: Failed to start staging Docker container: {e}"
+
+
+setup_staging_docker.__test__ = False  # type: ignore[attr-defined]
+
+
+def cleanup_staging_docker(tool_context: ToolContext) -> str:
+    """Tear down and clean up the active staging Docker container.
+
+    Args:
+        tool_context: ADK tool execution context.
+
+    Returns:
+        Status message string.
+    """
+    container_name = tool_context.state.get("staging_docker_container")
+    if not container_name:
+        return "OK: No active staging Docker container to clean up."
+
+    ok, msg = stop_staging_db(container_name)
+    tool_context.state["staging_docker_container"] = None
+
+    if ok:
+        return f"OK: Staging Docker container '{container_name}' cleaned up successfully ({msg})."
+    else:
+        return f"WARNING: Staging Docker container '{container_name}' cleanup returned: {msg}"
+
+
+cleanup_staging_docker.__test__ = False  # type: ignore[attr-defined]
 

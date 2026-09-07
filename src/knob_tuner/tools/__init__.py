@@ -30,6 +30,13 @@ from .kb_planner import (
 from .benchmark_tools import (
     run_sysbench_benchmark,
 )
+from .docker_tools import (
+    cleanup_orphan_containers,
+    is_docker_available,
+    resolve_docker_image,
+    start_staging_db,
+    stop_staging_db,
+)
 
 __all__ = [
     "load_db_config",
@@ -50,4 +57,10 @@ __all__ = [
     "KnobStrategyDef",
     "_parse_knob_kb",
     "run_sysbench_benchmark",
+    "is_docker_available",
+    "resolve_docker_image",
+    "start_staging_db",
+    "stop_staging_db",
+    "cleanup_orphan_containers",
 ]
+

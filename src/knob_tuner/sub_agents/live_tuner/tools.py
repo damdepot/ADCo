@@ -34,7 +34,7 @@ def _get_production_db_config(tool_context: ToolContext) -> DBConfig | None:
     db_type = state.get("db_type") or "postgres"
     if config_path and os.path.isfile(config_path):
         try:
-            return load_db_config(config_path, env="production", db_type=db_type)
+            return load_db_config(config_path, db_type=db_type)
         except Exception:
             pass
 

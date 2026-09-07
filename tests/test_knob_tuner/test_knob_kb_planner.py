@@ -7,10 +7,12 @@ from src.knob_tuner.tools.kb_planner import (
     KnobStrategyDef,
     _parse_knob_kb,
     _calculate_strategy_score,
+    _to_text,
     plan_knob_tuning,
     get_knob_strategies,
     KB_PATH,
 )
+from src.knob_tuner.sub_agents.knob_checker.models import KnobCheckerOutput, KnobCheckIssue
 
 
 class MockToolContext:
@@ -161,3 +163,106 @@ def test_plan_knob_tuning_performance_regression_prioritization():
     assert "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY" in names[:3]
     assert any(n in names[:3] for n in ["PG_SHARED_MEMORY_MANAGEMENT", "PG_WAL_CHECKPOINTING_AND_DURABILITY", "PG_CONCURRENCY_AND_PARALLEL_WORKERS"])
     assert "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY" in summary
+
+
+def test_to_text_helper():
+    assert _to_text(None) == ""
+    assert _to_text("hello") == "hello"
+    assert _to_text(123) == "123"
+    assert _to_text({"key": "val"}) == '{"key": "val"}'
+    assert _to_text(["a", "b"]) == '["a", "b"]'
+
+    issue = KnobCheckIssue(
+        knob="shared_buffers",
+        severity="critical",
+        category="crash",
+        description="Database crash OOM",
+    )
+    issue_text = _to_text(issue)
+    assert "shared_buffers" in issue_text
+    assert "crash" in issue_text
+
+
+def test_plan_knob_tuning_feedback_as_dict():
+    feedback_dict = {
+        "status": "FAIL",
+        "issues": [
+            {
+                "knob": "shared_buffers",
+                "severity": "critical",
+                "category": "crash",
+                "description": "Database crash OOM",
+            }
+        ],
+    }
+    strats, summary = plan_knob_tuning("postgres", feedback=feedback_dict)
+    names = [s.name for s in strats]
+    assert names[0] == "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY"
+    assert "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY" in summary
+
+
+def test_plan_knob_tuning_feedback_as_pydantic_model():
+    feedback_model = KnobCheckerOutput(
+        status="FAIL",
+        issues=[
+            KnobCheckIssue(
+                knob="shared_buffers",
+                severity="critical",
+                category="crash",
+                description="Database crash OOM",
+            )
+        ],
+    )
+    strats, summary = plan_knob_tuning("postgres", feedback=feedback_model)
+    names = [s.name for s in strats]
+    assert names[0] == "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY"
+    assert "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY" in summary
+
+
+def test_plan_knob_tuning_workload_as_dict():
+    workload_dict = {
+        "workload_type": "OLTP",
+        "details": "heavy cache and memory read workload",
+    }
+    strats, summary = plan_knob_tuning("postgres", workload_text=workload_dict)
+    names = [s.name for s in strats]
+    assert any("PG_SHARED_MEMORY_MANAGEMENT" == n for n in names[:3])
+    assert "PG_SHARED_MEMORY_MANAGEMENT" in summary
+
+
+def test_get_knob_strategies_dict_and_model_state():
+    feedback_model = KnobCheckerOutput(
+        status="FAIL",
+        issues=[
+            KnobCheckIssue(
+                knob="shared_buffers",
+                severity="critical",
+                category="crash",
+                description="Database crash OOM",
+            )
+        ],
+    )
+    tc = MockToolContext({
+        "db_type": "postgres",
+        "workload": {"query_type": "write", "summary": "heavy write transaction commit redo"},
+        "memory_gb": 4.0,
+        "cpu_cores": 2,
+        "knob_checker_output": feedback_model,
+    })
+    res = get_knob_strategies(tc)
+    assert isinstance(res, str)
+    assert "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY" in res
+    assert tc.state.get("knob_strategies") == res
+
+
+def test_get_knob_strategies_fallback_keys():
+    tc = MockToolContext({
+        "db_type": "postgres",
+        "intent_analyzer_output": {"type": "read", "details": "heavy read and cache workload"},
+        "feedback": {"status": "FAIL", "issues": [{"knob": "shared_buffers", "severity": "critical", "category": "crash", "description": "crash"}]},
+    })
+    res = get_knob_strategies(tc)
+    assert isinstance(res, str)
+    assert "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY" in res
+    assert tc.state.get("knob_strategies") == res
+

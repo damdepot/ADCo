@@ -1,18 +1,28 @@
 """Database restart tools supporting Docker, local services, and remote SSH."""
 
 import subprocess
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .db_connector import DBConfig
 
 
-def restart_docker_db(container_name: str, timeout: int = 60) -> tuple[bool, str]:
+def restart_docker_db(
+    container_name: str,
+    timeout: int = 60,
+    db_type: str = "postgres",
+    readiness_timeout: int = 60,
+) -> tuple[bool, str]:
     """Restart a database running inside a Docker container.
 
     Args:
         container_name: Docker container name or ID.
-        timeout: Maximum seconds to wait for restart command.
+        timeout: Maximum seconds to wait for the docker restart command.
+        db_type: Type of database ('postgres' or 'mysql') used to select
+            the readiness probe command.
+        readiness_timeout: Maximum seconds to wait for the database inside
+            the container to accept connections after restart.
 
     Returns:
         Tuple of (success: bool, message: str).
@@ -28,16 +38,54 @@ def restart_docker_db(container_name: str, timeout: int = 60) -> tuple[bool, str
             text=True,
             timeout=timeout,
         )
-        if proc.returncode == 0:
-            return True, f"Docker container '{container_name}' restarted successfully"
-        err_msg = proc.stderr.strip() or proc.stdout.strip()
-        return False, f"Failed to restart container '{container_name}': {err_msg}"
+        if proc.returncode != 0:
+            err_msg = proc.stderr.strip() or proc.stdout.strip()
+            return False, f"Failed to restart container '{container_name}': {err_msg}"
     except subprocess.TimeoutExpired:
         return False, f"Timed out restarting container '{container_name}' after {timeout}s"
     except FileNotFoundError:
         return False, "docker command not found in PATH"
     except Exception as e:
         return False, f"Unexpected error restarting container '{container_name}': {e}"
+
+    # Build the readiness probe command based on db_type
+    if db_type == "mysql":
+        probe_cmd = [
+            "docker", "exec", container_name,
+            "mysqladmin", "ping", "-uroot", "--silent",
+        ]
+    else:
+        # Default to postgres
+        probe_cmd = [
+            "docker", "exec", container_name,
+            "pg_isready", "-U", "postgres", "-h", "127.0.0.1",
+        ]
+
+    # Poll until the database is ready or readiness_timeout elapses
+    elapsed = 0
+    while elapsed < readiness_timeout:
+        try:
+            result = subprocess.run(
+                probe_cmd,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return (
+                    True,
+                    f"Docker container '{container_name}' restarted and ready",
+                )
+        except Exception:
+            pass
+        time.sleep(1)
+        elapsed += 1
+
+    return (
+        False,
+        f"Docker container '{container_name}' restarted but database did not become"
+        f" ready within {readiness_timeout}s",
+    )
 
 
 def restart_local_db(
@@ -160,7 +208,7 @@ def restart_db_by_config(cfg: "DBConfig") -> tuple[bool, str]:
 
     if restart_type == "docker":
         target = cfg.restart_target or f"{cfg.env}_{cfg.db_type}"
-        return restart_docker_db(target)
+        return restart_docker_db(target, db_type=cfg.db_type)
 
     elif restart_type in ("local", "systemctl", "service", "brew"):
         method = "systemctl" if restart_type == "local" else restart_type
