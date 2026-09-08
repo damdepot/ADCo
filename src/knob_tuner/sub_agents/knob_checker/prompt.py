@@ -12,6 +12,7 @@ Follow this strict sequence of verification steps:
    - Call `setup_staging_docker` to create a fresh staging database container with resource limits (2 cores, 2GB RAM).
    - This sets up the ephemeral database and seeds initial schemas if available.
    - Note that if retrying validation after a previous failed set of knobs, call `recreate_database_staging` to reset the container to a clean factory state before re-running verification with the new knobs.
+   - If container setup fails or times out here, record the failure as an `environment_error` and explicitly state that this occurred before candidate knobs were applied, so the orchestrator should NOT trigger memory reduction.
 
 1. **Benchmark Baseline Performance (Pre-Tuning)**:
    - Call `benchmark_baseline_staging` to measure baseline throughput (TPS) and query rate (QPS) on the unmodified staging database before applying any knobs.

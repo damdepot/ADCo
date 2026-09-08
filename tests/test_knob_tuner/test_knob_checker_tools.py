@@ -680,6 +680,14 @@ def test_setup_staging_docker_start_exception(mock_docker_avail, mock_start_stag
     tc = MockToolContext({"db_version": "16"})
     result = setup_staging_docker(tc)
     assert "ERROR: Failed to start staging Docker container: Docker run failed" in result
+    
+    issues = tc.state.get("staging_issues")
+    assert issues is not None
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue.knob == "staging_docker_environment"
+    assert issue.category == "environment_error"
+    assert "before any candidate knobs were applied" in issue.description
 
 
 @patch("src.knob_tuner.sub_agents.knob_checker.tools.stop_staging_db", return_value=(True, "Container stopped and removed"))

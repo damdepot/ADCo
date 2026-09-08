@@ -49,7 +49,8 @@ The maximum allowed total attempts is 4 (1 initial attempt + up to 3 retries):
    - Evaluate the `knob_checker` output verdict (`status`):
      - **PASS**: Staging validation succeeded (database restarted cleanly, Option A health/CRUD checks passed, and tuned TPS >= baseline TPS without latency regression). Proceed immediately to Phase 3 (`live_tuner`).
      - **FAIL**: Staging validation failed due to either functional failure (database crash, connectivity failure, memory overflow, rejected parameters, CRUD test failure) or performance regression (tuned TPS < baseline TPS, latency degradation).
-       - Count how many recommendation-validation attempts have occurred so far (starting at attempt 1).
+       - If the failure is due to `category="environment_error"` or staging container startup timeout at Step 0, DO NOT ask `knob_recommender` to reduce knob memory allocations. Instead, report the environment issue and STOP the pipeline.
+       - Otherwise, count how many recommendation-validation attempts have occurred so far (starting at attempt 1).
        - If total attempts < 4 (attempts 1, 2, or 3): Loop back to Step 1 (Recommendation). Forward the failure details and benchmark delta (tuned TPS vs baseline TPS, latency changes, error diagnostics) to `knob_recommender` for remediation.
        - If total attempts >= 4 (attempt 4 failed): STOP the pipeline. Report that maximum retry attempts (1 initial + 3 retries) have been exhausted without achieving a stable, non-regressing staging configuration. Include the final failure details and DO NOT invoke `live_tuner`.
 

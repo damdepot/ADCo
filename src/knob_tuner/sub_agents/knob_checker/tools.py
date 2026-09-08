@@ -180,9 +180,35 @@ def restart_database_staging(tool_context: ToolContext) -> str:
         ok, msg = restart_docker_db(container_name, db_type=cfg.db_type)
         if ok:
             try:
+                import subprocess
                 internal_port = 3306 if "my" in cfg.db_type.lower() else 5432
                 new_port = get_container_host_port(container_name, internal_port)
+                cfg.host = "127.0.0.1"
                 cfg.port = new_port
+                
+                # Check if 127.0.0.1 works
+                conn_works = False
+                try:
+                    conn = get_connection(cfg)
+                    if conn:
+                        conn.close()
+                        conn_works = True
+                except Exception:
+                    pass
+
+                # If 127.0.0.1 doesn't work, try container IP
+                if not conn_works:
+                    ip_proc = subprocess.run(
+                        ["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", container_name],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if ip_proc.returncode == 0:
+                        container_ip = ip_proc.stdout.strip()
+                        if container_ip:
+                            cfg.host = container_ip
+                            cfg.port = internal_port
+
                 tool_context.state["staging_db_config"] = cfg
             except Exception:
                 pass  # Keep previous port if querying fails (e.g. in unit tests)
@@ -697,6 +723,16 @@ def setup_staging_docker(tool_context: ToolContext) -> str:
         ])
         return "\n".join(lines)
     except Exception as e:
+        issue = KnobCheckIssue(
+            knob="staging_docker_environment",
+            severity="high",
+            category="environment_error",
+            description=f"Staging container setup failed before any candidate knobs were applied: {e}",
+            suggestion="Check Docker environment or image availability. Do NOT attempt to reduce knob memory allocations for this error."
+        )
+        issues = tool_context.state.setdefault("staging_issues", [])
+        issues.append(issue)
+        tool_context.state["staging_validated"] = False
         return f"ERROR: Failed to start staging Docker container: {e}"
 
 

@@ -58,6 +58,14 @@ def resolve_docker_image(db_type: str, db_version: str | None = None) -> str:
         if m:
             base_ver = m.group(1)
             tag_suffix = m.group(2) or ""
+            
+            parts = base_ver.split('.')
+            if len(parts) >= 2:
+                major = int(parts[0])
+                minor = int(parts[1])
+                if major >= 10 and minor > 9:
+                    base_ver = str(major)
+
             version_str = f"{base_ver}{tag_suffix}"
         else:
             version_str = cleaned
@@ -367,7 +375,24 @@ def start_staging_db(
 
     if run_proc.returncode != 0:
         err_msg = run_proc.stderr.strip() or run_proc.stdout.strip()
-        raise RuntimeError(f"Failed to start staging DB container '{container_name}': {err_msg}")
+        if "manifest unknown" in err_msg.lower() or "pull" in err_msg.lower() or "not found" in err_msg.lower():
+            fallback_image = "postgres:17" if engine == "postgres" else "mysql:8.4"
+            idx = cmd.index(image)
+            cmd[idx] = fallback_image
+            try:
+                run_proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if run_proc.returncode != 0:
+                    err_msg = run_proc.stderr.strip() or run_proc.stdout.strip()
+                    raise RuntimeError(f"Failed to start staging DB container '{container_name}' even with fallback {fallback_image}: {err_msg}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to execute fallback docker run for '{container_name}': {e}") from e
+        else:
+            raise RuntimeError(f"Failed to start staging DB container '{container_name}': {err_msg}")
 
     register_active_container(container_name)
 
@@ -390,6 +415,20 @@ def start_staging_db(
         restart_target=container_name,
     )
 
+    # Inspect container IP for fallback connection
+    container_ip = None
+    try:
+        ip_proc = subprocess.run(
+            ["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", container_name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if ip_proc.returncode == 0:
+            container_ip = ip_proc.stdout.strip()
+    except Exception:
+        pass
+
     # Readiness polling loop
     start_time = time.time()
     while time.time() - start_time < timeout:
@@ -406,7 +445,23 @@ def start_staging_db(
                     run_safe_query(cfg, "SELECT 1")
                     return container_name, cfg
                 except Exception:
-                    pass
+                    if container_ip:
+                        fallback_cfg = DBConfig(
+                            host=container_ip,
+                            port=internal_port,
+                            user=user,
+                            password=password,
+                            database=database,
+                            db_type=engine,
+                            env="staging",
+                            restart_type="docker",
+                            restart_target=container_name,
+                        )
+                        try:
+                            run_safe_query(fallback_cfg, "SELECT 1")
+                            return container_name, fallback_cfg
+                        except Exception:
+                            pass
         except Exception:
             pass
         time.sleep(1)

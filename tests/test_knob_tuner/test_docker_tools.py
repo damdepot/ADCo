@@ -213,7 +213,7 @@ def test_start_staging_db_postgres_success(tmp_path):
     port_res = MagicMock(returncode=0, stdout="0.0.0.0:54321\n:::54321\n", stderr="")
     exec_res = MagicMock(returncode=0, stdout="127.0.0.1:5432 - accepting connections\n", stderr="")
 
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res]) as mock_run, \
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"?column?": 1}]) as mock_query:
 
         cname, cfg = start_staging_db(
@@ -264,7 +264,7 @@ def test_start_staging_db_postgresql_alias_success():
     port_res = MagicMock(returncode=0, stdout="127.0.0.1:49153\n", stderr="")
     exec_res = MagicMock(returncode=0, stdout="accepting connections\n", stderr="")
 
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res]), \
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]), \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"?column?": 1}]):
 
         cname, cfg = start_staging_db(db_type="postgresql")
@@ -278,7 +278,7 @@ def test_start_staging_db_mysql_success():
     port_res = MagicMock(returncode=0, stdout="127.0.0.1:33060\n", stderr="")
     exec_res = MagicMock(returncode=0, stdout="mysqld is alive\n", stderr="")
 
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res]) as mock_run, \
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
         cname, cfg = start_staging_db(
@@ -349,7 +349,7 @@ def test_start_staging_db_readiness_timeout():
     logs_res = MagicMock(returncode=0, stdout="FATAL: database not ready\n", stderr="")
 
     # Time simulation: simulate timeout expiring quickly
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res, exec_res, exec_res, logs_res]), \
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res, exec_res, exec_res, logs_res]), \
          patch("time.time", side_effect=[100.0, 100.0, 101.0, 102.0, 110.0]), \
          patch("time.sleep"), \
          patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop:
@@ -371,7 +371,7 @@ def test_start_staging_db_readiness_timeout_with_container_logs():
         stderr="sh: /docker-entrypoint-initdb.d/01.sh: Permission denied",
     )
 
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res, logs_res]), \
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res, logs_res]), \
          patch("time.time", side_effect=[100.0, 100.0, 140.0]), \
          patch("time.sleep"), \
          patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop:
@@ -392,7 +392,7 @@ def test_start_staging_db_readiness_timeout_log_fetch_exception():
     port_res = MagicMock(returncode=0, stdout="127.0.0.1:54321\n", stderr="")
     exec_res = MagicMock(returncode=1, stdout="", stderr="connection refused")
 
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res, Exception("docker logs failed")]), \
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res, Exception("docker logs failed")]), \
          patch("time.time", side_effect=[100.0, 100.0, 140.0]), \
          patch("time.sleep"), \
          patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop:
@@ -412,10 +412,10 @@ def test_start_staging_db_query_verification_retry_then_success():
     exec_res1 = MagicMock(returncode=0, stdout="accepting connections", stderr="")
     exec_res2 = MagicMock(returncode=0, stdout="accepting connections", stderr="")
 
-    # First query attempt fails, second succeeds
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res1, exec_res2]), \
+    # First query attempt fails (cfg and fallback_cfg), second succeeds (cfg)
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res1, exec_res2]), \
          patch("time.sleep"), \
-         patch("src.knob_tuner.tools.docker_tools.run_safe_query", side_effect=[Exception("Connection refused"), [{"1": 1}]]):
+         patch("src.knob_tuner.tools.docker_tools.run_safe_query", side_effect=[Exception("Refused"), Exception("Refused"), [{"1": 1}]]):
 
         cname, cfg = start_staging_db(db_type="postgres", timeout=10)
         assert cname.startswith("adco-staging-postgres-")
@@ -470,6 +470,9 @@ def test_resolve_docker_image_postgres_banners():
     banner8 = "PostgreSQL 17.2 (Homebrew) on aarch64-apple-darwin24.2.0"
     assert resolve_docker_image("postgres", banner8) == "postgres:17.2"
 
+    banner9 = "PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit"
+    assert resolve_docker_image("postgres", banner9) == "postgres:17"
+
 
 def test_resolve_docker_image_postgres_custom_tags():
     assert resolve_docker_image("postgres", "postgres:16") == "postgres:16"
@@ -517,7 +520,7 @@ def test_start_staging_db_postgres_with_version():
     port_res = MagicMock(returncode=0, stdout="127.0.0.1:54321\n", stderr="")
     exec_res = MagicMock(returncode=0, stdout="accepting connections\n", stderr="")
 
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res]) as mock_run, \
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
         cname, cfg = start_staging_db(db_type="postgres", db_version="16")
@@ -534,7 +537,7 @@ def test_start_staging_db_postgres_with_banner():
     exec_res = MagicMock(returncode=0, stdout="accepting connections\n", stderr="")
 
     banner = "PostgreSQL 16.3 on x86_64-pc-linux-gnu, compiled by gcc"
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res]) as mock_run, \
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
         cname, cfg = start_staging_db(db_type="postgres", db_version=banner)
@@ -549,7 +552,7 @@ def test_start_staging_db_mysql_with_version():
     port_res = MagicMock(returncode=0, stdout="127.0.0.1:33060\n", stderr="")
     exec_res = MagicMock(returncode=0, stdout="mysqld is alive\n", stderr="")
 
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res]) as mock_run, \
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
         cname, cfg = start_staging_db(db_type="mysql", db_version="8.0")
@@ -565,7 +568,7 @@ def test_start_staging_db_mysql_with_banner():
     exec_res = MagicMock(returncode=0, stdout="mysqld is alive\n", stderr="")
 
     banner = "8.0.35-0ubuntu0.22.04.1"
-    with patch("subprocess.run", side_effect=[run_res, port_res, exec_res]) as mock_run, \
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
         cname, cfg = start_staging_db(db_type="mysql", db_version=banner)
