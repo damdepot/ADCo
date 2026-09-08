@@ -6,15 +6,17 @@ from typing import Any
 from google.adk.tools import ToolContext
 
 from src.knob_tuner.tools.benchmark_tools import run_sysbench_benchmark
-from src.knob_tuner.tools.db_connector import DBConfig, load_db_config, get_connection
+from src.knob_tuner.tools.db_connector import DBConfig, get_connection
 from src.knob_tuner.tools.db_tools import apply_knobs, test_database, verify_active_knobs
 from src.knob_tuner.tools.docker_tools import (
     is_docker_available,
+    recreate_docker_db,
+    restart_docker_db,
+    get_container_host_port,
     start_staging_db,
     stop_staging_db,
 )
 from src.knob_tuner.tools.file_tools import read_json_file
-from src.knob_tuner.tools.docker_tools import restart_docker_db, recreate_docker_db
 from src.knob_tuner.sub_agents.knob_checker.models import (
     BenchmarkResult,
     KnobCheckIssue,
@@ -23,79 +25,6 @@ from src.knob_tuner.sub_agents.knob_checker.models import (
 
 
 _REGRESSION_THRESHOLD_PCT = 5.0  # FAIL only if TPS drops more than this percentage
-
-
-def _get_staging_db_config(tool_context: ToolContext) -> DBConfig | None:
-    """Extract staging database configuration from tool context state."""
-    state = tool_context.state
-
-    # 1. Direct staging_db_config in state
-    if "staging_db_config" in state:
-        cfg = state["staging_db_config"]
-        if hasattr(cfg, "host") and hasattr(cfg, "db_type"):
-            return cfg
-        if isinstance(cfg, dict):
-            return _dict_to_db_config(cfg, default_env="staging")
-
-    # 2. General db_config in state
-    if "db_config" in state:
-        cfg = state["db_config"]
-        if hasattr(cfg, "host") and hasattr(cfg, "db_type"):
-            return cfg
-        if isinstance(cfg, dict):
-            return _dict_to_db_config(cfg, default_env="staging")
-
-    # 3. Load from config file path if specified
-    config_path = state.get("config_path") or state.get("db_config_path")
-    db_type = state.get("db_type") or "postgres"
-    if config_path and os.path.isfile(config_path):
-        try:
-            return load_db_config(config_path, db_type=db_type, db_override=state.get("db_name") or state.get("database") or state.get("dbname"))
-        except Exception:
-            pass
-
-    # 4. Top-level state fields
-    if "db_type" in state and ("database" in state or "dbname" in state or "db_name" in state):
-        db_type = state.get("db_type", "postgres")
-        default_port = 5432 if "post" in db_type.lower() else 3306
-        default_user = "postgres" if "post" in db_type.lower() else "root"
-        return DBConfig(
-            host=state.get("host", "localhost"),
-            port=int(state.get("port", default_port)),
-            user=state.get("user", default_user),
-            password=state.get("password", ""),
-            database=state.get("db_name", state.get("database", state.get("dbname", "testdb"))),
-            db_type=db_type,
-            env=state.get("env", "staging"),
-            restart_type=state.get("restart_type", "docker"),
-            restart_target=state.get("restart_target", ""),
-            restart_cmd=state.get("restart_cmd", ""),
-            remote_host=state.get("remote_host", ""),
-            remote_user=state.get("remote_user", ""),
-        )
-
-    return None
-
-
-def _dict_to_db_config(d: dict[str, Any], default_env: str = "staging") -> DBConfig:
-    """Convert dictionary to DBConfig instance."""
-    db_type = d.get("db_type", "postgres")
-    default_port = 5432 if "post" in db_type.lower() else 3306
-    default_user = "postgres" if "post" in db_type.lower() else "root"
-    return DBConfig(
-        host=d.get("host", "localhost"),
-        port=int(d.get("port", default_port)),
-        user=d.get("user", default_user),
-        password=d.get("password", ""),
-        database=d.get("database", d.get("dbname", "testdb")),
-        db_type=db_type,
-        env=d.get("env", default_env),
-        restart_type=d.get("restart_type", "docker"),
-        restart_target=d.get("restart_target", ""),
-        restart_cmd=d.get("restart_cmd", ""),
-        remote_host=d.get("remote_host", ""),
-        remote_user=d.get("remote_user", ""),
-    )
 
 
 def _load_selected_knobs(tool_context: ToolContext) -> list[dict[str, Any]]:
@@ -179,7 +108,7 @@ def apply_knobs_staging(tool_context: ToolContext) -> str:
     Returns:
         Status summary of applied knobs or error message.
     """
-    cfg = _get_staging_db_config(tool_context)
+    cfg = tool_context.state.get("staging_db_config")
     if not cfg:
         return "ERROR: Staging DBConfig not found in state"
 
@@ -239,7 +168,7 @@ def restart_database_staging(tool_context: ToolContext) -> str:
     Returns:
         Status message indicating success or failure of restart.
     """
-    cfg = _get_staging_db_config(tool_context)
+    cfg = tool_context.state.get("staging_db_config")
     if not cfg:
         return "ERROR: Staging DBConfig not found in state"
 
@@ -250,6 +179,13 @@ def restart_database_staging(tool_context: ToolContext) -> str:
     try:
         ok, msg = restart_docker_db(container_name, db_type=cfg.db_type)
         if ok:
+            try:
+                internal_port = 3306 if "my" in cfg.db_type.lower() else 5432
+                new_port = get_container_host_port(container_name, internal_port)
+                cfg.port = new_port
+                tool_context.state["staging_db_config"] = cfg
+            except Exception:
+                pass  # Keep previous port if querying fails (e.g. in unit tests)
             return f"OK: Staging database restarted successfully ({msg})"
         else:
             return f"ERROR: Staging database restart failed: {msg}"
@@ -266,12 +202,9 @@ def recreate_database_staging(tool_context: ToolContext) -> str:
     Returns:
         Status message indicating success or failure of recreation.
     """
-    cfg = _get_staging_db_config(tool_context)
-    if not cfg:
-        return "ERROR: Staging DBConfig not found in state"
-
     container_name = tool_context.state.get("staging_docker_container")
-    if not container_name:
+    cfg = tool_context.state.get("staging_db_config")
+    if not container_name or not cfg:
         return setup_staging_docker(tool_context)
 
     try:
@@ -349,7 +282,7 @@ def test_database_staging(tool_context: ToolContext) -> str:
     Returns:
         Detailed test report string.
     """
-    cfg = _get_staging_db_config(tool_context)
+    cfg = tool_context.state.get("staging_db_config")
     if not cfg:
         tool_context.state["staging_validated"] = False
         return "ERROR: Staging DBConfig not found in state"
@@ -402,9 +335,9 @@ def test_database_staging(tool_context: ToolContext) -> str:
             lines.append("- No knobs verified.")
 
         if err:
-            lines.append(f"\\n- **Error Details**: {err}")
+            lines.append(f"\n- **Error Details**: {err}")
 
-        return "\\n".join(lines)
+        return "\n".join(lines)
     except Exception as e:
         tool_context.state["staging_validated"] = False
         return f"ERROR: Option A test suite threw an exception: {e}"
@@ -467,7 +400,7 @@ def benchmark_baseline_staging(tool_context: ToolContext) -> str:
                 f"environmental or tool issue rather than a candidate knob failure."
             )
 
-    cfg = _get_staging_db_config(tool_context)
+    cfg = tool_context.state.get("staging_db_config")
     if not cfg:
         return "ERROR: Staging DBConfig not found in state"
 
@@ -550,7 +483,7 @@ def benchmark_tuned_staging(tool_context: ToolContext) -> str:
     Returns:
         Formatted markdown comparison report of baseline vs tuned performance.
     """
-    cfg = _get_staging_db_config(tool_context)
+    cfg = tool_context.state.get("staging_db_config")
     if not cfg:
         tool_context.state["staging_validated"] = False
         return "ERROR: Staging DBConfig not found in state"
@@ -745,17 +678,12 @@ def setup_staging_docker(tool_context: ToolContext) -> str:
     if not db_type:
         db_type = tool_context.state.get("db_type", "postgres")
 
-    cfg_staging = _get_staging_db_config(tool_context)
-    if cfg_staging and getattr(cfg_staging, "database", None):
-        database = cfg_staging.database
-    elif tool_context.state.get("db_name"):
-        database = tool_context.state.get("db_name")
-    elif tool_context.state.get("database"):
-        database = tool_context.state.get("database")
-    elif tool_context.state.get("dbname"):
-        database = tool_context.state.get("dbname")
-    else:
-        database = "testdb"
+    database = (
+        tool_context.state.get("db_name")
+        or tool_context.state.get("database")
+        or tool_context.state.get("dbname")
+        or "testdb"
+    )
 
     # Locate ./db/init/<db_type> relative to repo root if it exists
     canonical_type = "postgres" if "post" in db_type.lower() else ("mysql" if "my" in db_type.lower() else db_type)
@@ -817,6 +745,7 @@ def cleanup_staging_docker(tool_context: ToolContext) -> str:
 
     ok, msg = stop_staging_db(container_name)
     tool_context.state["staging_docker_container"] = None
+    tool_context.state["staging_db_config"] = None
 
     if ok:
         return f"OK: Staging Docker container '{container_name}' cleaned up successfully ({msg})."

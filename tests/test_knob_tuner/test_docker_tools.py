@@ -12,6 +12,7 @@ from src.knob_tuner.tools.docker_tools import (
     resolve_docker_image,
     start_staging_db,
     stop_staging_db,
+    get_container_host_port,
 )
 
 
@@ -627,3 +628,37 @@ def test_recreate_docker_db_failure():
         assert ok is False
         assert "Failed to start" in err
         assert cfg is None
+
+# =====================================================================
+# get_container_host_port tests
+# =====================================================================
+
+def test_get_container_host_port_success():
+    mock_res = MagicMock(returncode=0, stdout="0.0.0.0:54321\n:::54321\n", stderr="")
+    with patch("subprocess.run", return_value=mock_res) as mock_run:
+        port = get_container_host_port("my-container", 5432)
+        assert port == 54321
+        mock_run.assert_called_once_with(
+            ["docker", "port", "my-container", "5432"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+def test_get_container_host_port_failure():
+    mock_res = MagicMock(returncode=1, stdout="", stderr="Error: No such container: my-container")
+    with patch("subprocess.run", return_value=mock_res):
+        with pytest.raises(RuntimeError, match="Failed to get port mapping for container 'my-container'"):
+            get_container_host_port("my-container", 5432)
+
+def test_get_container_host_port_malformed():
+    mock_res = MagicMock(returncode=0, stdout="invalid_output\n", stderr="")
+    with patch("subprocess.run", return_value=mock_res):
+        with pytest.raises(RuntimeError, match="Failed to parse mapped host port from docker port output: 'invalid_output'"):
+            get_container_host_port("my-container", 5432)
+
+def test_get_container_host_port_exception():
+    with patch("subprocess.run", side_effect=Exception("Docker daemon died")):
+        with pytest.raises(Exception, match="Docker daemon died"):
+            get_container_host_port("my-container", 5432)
+

@@ -128,6 +128,46 @@ def is_docker_available() -> tuple[bool, str]:
         return False, f"Unexpected error checking Docker availability: {e}"
 
 
+def get_container_host_port(container_name: str, internal_port: int = 5432, timeout: int = 15) -> int:
+    """Get the mapped host port for a container's internal port.
+
+    Args:
+        container_name: The Docker container name or ID.
+        internal_port: The internal container port to resolve.
+        timeout: Maximum seconds to wait for docker port command.
+
+    Returns:
+        The mapped host port.
+
+    Raises:
+        RuntimeError: If port resolution fails or output is malformed.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "port", container_name, str(internal_port)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to get port mapping for container '{container_name}': {e}") from e
+
+    if proc.returncode != 0:
+        err_msg = proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError(f"Failed to get port mapping for container '{container_name}': {err_msg}")
+
+    for line in proc.stdout.strip().splitlines():
+        line = line.strip()
+        if ":" in line:
+            port_str = line.rsplit(":", 1)[-1]
+            if port_str.isdigit():
+                return int(port_str)
+
+    raise RuntimeError(
+        f"Failed to parse mapped host port from docker port output: '{proc.stdout.strip()}'"
+    )
+
+
 def stop_staging_db(container_name: str, timeout: int = 15) -> tuple[bool, str]:
     """Stop and remove a staging database Docker container.
 
@@ -340,39 +380,10 @@ def start_staging_db(
 
     # Inspect assigned host port
     try:
-        port_proc = subprocess.run(
-            ["docker", "port", container_name, str(internal_port)],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        host_port = get_container_host_port(container_name, internal_port, timeout=15)
     except Exception as e:
         stop_staging_db(container_name)
-        raise RuntimeError(
-            f"Failed to get port mapping for container '{container_name}': {e}"
-        ) from e
-
-    if port_proc.returncode != 0:
-        stop_staging_db(container_name)
-        err_msg = port_proc.stderr.strip() or port_proc.stdout.strip()
-        raise RuntimeError(
-            f"Failed to get port mapping for container '{container_name}': {err_msg}"
-        )
-
-    host_port = None
-    for line in port_proc.stdout.strip().splitlines():
-        line = line.strip()
-        if ":" in line:
-            port_str = line.rsplit(":", 1)[-1]
-            if port_str.isdigit():
-                host_port = int(port_str)
-                break
-
-    if host_port is None:
-        stop_staging_db(container_name)
-        raise RuntimeError(
-            f"Failed to parse mapped host port from docker port output: '{port_proc.stdout.strip()}'"
-        )
+        raise RuntimeError(str(e)) from e
 
     cfg = DBConfig(
         host="127.0.0.1",

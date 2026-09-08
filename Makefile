@@ -10,6 +10,7 @@ knob-tune:
 	uv run python -m src.knob_tuner $(DIR) \
 		--model=gemini-3.5-flash-lite \
 		--db-type=$(DB_TYPE) \
+		--db-name=$(DB_NAME) \
 		--cpu-cores=2 \
 		--memory=2 \
 		--verbose

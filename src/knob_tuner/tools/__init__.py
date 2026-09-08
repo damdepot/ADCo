@@ -29,6 +29,7 @@ from .docker_tools import (
     is_docker_available,
     resolve_docker_image,
     start_staging_db,
+    get_container_host_port,
     stop_staging_db,
     restart_docker_db,
     recreate_docker_db,
@@ -54,6 +55,7 @@ __all__ = [
     "is_docker_available",
     "resolve_docker_image",
     "start_staging_db",
+    "get_container_host_port",
     "stop_staging_db",
     "cleanup_orphan_containers",
 ]
