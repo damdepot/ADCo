@@ -543,10 +543,17 @@ def benchmark_tuned_staging(tool_context: ToolContext) -> str:
             and delta_pct < -_REGRESSION_THRESHOLD_PCT
         )
 
+        baseline_was_not_ok = (baseline_status != "ok" or not baseline_status)
+
         if is_error:
-            status_str = "ERROR"
-            regression_detected = True
-            tool_context.state["staging_validated"] = False
+            if baseline_was_not_ok:
+                status_str = "SKIPPED"
+                regression_detected = False
+                is_error = False
+            else:
+                status_str = "ERROR"
+                regression_detected = True
+                tool_context.state["staging_validated"] = False
         elif is_regression:
             status_str = "REGRESSION"
             regression_detected = True

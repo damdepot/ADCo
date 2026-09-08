@@ -105,6 +105,17 @@ def test_check_staging_validation_passed():
     assert "PASSED" in result
 
 
+def test_check_staging_validation_passed_via_knob_checker_output():
+    tc = MockToolContext({
+        "staging_validated": False,
+        "knob_checker_output": {"status": "PASS"}
+    })
+    result = check_staging_validation(tc)
+    assert "VALIDATED" in result
+    assert "PASSED" in result
+    assert tc.state["staging_validated"] is True
+
+
 def test_check_staging_validation_blocked_when_false():
     tc = MockToolContext({"staging_validated": False})
     result = check_staging_validation(tc)
@@ -166,6 +177,34 @@ def test_apply_knobs_production_success_splits_dynamic_and_static(mock_apply, mo
     assert "work_mem" in result
     assert tc.state["prod_restart_required_knobs"][0]["name"] == "shared_buffers"
     assert len(tc.state["prod_applied_knobs"]) == 2
+    mock_apply.assert_called_once()
+
+
+@patch("src.knob_tuner.sub_agents.live_tuner.tools.verify_active_knobs")
+@patch("src.knob_tuner.sub_agents.live_tuner.tools.apply_knobs")
+def test_apply_knobs_production_success_via_knob_checker_output(mock_apply, mock_verify, mock_db_config_pg):
+    mock_apply.return_value = [
+        {"knob": "work_mem", "value": "32MB", "status": "applied", "error": None}
+    ]
+    mock_verify.return_value = {
+        "status": "ok",
+        "all_verified": True,
+        "knobs": [
+            {"knob": "work_mem", "expected_value": "32MB", "actual_value": "32MB", "status": "VERIFIED"}
+        ],
+    }
+    tc = MockToolContext({
+        "staging_validated": False,
+        "knob_checker_output": {"status": "PASS"},
+        "prod_db_config": mock_db_config_pg,
+        "selected_knobs": [{"knob": "work_mem", "recommended_value": "32MB", "restart_required": False}],
+    })
+
+    result = apply_knobs_production(tc)
+
+    assert "Production Live Tuning Report" in result
+    assert "**Knobs Processed**: 1/1" in result
+    assert tc.state["staging_validated"] is True
     mock_apply.assert_called_once()
 
 

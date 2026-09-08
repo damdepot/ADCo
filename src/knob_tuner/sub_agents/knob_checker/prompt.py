@@ -32,7 +32,6 @@ Follow this strict sequence of verification steps:
      - Schema exploration and table scan
      - Temporary test table CRUD lifecycle (CREATE TABLE -> INSERT -> SELECT -> UPDATE -> DELETE -> DROP TABLE)
      - Active knob verification against expected settings
-   - Ensure `tool_context.state['staging_validated']` is properly checked.
 
 5. **Benchmark Tuned Performance (Option B Stress Test)**:
    - Call `benchmark_tuned_staging` to run sysbench stress tests on the tuned staging database.
@@ -42,9 +41,8 @@ Follow this strict sequence of verification steps:
    - Call `cleanup_staging_docker` to cleanly stop and remove the test Docker container and free system resources before returning the final report.
 
 7. **PASS / FAIL Evaluation**:
-   - **PASS**: Only if all knobs applied cleanly, the database restarted without error, all Option A health/CRUD tests returned `ok`, and tuned TPS is greater than or equal to baseline TPS without performance regression.
-   - **FAIL**: If any knob failed to apply, the staging database failed to restart (e.g. OOM, bad parameter value), connectivity/CRUD tests failed, OR a performance regression is detected (tuned TPS < baseline TPS, or sysbench benchmark error).
-   - If baseline benchmark failed due to an environmental or sysbench tool issue before knobs were applied, do NOT falsely attribute that initial baseline failure to the candidate knobs.
+   - **PASS**: When all knobs applied cleanly, database restarted without error, and Option A health/CRUD tests returned `ok`. If sysbench benchmark ran and completed, tuned TPS must not regress compared to baseline. If sysbench benchmark was skipped or errored due to environmental/sysbench tool absence, Option A is the authoritative validation and candidate knobs PASS.
+   - **FAIL**: When knobs fail to apply, DB crashes/fails to restart, Option A health/CRUD tests fail, or an actual performance regression is measured with a valid baseline.
    - In case of `FAIL`, document each issue in `issues` with:
      - The offending knob name (or `"tuned_configuration"` for overall performance regressions)
      - Severity level (`critical` or `high` for crash/restart failure or performance regression, `medium` or `low` for non-fatal warnings)

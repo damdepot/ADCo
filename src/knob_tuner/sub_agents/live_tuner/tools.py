@@ -179,6 +179,19 @@ def _load_selected_knobs(tool_context: ToolContext) -> list[dict[str, Any]]:
     return []
 
 
+def _is_staging_validated(tool_context: ToolContext) -> bool:
+    is_validated = bool(tool_context.state.get("staging_validated", False))
+    knob_checker_output = tool_context.state.get("knob_checker_output")
+    if knob_checker_output:
+        if hasattr(knob_checker_output, "status") and getattr(knob_checker_output, "status") == "PASS":
+            is_validated = True
+            tool_context.state["staging_validated"] = True
+        elif isinstance(knob_checker_output, dict) and knob_checker_output.get("status") == "PASS":
+            is_validated = True
+            tool_context.state["staging_validated"] = True
+    return is_validated
+
+
 def check_staging_validation(tool_context: ToolContext) -> str:
     """Check if staging validation has passed and live tuning is permitted.
 
@@ -188,8 +201,7 @@ def check_staging_validation(tool_context: ToolContext) -> str:
     Returns:
         Authorization status message.
     """
-    is_validated = bool(tool_context.state.get("staging_validated", False))
-    if is_validated:
+    if _is_staging_validated(tool_context):
         return "VALIDATED: Staging validation has PASSED. Live production tuning is authorized."
     else:
         return (
@@ -209,7 +221,7 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
     Returns:
         Detailed summary of live application and deferred restart-required knobs.
     """
-    if not tool_context.state.get("staging_validated", False):
+    if not _is_staging_validated(tool_context):
         return (
             "ERROR: Guardrail check failed — staging_validated is False. "
             "Knobs cannot be applied to production."

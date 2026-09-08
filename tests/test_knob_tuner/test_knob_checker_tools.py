@@ -497,6 +497,27 @@ def test_benchmark_tuned_staging_regression(mock_run_bench, mock_db_config_pg):
     assert any(i.category == "performance_regression" for i in issues)
 
 
+@patch("src.knob_tuner.sub_agents.knob_checker.tools.run_sysbench_benchmark")
+def test_benchmark_tuned_staging_skipped_due_to_baseline_failure(mock_run_bench, mock_db_config_pg):
+    baseline_result = {"status": "error", "error": "sysbench not installed", "details": {}}
+    mock_run_bench.return_value = {
+        "status": "error",
+        "error": "sysbench not installed"
+    }
+    tc = MockToolContext({
+        "staging_db_config": mock_db_config_pg,
+        "staging_baseline_benchmark": baseline_result,
+        "staging_validated": True,
+    })
+
+    result = benchmark_tuned_staging(tc)
+    assert "Result: **SKIPPED**" in result
+    assert tc.state["staging_benchmark_results"].status == "SKIPPED"
+    assert tc.state["staging_benchmark_results"].regression_detected is False
+    # Verify staging_validated was NOT set to False
+    assert tc.state["staging_validated"] is True
+
+
 def test_benchmark_tuned_staging_missing_config():
     tc = MockToolContext({})
     result = benchmark_tuned_staging(tc)
