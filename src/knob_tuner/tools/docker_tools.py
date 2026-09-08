@@ -1,6 +1,5 @@
 """Docker management tools for knob_tuner staging databases."""
 
-import os
 import re
 import subprocess
 import time
@@ -255,7 +254,6 @@ def start_staging_db(
     cpus: float = 2.0,
     memory: str = "2g",
     database: str = "testdb",
-    init_dir: str | None = None,
     timeout: int = 60,
 ) -> tuple[str, DBConfig]:
     """Start an ephemeral Docker container for staging database benchmarking.
@@ -266,7 +264,6 @@ def start_staging_db(
         cpus: CPU limit (e.g. 2.0).
         memory: Memory limit (e.g. '2g').
         database: Database name to create and initialize.
-        init_dir: Optional directory with SQL initialization scripts.
         timeout: Maximum seconds to wait for database readiness.
 
     Returns:
@@ -354,10 +351,6 @@ def start_staging_db(
         f"127.0.0.1::{internal_port}",
     ]
     cmd.extend(env_vars)
-
-    if init_dir and os.path.exists(init_dir):
-        abs_init_dir = os.path.abspath(init_dir)
-        cmd.extend(["-v", f"{abs_init_dir}:/docker-entrypoint-initdb.d:ro"])
 
     cmd.append(image)
     cmd.extend(extra_args)
@@ -535,7 +528,6 @@ def recreate_docker_db(
     cpus: float = 2.0,
     memory: str = "2g",
     timeout: int = 60,
-    init_dir: str | None = None,
 ) -> tuple[bool, str, object]:
     """Stop, remove, and recreate a staging Docker container, returning the new config.
 
@@ -551,7 +543,6 @@ def recreate_docker_db(
         cpus: CPU limit for the new container.
         memory: Memory limit for the new container (e.g. '2g').
         timeout: Maximum seconds to wait for the new container to become ready.
-        init_dir: Optional path to an initialization directory.
 
     Returns:
         Tuple of (success: bool, new_container_name_or_error: str, new_cfg_or_None).
@@ -566,7 +557,6 @@ def recreate_docker_db(
             cpus=cpus,
             memory=memory,
             timeout=timeout,
-            init_dir=init_dir,
         )
         return True, new_container_name, new_cfg
     except Exception as e:

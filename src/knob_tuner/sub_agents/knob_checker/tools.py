@@ -226,24 +226,11 @@ def recreate_database_staging(tool_context: ToolContext) -> str:
         db_type = cfg.db_type
         database = cfg.database
 
-        canonical_type = "postgres" if "post" in db_type.lower() else ("mysql" if "my" in db_type.lower() else db_type)
-        init_dir = None
-        for cand in [
-            f"./db/init/{canonical_type}",
-            f"./db/init/{db_type}",
-            os.path.join(os.getcwd(), "db", "init", canonical_type),
-            os.path.join(os.getcwd(), "db", "init", db_type),
-        ]:
-            if os.path.isdir(cand):
-                init_dir = cand
-                break
-
         ok, result, new_cfg = recreate_docker_db(
             container_name=container_name,
             db_type=db_type,
             db_version=db_version,
             database=database,
-            init_dir=init_dir,
         )
         if ok:
             tool_context.state["staging_docker_container"] = result
@@ -685,25 +672,11 @@ def setup_staging_docker(tool_context: ToolContext) -> str:
         or "testdb"
     )
 
-    # Locate ./db/init/<db_type> relative to repo root if it exists
-    canonical_type = "postgres" if "post" in db_type.lower() else ("mysql" if "my" in db_type.lower() else db_type)
-    init_dir = None
-    for cand in [
-        f"./db/init/{canonical_type}",
-        f"./db/init/{db_type}",
-        os.path.join(os.getcwd(), "db", "init", canonical_type),
-        os.path.join(os.getcwd(), "db", "init", db_type),
-    ]:
-        if os.path.isdir(cand):
-            init_dir = cand
-            break
-
     try:
         container_name, cfg = start_staging_db(
             db_type=db_type,
             db_version=db_version,
             database=database,
-            init_dir=init_dir,
         )
         tool_context.state["staging_db_config"] = cfg
         tool_context.state["staging_docker_container"] = container_name

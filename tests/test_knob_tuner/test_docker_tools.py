@@ -209,9 +209,6 @@ def test_start_staging_db_invalid_db_type():
 
 
 def test_start_staging_db_postgres_success(tmp_path):
-    init_sql_dir = tmp_path / "initdb"
-    init_sql_dir.mkdir()
-
     run_res = MagicMock(returncode=0, stdout="container_id_123\n", stderr="")
     port_res = MagicMock(returncode=0, stdout="0.0.0.0:54321\n:::54321\n", stderr="")
     exec_res = MagicMock(returncode=0, stdout="127.0.0.1:5432 - accepting connections\n", stderr="")
@@ -224,7 +221,6 @@ def test_start_staging_db_postgres_success(tmp_path):
             cpus=2.0,
             memory="2g",
             database="bench_pg",
-            init_dir=str(init_sql_dir),
             timeout=30,
         )
 
@@ -256,8 +252,7 @@ def test_start_staging_db_postgres_success(tmp_path):
         assert "POSTGRES_USER=postgres" in run_call_args
         assert "POSTGRES_PASSWORD=postgres" in run_call_args
         assert "POSTGRES_DB=bench_pg" in run_call_args
-        assert "-v" in run_call_args
-        assert f"{os.path.abspath(str(init_sql_dir))}:/docker-entrypoint-initdb.d:ro" in run_call_args
+        assert "-v" not in run_call_args
         assert "postgres:17" in run_call_args
 
         # Verify safe query was executed
