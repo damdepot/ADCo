@@ -62,7 +62,7 @@ def load_db_config(
     Args:
         config_path: Path to the INI config file.
         db_type: Database engine type ('postgres', 'postgresql', 'mysql', etc.).
-        db_override: Optional database name override.
+        db_override: Required database name override.
 
     Returns:
         DBConfig dataclass instance.
@@ -106,7 +106,7 @@ def load_db_config(
         raise KeyError(f"Section [{db_type}] not found in {config_path}")
 
     sec = config[matched_section]
-    required_keys = ["host", "port", "user", "password", "database"]
+    required_keys = ["host", "port", "user", "password"]
     for key in required_keys:
         if key not in sec:
             raise KeyError(
@@ -120,7 +120,9 @@ def load_db_config(
             f"Invalid port value '{sec['port']}' in [{matched_section}]: {e}"
         ) from e
 
-    database = db_override if db_override else sec["database"]
+    if not db_override or not str(db_override).strip():
+        raise KeyError("Missing required database name. Database name must be provided via --db-name / db_override.")
+    database = str(db_override).strip()
     env = sec.get("env", "production")
 
     return DBConfig(

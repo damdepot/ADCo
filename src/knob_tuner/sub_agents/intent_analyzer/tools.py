@@ -32,7 +32,7 @@ def _get_db_config(tool_context: ToolContext) -> DBConfig | None:
                 port=int(cfg.get("port", default_port)),
                 user=cfg.get("user", default_user),
                 password=cfg.get("password", ""),
-                database=cfg.get("database", cfg.get("dbname", "postgres")),
+                database=cfg.get("db_name", cfg.get("database", cfg.get("dbname", "postgres"))),
                 db_type=db_type,
                 env=cfg.get("env", "staging"),
                 restart_type=cfg.get("restart_type", "docker"),
@@ -41,7 +41,7 @@ def _get_db_config(tool_context: ToolContext) -> DBConfig | None:
                 remote_host=cfg.get("remote_host", ""),
                 remote_user=cfg.get("remote_user", ""),
             )
-    if "db_type" in state and ("database" in state or "dbname" in state):
+    if "db_type" in state and ("database" in state or "dbname" in state or "db_name" in state):
         db_type = state.get("db_type", "postgres")
         default_port = 5432 if "post" in db_type.lower() else 3306
         default_user = "postgres" if "post" in db_type.lower() else "root"
@@ -50,7 +50,7 @@ def _get_db_config(tool_context: ToolContext) -> DBConfig | None:
             port=int(state.get("port", default_port)),
             user=state.get("user", default_user),
             password=state.get("password", ""),
-            database=state.get("database", state.get("dbname", "postgres")),
+            database=state.get("db_name", state.get("database", state.get("dbname", "postgres"))),
             db_type=db_type,
             env=state.get("env", "staging"),
         )

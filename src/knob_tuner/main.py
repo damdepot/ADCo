@@ -168,6 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Database memory limit in GB (default: auto)",
     )
     parser.add_argument(
+        "--db-name",
+        required=True,
+        help="Database name to target (required)",
+    )
+    parser.add_argument(
         "--db-config",
         default="db.config",
         help="Path to database configuration INI file (default: db.config)",
@@ -227,12 +232,16 @@ def build_initial_state(
     knob_path: str,
     output_path: str,
     dry_run: bool,
+    db_name: str,
 ) -> dict[str, Any]:
     """Construct initial state dictionary for the knob tuner session."""
     env = "production" if production_db else "staging"
     state: dict[str, Any] = {
         "target": target,
         "db_type": db_type,
+        "db_name": db_name,
+        "database": db_name,
+        "dbname": db_name,
         "cpu_cores": cpu_cores,
         "memory_gb": memory_gb,
         "memory": memory_gb,
@@ -249,7 +258,7 @@ def build_initial_state(
 
     if os.path.isfile(db_config_path):
         try:
-            cfg = load_db_config(db_config_path, db_type=db_type)
+            cfg = load_db_config(db_config_path, db_type=db_type, db_override=db_name)
             state["db_config"] = cfg
             state["database"] = cfg.database
             state["dbname"] = cfg.database
@@ -304,6 +313,7 @@ async def run_pipeline(
     dry_run: bool = False,
     verbose: bool = False,
     cleanup_orphans: bool = True,
+    db_name: str = "",
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using Google ADK Runner and session service."""
     register_cleanup_handlers()
@@ -348,6 +358,7 @@ async def run_pipeline(
         knob_path=knob_path_abs,
         output_path=output_path_abs,
         dry_run=dry_run,
+        db_name=db_name,
     )
 
     await session_service.create_session(
@@ -365,6 +376,7 @@ async def run_pipeline(
         f"Tune database configuration knobs for the codebase at: {target_abs}\n\n"
         f"Configuration details:\n"
         f"- Database Type: {db_type}\n"
+        f"- Database Name: {db_name}\n"
         f"- CPU Cores: {cpu_cores}\n"
         f"- Memory: {memory_gb} GB\n"
         f"- Target Environment: {env_name}\n"
@@ -453,6 +465,7 @@ def main() -> None:
                 dry_run=args.dry_run,
                 verbose=args.verbose,
                 cleanup_orphans=getattr(args, "cleanup_orphans", True),
+                db_name=args.db_name,
             )
         )
     except Exception as exc:
@@ -469,6 +482,7 @@ def main() -> None:
     print(f"Target:             {target}")
     print(f"Model:              {args.model}")
     print(f"Database Type:      {args.db_type}")
+    print(f"Database Name:      {args.db_name}")
     print(f"Staging Validation: {checker_status}")
     print(f"Live Tuning Status: {live_status}")
     print(f"Output File:        {args.output_path}")

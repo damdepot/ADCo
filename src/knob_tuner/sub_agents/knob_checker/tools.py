@@ -50,12 +50,12 @@ def _get_staging_db_config(tool_context: ToolContext) -> DBConfig | None:
     db_type = state.get("db_type") or "postgres"
     if config_path and os.path.isfile(config_path):
         try:
-            return load_db_config(config_path, db_type=db_type)
+            return load_db_config(config_path, db_type=db_type, db_override=state.get("db_name") or state.get("database") or state.get("dbname"))
         except Exception:
             pass
 
     # 4. Top-level state fields
-    if "db_type" in state and ("database" in state or "dbname" in state):
+    if "db_type" in state and ("database" in state or "dbname" in state or "db_name" in state):
         db_type = state.get("db_type", "postgres")
         default_port = 5432 if "post" in db_type.lower() else 3306
         default_user = "postgres" if "post" in db_type.lower() else "root"
@@ -64,7 +64,7 @@ def _get_staging_db_config(tool_context: ToolContext) -> DBConfig | None:
             port=int(state.get("port", default_port)),
             user=state.get("user", default_user),
             password=state.get("password", ""),
-            database=state.get("database", state.get("dbname", "testdb")),
+            database=state.get("db_name", state.get("database", state.get("dbname", "testdb"))),
             db_type=db_type,
             env=state.get("env", "staging"),
             restart_type=state.get("restart_type", "docker"),
@@ -748,6 +748,8 @@ def setup_staging_docker(tool_context: ToolContext) -> str:
     cfg_staging = _get_staging_db_config(tool_context)
     if cfg_staging and getattr(cfg_staging, "database", None):
         database = cfg_staging.database
+    elif tool_context.state.get("db_name"):
+        database = tool_context.state.get("db_name")
     elif tool_context.state.get("database"):
         database = tool_context.state.get("database")
     elif tool_context.state.get("dbname"):
