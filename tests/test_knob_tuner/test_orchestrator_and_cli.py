@@ -20,13 +20,23 @@ from src.knob_tuner.main import (
     _maybe_parse,
     _parse_cpu_cores,
     _parse_memory,
+    _process_cleanup,
+    _signal_handler,
     _write_output_result,
     build_initial_state,
     build_parser,
     main,
+    register_cleanup_handlers,
     run_pipeline,
 )
 from src.knob_tuner.tools.db_connector import DBConfig
+from src.knob_tuner.tools.docker_tools import (
+    ACTIVE_CONTAINERS,
+    cleanup_orphan_containers,
+    register_active_container,
+    stop_staging_db,
+    unregister_active_container,
+)
 
 
 # ===========================================================================
@@ -82,7 +92,11 @@ def test_orchestrator_prompt_contains_rules_and_loop_bounds():
 
 def test_cli_parser_defaults():
     parser = build_parser()
-    args = parser.parse_args(["/tmp/target_app"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["/tmp/target_app"])
+
+    args = parser.parse_args(["/tmp/target_app", "--db-name", "test_db"])
+    assert args.db_name == "test_db"
     assert args.target == "/tmp/target_app"
     assert args.model == "gemini-3.5-flash-lite"
     assert args.db_type == "postgres"
@@ -95,14 +109,17 @@ def test_cli_parser_defaults():
     assert args.output_path == "out/knob_tuner/result.json"
     assert args.dry_run is False
     assert args.verbose is False
+    assert args.cleanup_orphans is True
 
 
 def test_cli_parser_custom_args():
     parser = build_parser()
     args = parser.parse_args([
         "/my/codebase",
+        "--db-name", "custom_db",
         "--model", "gemini-1.5-flash",
         "--db-type", "mysql",
+        "--db-name", "custom_db",
         "--cpu-cores", "8",
         "--memory", "16.0",
         "--db-config", "custom_db.config",
@@ -112,10 +129,13 @@ def test_cli_parser_custom_args():
         "--output-path", "/custom/res.dat",
         "--dry-run",
         "-v",
+        "--no-cleanup-orphans",
     ])
     assert args.target == "/my/codebase"
+    assert args.db_name == "custom_db"
     assert args.model == "gemini-1.5-flash"
     assert args.db_type == "mysql"
+    assert args.db_name == "custom_db"
     assert args.cpu_cores == "8"
     assert args.memory == "16.0"
     assert args.db_config == "custom_db.config"
@@ -125,6 +145,7 @@ def test_cli_parser_custom_args():
     assert args.output_path == "/custom/res.dat"
     assert args.dry_run is True
     assert args.verbose is True
+    assert args.cleanup_orphans is False
 
 
 def test_parse_cpu_cores():
@@ -163,6 +184,7 @@ def test_build_initial_state_without_config_file():
     state = build_initial_state(
         target="/tmp/my_app",
         db_type="postgres",
+        db_name="custom_db",
         cpu_cores=4,
         memory_gb=8.0,
         db_config_path="/tmp/non_existent.config",
@@ -174,6 +196,7 @@ def test_build_initial_state_without_config_file():
     )
     assert state["target"] == "/tmp/my_app"
     assert state["db_type"] == "postgres"
+    assert state["database"] == "custom_db"
     assert state["cpu_cores"] == 4
     assert state["memory_gb"] == 8.0
     assert state["production_db"] is False
@@ -187,6 +210,7 @@ def test_build_initial_state_with_valid_config(sample_ini_path):
     state = build_initial_state(
         target="/tmp/my_app",
         db_type="postgres",
+        db_name="custom_db",
         cpu_cores=2,
         memory_gb=4.0,
         db_config_path=str(sample_ini_path),
@@ -201,13 +225,15 @@ def test_build_initial_state_with_valid_config(sample_ini_path):
     assert isinstance(stg_cfg, DBConfig)
     assert stg_cfg.host == "10.0.0.2"
     assert stg_cfg.port == 5432
-    assert stg_cfg.database == "stg_db"
+    assert stg_cfg.database == "custom_db"
+    assert state["database"] == "custom_db"
 
 
 def test_build_initial_state_production_env(sample_ini_path):
     state = build_initial_state(
         target="/tmp/my_app",
         db_type="mysql",
+        db_name="custom_db",
         cpu_cores=4,
         memory_gb=16.0,
         db_config_path=str(sample_ini_path),
@@ -223,7 +249,95 @@ def test_build_initial_state_production_env(sample_ini_path):
     prod_cfg = state["production_db_config"]
     assert prod_cfg.host == "127.0.0.1"
     assert prod_cfg.port == 3306
-    assert prod_cfg.database == "prod_db"
+    assert prod_cfg.database == "custom_db"
+    assert state["database"] == "custom_db"
+
+
+def test_build_initial_state_strict_db_config_path_no_autodiscovery(tmp_path: Path):
+    target_dir = tmp_path / "my_target_app"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_cfg = target_dir / "db.config"
+    target_cfg.write_text(
+        """[postgres]
+host = 192.168.1.50
+port = 5432
+user = testuser
+password = testpass
+database = app_local_db
+restart_type = docker
+restart_target = stg_pg_app
+""",
+        encoding="utf-8",
+    )
+
+    custom_cfg = tmp_path / "custom.config"
+    custom_cfg.write_text(
+        """[postgres]
+host = 10.0.0.99
+port = 5432
+user = customuser
+password = custompass
+database = custom_db
+restart_type = docker
+restart_target = stg_custom_app
+""",
+        encoding="utf-8",
+    )
+
+    # 1. Providing explicit custom_cfg does not bind target/db.config
+    state_custom = build_initial_state(
+        target=str(target_dir),
+        db_name="custom_db",
+        db_type="postgres",
+        cpu_cores=4,
+        memory_gb=8.0,
+        db_config_path=str(custom_cfg),
+        production_db=False,
+        log_file=str(tmp_path / "log.log"),
+        knob_path=str(tmp_path / "knobs"),
+        output_path=str(tmp_path / "out.json"),
+        dry_run=False,
+    )
+    assert state_custom["db_config_path"] == str(custom_cfg)
+    assert state_custom["database"] == "custom_db"
+    assert state_custom["staging_db_config"].host == "10.0.0.99"
+
+    # 2. Providing non-existent config does NOT auto-bind target/db.config
+    absent_cfg = str(tmp_path / "absent.config")
+    state_absent = build_initial_state(
+        target=str(target_dir),
+        db_name="custom_db",
+        db_type="postgres",
+        cpu_cores=4,
+        memory_gb=8.0,
+        db_config_path=absent_cfg,
+        production_db=False,
+        log_file=str(tmp_path / "log.log"),
+        knob_path=str(tmp_path / "knobs"),
+        output_path=str(tmp_path / "out.json"),
+        dry_run=False,
+    )
+    assert state_absent["db_config_path"] == absent_cfg
+    assert state_absent["config_path"] == absent_cfg
+    assert "staging_db_config" not in state_absent
+    assert state_absent["database"] == "custom_db"
+
+    # 3. Default "db.config" remains "db.config" and is not rewritten to target/db.config
+    state_default = build_initial_state(
+        target=str(target_dir),
+        db_name="custom_db",
+        db_type="postgres",
+        cpu_cores=4,
+        memory_gb=8.0,
+        db_config_path="db.config",
+        production_db=False,
+        log_file=str(tmp_path / "log.log"),
+        knob_path=str(tmp_path / "knobs"),
+        output_path=str(tmp_path / "out.json"),
+        dry_run=False,
+    )
+    assert state_default["db_config_path"] == "db.config"
+    assert state_default["config_path"] == "db.config"
 
 
 # ===========================================================================
@@ -297,6 +411,7 @@ def test_run_pipeline_mocked(tmp_path: Path):
         res = asyncio.run(
             run_pipeline(
                 target=str(target_dir),
+                db_name="custom_db",
                 model="gemini-3.5-flash-lite",
                 db_type="postgres",
                 cpu_cores_arg=2,
@@ -318,7 +433,7 @@ def test_run_pipeline_mocked(tmp_path: Path):
 
 
 def test_main_cli_invalid_target(capsys):
-    with patch.object(sys, "argv", ["knob_tuner", "/path/that/does/not/exist/at/all"]):
+    with patch.object(sys, "argv", ["knob_tuner", "/path/that/does/not/exist/at/all", "--db-name", "custom_db"]):
         with pytest.raises(SystemExit) as exc_info:
             main()
         assert exc_info.value.code == 2
@@ -340,7 +455,7 @@ def test_main_cli_success(tmp_path: Path):
 
     with patch("src.knob_tuner.main.run_pipeline", new_callable=AsyncMock) as mock_run:
         mock_run.return_value = mock_state
-        with patch.object(sys, "argv", ["knob_tuner", str(target_dir)]):
+        with patch.object(sys, "argv", ["knob_tuner", str(target_dir), "--db-name", "custom_db"]):
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 0
@@ -369,7 +484,7 @@ def test_main_cli_failure(tmp_path: Path):
 
     with patch("src.knob_tuner.main.run_pipeline", new_callable=AsyncMock) as mock_run:
         mock_run.return_value = mock_state
-        with patch.object(sys, "argv", ["knob_tuner", str(target_dir)]):
+        with patch.object(sys, "argv", ["knob_tuner", str(target_dir), "--db-name", "custom_db"]):
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 1
@@ -380,10 +495,192 @@ def test_main_cli_exception(tmp_path: Path, capsys):
     target_dir.mkdir()
 
     with patch("src.knob_tuner.main.run_pipeline", side_effect=RuntimeError("Connection exploded")):
-        with patch.object(sys, "argv", ["knob_tuner", str(target_dir)]):
+        with patch.object(sys, "argv", ["knob_tuner", str(target_dir), "--db-name", "custom_db"]):
             with pytest.raises(SystemExit) as exc_info:
                 main()
             assert exc_info.value.code == 1
             captured = capsys.readouterr()
             assert "Knob Tuner Pipeline FAILED" in captured.err
             assert "Connection exploded" in captured.err
+
+
+# ===========================================================================
+# 6. Process Lifecycle, Safety Handlers & Active Container Tracking Tests
+# ===========================================================================
+
+def test_register_cleanup_handlers():
+    with patch("atexit.register") as mock_atexit, patch("signal.signal") as mock_signal:
+        import src.knob_tuner.main as main_mod
+        main_mod._cleanup_handlers_registered = False
+        register_cleanup_handlers()
+        assert main_mod._cleanup_handlers_registered is True
+        mock_atexit.assert_called_once_with(_process_cleanup)
+        assert mock_signal.call_count >= 2
+
+
+def test_process_cleanup_stops_all_active_containers():
+    register_active_container("cleanup_test_container_1")
+    register_active_container("cleanup_test_container_2")
+    assert "cleanup_test_container_1" in ACTIVE_CONTAINERS
+    assert "cleanup_test_container_2" in ACTIVE_CONTAINERS
+
+    with patch("src.knob_tuner.main.stop_staging_db") as mock_stop:
+        _process_cleanup()
+        mock_stop.assert_any_call("cleanup_test_container_1")
+        mock_stop.assert_any_call("cleanup_test_container_2")
+
+    unregister_active_container("cleanup_test_container_1")
+    unregister_active_container("cleanup_test_container_2")
+
+
+def test_signal_handler_triggers_cleanup_and_exit():
+    import signal
+    with patch("src.knob_tuner.main._process_cleanup") as mock_cleanup, patch("sys.exit") as mock_exit:
+        _signal_handler(signal.SIGINT, None)
+        mock_cleanup.assert_called_once()
+        mock_exit.assert_called_once_with(128 + signal.SIGINT)
+
+
+def test_run_pipeline_orphan_cleanup_called(tmp_path: Path):
+    target_dir = tmp_path / "target_app"
+    target_dir.mkdir()
+
+    mock_event = MagicMock()
+    mock_event.content.parts = [MagicMock(function_call=None, function_response=None, text="Done")]
+    mock_event.partial = False
+
+    async def mock_run_async(*args, **kwargs):
+        yield mock_event
+
+    with patch("src.knob_tuner.main.cleanup_orphan_containers", return_value=["stale_c1"]) as mock_cleanup:
+        with patch("src.knob_tuner.main.Runner") as mock_runner_cls:
+            mock_runner = MagicMock()
+            mock_runner.run_async = mock_run_async
+            mock_runner_cls.return_value = mock_runner
+
+            asyncio.run(
+                run_pipeline(
+                    target=str(target_dir),
+                    db_name="custom_db",
+                    model="gemini-3.5-flash-lite",
+                    db_type="postgres",
+                    output_path=str(tmp_path / "res.json"),
+                    log_file=str(tmp_path / "log.log"),
+                    knob_path=str(tmp_path / "knobs"),
+                    cleanup_orphans=True,
+                )
+            )
+
+            mock_cleanup.assert_called_once()
+
+
+def test_run_pipeline_orphan_cleanup_skipped(tmp_path: Path):
+    target_dir = tmp_path / "target_app"
+    target_dir.mkdir()
+
+    mock_event = MagicMock()
+    mock_event.content.parts = [MagicMock(function_call=None, function_response=None, text="Done")]
+    mock_event.partial = False
+
+    async def mock_run_async(*args, **kwargs):
+        yield mock_event
+
+    with patch("src.knob_tuner.main.cleanup_orphan_containers") as mock_cleanup:
+        with patch("src.knob_tuner.main.Runner") as mock_runner_cls:
+            mock_runner = MagicMock()
+            mock_runner.run_async = mock_run_async
+            mock_runner_cls.return_value = mock_runner
+
+            asyncio.run(
+                run_pipeline(
+                    target=str(target_dir),
+                    db_name="custom_db",
+                    model="gemini-3.5-flash-lite",
+                    db_type="postgres",
+                    output_path=str(tmp_path / "res.json"),
+                    log_file=str(tmp_path / "log.log"),
+                    knob_path=str(tmp_path / "knobs"),
+                    cleanup_orphans=False,
+                )
+            )
+
+            mock_cleanup.assert_not_called()
+
+
+def test_run_pipeline_exception_triggers_cleanup(tmp_path: Path):
+    target_dir = tmp_path / "target_app"
+    target_dir.mkdir()
+
+    with patch("src.knob_tuner.main.Runner") as mock_runner_cls, patch("src.knob_tuner.main._process_cleanup") as mock_cleanup:
+        mock_runner = MagicMock()
+        mock_runner.run_async.side_effect = RuntimeError("Runner crashed")
+        mock_runner_cls.return_value = mock_runner
+
+        with pytest.raises(RuntimeError, match="Runner crashed"):
+            asyncio.run(
+                run_pipeline(
+                    target=str(target_dir),
+                    db_name="custom_db",
+                    model="gemini-3.5-flash-lite",
+                    db_type="postgres",
+                    output_path=str(tmp_path / "res.json"),
+                    log_file=str(tmp_path / "log.log"),
+                    knob_path=str(tmp_path / "knobs"),
+                    cleanup_orphans=False,
+                )
+            )
+
+        mock_cleanup.assert_called_once()
+
+
+def test_build_initial_state_registers_active_docker_container(sample_ini_path):
+    with patch("src.knob_tuner.main.register_active_container") as mock_register:
+        build_initial_state(
+            target="/tmp/app",
+            db_type="postgres",
+            db_name="custom_db",
+            cpu_cores=2,
+            memory_gb=4.0,
+            db_config_path=str(sample_ini_path),
+            production_db=False,
+            log_file="/tmp/log.log",
+            knob_path="/tmp/knobs",
+            output_path="/tmp/res.json",
+            dry_run=False,
+        )
+        mock_register.assert_called_with("stg_pg_container")
+
+
+def test_build_initial_state_sets_db_name():
+    state = build_initial_state(
+        target="/tmp/my_app",
+        db_name="custom_db",
+        db_type="postgres",
+        cpu_cores=4,
+        memory_gb=8.0,
+        db_config_path="/tmp/non_existent.config",
+        production_db=False,
+        log_file="/tmp/log.log",
+        knob_path="/tmp/knobs",
+        output_path="/tmp/out.dat",
+        dry_run=True,
+    )
+    assert state["database"] == "custom_db"
+    assert state["dbname"] == "custom_db"
+
+def test_build_initial_state_ignores_ini_database_uses_cli_name(sample_ini_path):
+    state = build_initial_state(
+        target="/tmp/my_app",
+        db_name="custom_db",
+        db_type="postgres",
+        cpu_cores=2,
+        memory_gb=4.0,
+        db_config_path=str(sample_ini_path),
+        production_db=False,
+        log_file="/tmp/log.log",
+        knob_path="/tmp/knobs",
+        output_path="/tmp/out.dat",
+        dry_run=False,
+    )
+    assert state["database"] == "custom_db"
+    assert state["dbname"] == "custom_db"

@@ -15,7 +15,7 @@ class DBConfig:
     password: str
     database: str
     db_type: str
-    env: str
+    env: str = "production"
     restart_type: str = "docker"
     restart_target: str = ""
     restart_cmd: str = ""
@@ -53,22 +53,23 @@ def _is_safe_query(sql: str) -> bool:
 
 
 def load_db_config(
-    config_path: str, env: str, db_type: str, db_override: str | None = None
+    config_path: str,
+    db_type: str = "postgres",
+    db_override: str | None = None,
 ) -> DBConfig:
-    """Load database configuration from an INI file for a given env and db_type.
+    """Load database configuration from an INI file for a given db_type.
 
     Args:
         config_path: Path to the INI config file.
-        env: Environment name (e.g. 'staging', 'production').
-        db_type: Database engine type ('postgres', 'postgresql', 'mysql').
-        db_override: Optional database name override.
+        db_type: Database engine type ('postgres', 'postgresql', 'mysql', etc.).
+        db_override: Required database name override.
 
     Returns:
         DBConfig dataclass instance.
 
     Raises:
         FileNotFoundError: If config file does not exist.
-        KeyError: If the section [env.db_type] or required keys are missing.
+        KeyError: If matching section or required keys are missing.
         ValueError: If configuration values are invalid.
     """
     if not os.path.isfile(config_path):
@@ -77,19 +78,35 @@ def load_db_config(
     config = configparser.ConfigParser()
     config.read(config_path, encoding="utf-8")
 
-    # Normalize section name lookup (e.g., staging.postgres or staging.mysql)
-    section_name = f"{env}.{db_type}"
+    all_sections = config.sections()
     matched_section = None
-    for section in config.sections():
-        if section.lower() == section_name.lower():
+
+    # 1. Exact case-insensitive match for db_type (e.g., [postgres] or [mysql])
+    for section in all_sections:
+        if section.lower() == db_type.lower():
             matched_section = section
             break
 
+    # 2. Basic engine normalization (e.g., postgresql -> postgres, mariadb -> mysql)
     if not matched_section:
-        raise KeyError(f"Section [{section_name}] not found in {config_path}")
+        norm_map = {
+            "postgresql": "postgres",
+            "postgres": "postgresql",
+            "mariadb": "mysql",
+            "mysql": "mariadb",
+        }
+        alt_type = norm_map.get(db_type.lower())
+        if alt_type:
+            for section in all_sections:
+                if section.lower() == alt_type:
+                    matched_section = section
+                    break
+
+    if not matched_section:
+        raise KeyError(f"Section [{db_type}] not found in {config_path}")
 
     sec = config[matched_section]
-    required_keys = ["host", "port", "user", "password", "database"]
+    required_keys = ["host", "port", "user", "password"]
     for key in required_keys:
         if key not in sec:
             raise KeyError(
@@ -103,7 +120,10 @@ def load_db_config(
             f"Invalid port value '{sec['port']}' in [{matched_section}]: {e}"
         ) from e
 
-    database = db_override if db_override else sec["database"]
+    if not db_override or not str(db_override).strip():
+        raise KeyError("Missing required database name. Database name must be provided via --db-name / db_override.")
+    database = str(db_override).strip()
+    env = sec.get("env", "production")
 
     return DBConfig(
         host=sec["host"],

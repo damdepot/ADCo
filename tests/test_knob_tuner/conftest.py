@@ -48,34 +48,25 @@ def mock_db_config_mysql() -> DBConfig:
 @pytest.fixture
 def sample_ini_path(tmp_path: Path) -> Path:
     ini_content = """
-[production.mysql]
-host = 127.0.0.1
-port = 3306
-user = prod_root
-password = prod_pass
-database = prod_db
-restart_type = systemctl
-restart_target = mysql
-
-[staging.postgres]
+[postgres]
 host = 10.0.0.2
 port = 5432
 user = stg_postgres
 password = stg_pass
 database = stg_db
+env = staging
 restart_type = docker
 restart_target = stg_pg_container
 
-[remote.postgres]
-host = 192.168.1.100
-port = 5432
-user = remote_pg
-password = remote_pass
-database = remote_db
-restart_type = ssh
-remote_host = 192.168.1.100
-remote_user = ubuntu
-restart_cmd = sudo systemctl restart postgresql
+[mysql]
+host = 127.0.0.1
+port = 3306
+user = prod_root
+password = prod_pass
+database = prod_db
+env = production
+restart_type = systemctl
+restart_target = mysql
 """
     config_file = tmp_path / "test_db.config"
     config_file.write_text(ini_content.strip(), encoding="utf-8")

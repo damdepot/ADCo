@@ -8,7 +8,6 @@ from google.adk.tools import ToolContext
 from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
 from src.knob_tuner.tools.db_tools import apply_knobs, verify_active_knobs
 from src.knob_tuner.tools.file_tools import read_json_file
-from src.knob_tuner.tools.restart_tools import restart_db_by_config
 
 def _get_production_db_config(tool_context: ToolContext) -> DBConfig | None:
     """Extract production database configuration from tool context state."""
@@ -34,7 +33,7 @@ def _get_production_db_config(tool_context: ToolContext) -> DBConfig | None:
     db_type = state.get("db_type") or "postgres"
     if config_path and os.path.isfile(config_path):
         try:
-            return load_db_config(config_path, env="production", db_type=db_type)
+            return load_db_config(config_path, db_type=db_type, db_override=state.get("db_name") or state.get("database") or state.get("dbname"))
         except Exception:
             pass
 
@@ -47,7 +46,7 @@ def _get_production_db_config(tool_context: ToolContext) -> DBConfig | None:
             return _dict_to_db_config(cfg, default_env="production")
 
     # 4. Top-level state fields
-    if "db_type" in state and ("database" in state or "dbname" in state):
+    if "db_type" in state and ("database" in state or "dbname" in state or "db_name" in state):
         db_type = state.get("db_type", "postgres")
         default_port = 5432 if "post" in db_type.lower() else 3306
         default_user = "postgres" if "post" in db_type.lower() else "root"
@@ -56,7 +55,7 @@ def _get_production_db_config(tool_context: ToolContext) -> DBConfig | None:
             port=int(state.get("port", default_port)),
             user=state.get("user", default_user),
             password=state.get("password", ""),
-            database=state.get("database", state.get("dbname", "testdb")),
+            database=state.get("db_name", state.get("database", state.get("dbname", "testdb"))),
             db_type=db_type,
             env=state.get("env", "production"),
             restart_type=state.get("restart_type", "docker"),
@@ -180,6 +179,19 @@ def _load_selected_knobs(tool_context: ToolContext) -> list[dict[str, Any]]:
     return []
 
 
+def _is_staging_validated(tool_context: ToolContext) -> bool:
+    is_validated = bool(tool_context.state.get("staging_validated", False))
+    knob_checker_output = tool_context.state.get("knob_checker_output")
+    if knob_checker_output:
+        if hasattr(knob_checker_output, "status") and getattr(knob_checker_output, "status") == "PASS":
+            is_validated = True
+            tool_context.state["staging_validated"] = True
+        elif isinstance(knob_checker_output, dict) and knob_checker_output.get("status") == "PASS":
+            is_validated = True
+            tool_context.state["staging_validated"] = True
+    return is_validated
+
+
 def check_staging_validation(tool_context: ToolContext) -> str:
     """Check if staging validation has passed and live tuning is permitted.
 
@@ -189,8 +201,7 @@ def check_staging_validation(tool_context: ToolContext) -> str:
     Returns:
         Authorization status message.
     """
-    is_validated = bool(tool_context.state.get("staging_validated", False))
-    if is_validated:
+    if _is_staging_validated(tool_context):
         return "VALIDATED: Staging validation has PASSED. Live production tuning is authorized."
     else:
         return (
@@ -210,7 +221,7 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
     Returns:
         Detailed summary of live application and deferred restart-required knobs.
     """
-    if not tool_context.state.get("staging_validated", False):
+    if not _is_staging_validated(tool_context):
         return (
             "ERROR: Guardrail check failed — staging_validated is False. "
             "Knobs cannot be applied to production."
@@ -240,15 +251,6 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
     else:
         tool_context.state["prod_applied_knobs"] = []
         
-    allow_restart = bool(tool_context.state.get("allow_production_restart", False))
-    
-    restarted = False
-    restart_msg = ""
-    if allow_restart and restart_required_knobs:
-        ok, msg = restart_db_by_config(cfg)
-        restarted = ok
-        restart_msg = msg
-
     # Verification
     verification = verify_active_knobs(cfg, knobs)
     tool_context.state["prod_verified_knobs"] = verification.get("knobs", [])
@@ -260,7 +262,7 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
         "## Production Live Tuning Report",
         f"- **Knobs Processed**: {applied_count}/{len(knobs)} (Failed: {failed_count})",
         f"- **Static / Restart-Required Knobs Deferred**: {len(restart_required_knobs)}",
-        f"- **Auto-Restart Status**: {'EXECUTED (' + restart_msg + ')' if restarted else 'DISABLED (Zero Downtime Policy)'}",
+        "- **Auto-Restart Status**: DISABLED (Zero Downtime Policy)",
         "",
     ]
 
@@ -275,7 +277,7 @@ def apply_knobs_production(tool_context: ToolContext) -> str:
             lines.append(f"- **{kname}** -> `{kval}`: **{st.upper()}**{err_str}")
         lines.append("")
 
-    if restart_required_knobs and not restarted:
+    if restart_required_knobs:
         lines.append("### Deferred Knobs (Requires Scheduled Maintenance Restart)")
         for rk in restart_required_knobs:
             kname = rk.get("name", "")

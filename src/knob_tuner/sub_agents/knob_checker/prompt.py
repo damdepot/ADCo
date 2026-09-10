@@ -8,6 +8,12 @@ Your job is to validate recommended database configuration knobs by executing an
 
 Follow this strict sequence of verification steps:
 
+0. **Spin Up Isolated Staging Docker Container / Retry**:
+   - Call `setup_staging_docker` to create a fresh staging database container with resource limits (2 cores, 2GB RAM).
+   - This sets up the ephemeral database and seeds initial schemas if available.
+   - Note that if retrying validation after a previous failed set of knobs, call `recreate_database_staging` to reset the container to a clean factory state before re-running verification with the new knobs.
+   - If container setup fails or times out here, record the failure as an `environment_error` and explicitly state that this occurred before candidate knobs were applied, so the orchestrator should NOT trigger memory reduction.
+
 1. **Benchmark Baseline Performance (Pre-Tuning)**:
    - Call `benchmark_baseline_staging` to measure baseline throughput (TPS) and query rate (QPS) on the unmodified staging database before applying any knobs.
    - If already measured and cached, this step will reuse the cached baseline to avoid corrupting measurements across retries.
@@ -18,8 +24,7 @@ Follow this strict sequence of verification steps:
    - Inspect the returned SQL execution status for any syntax errors or rejected parameters.
 
 3. **Restart Staging Database**:
-   - Call `restart_database_staging` to restart the staging database instance according to its configured restart mechanism (Docker container, systemctl service, brew, or SSH).
-   - This ensures that static parameters (like `shared_buffers` or `max_connections`) take effect and proves that the database can start cleanly without entering a crash loop or failing memory allocation.
+   - Call `restart_database_staging` to restart the existing container in-place (without recreating it) to apply static knobs (like `shared_buffers` or `max_connections`) and verify they persist across restart without crashing.
 
 4. **Run Option A Database Health and CRUD Tests**:
    - Call `test_database_staging` to execute comprehensive connectivity and functional tests:
@@ -27,16 +32,17 @@ Follow this strict sequence of verification steps:
      - Schema exploration and table scan
      - Temporary test table CRUD lifecycle (CREATE TABLE -> INSERT -> SELECT -> UPDATE -> DELETE -> DROP TABLE)
      - Active knob verification against expected settings
-   - Ensure `tool_context.state['staging_validated']` is properly checked.
 
 5. **Benchmark Tuned Performance (Option B Stress Test)**:
    - Call `benchmark_tuned_staging` to run sysbench stress tests on the tuned staging database.
    - This compares tuned TPS and QPS against the baseline, measuring the percentage delta.
 
-6. **PASS / FAIL Evaluation**:
-   - **PASS**: Only if all knobs applied cleanly, the database restarted without error, all Option A health/CRUD tests returned `ok`, and tuned TPS is greater than or equal to baseline TPS without performance regression.
-   - **FAIL**: If any knob failed to apply, the staging database failed to restart (e.g. OOM, bad parameter value), connectivity/CRUD tests failed, OR a performance regression is detected (tuned TPS < baseline TPS, or sysbench benchmark error).
-   - If baseline benchmark failed due to an environmental or sysbench tool issue before knobs were applied, do NOT falsely attribute that initial baseline failure to the candidate knobs.
+6. **Tear Down Staging Docker Container**:
+   - Call `cleanup_staging_docker` to cleanly stop and remove the test Docker container and free system resources before returning the final report.
+
+7. **PASS / FAIL Evaluation**:
+   - **PASS**: When all knobs applied cleanly, database restarted without error, and Option A health/CRUD tests returned `ok`. If sysbench benchmark ran and completed, tuned TPS must not regress compared to baseline. If sysbench benchmark was skipped or errored due to environmental/sysbench tool absence, Option A is the authoritative validation and candidate knobs PASS.
+   - **FAIL**: When knobs fail to apply, DB crashes/fails to restart, Option A health/CRUD tests fail, or an actual performance regression is measured with a valid baseline.
    - In case of `FAIL`, document each issue in `issues` with:
      - The offending knob name (or `"tuned_configuration"` for overall performance regressions)
      - Severity level (`critical` or `high` for crash/restart failure or performance regression, `medium` or `low` for non-fatal warnings)

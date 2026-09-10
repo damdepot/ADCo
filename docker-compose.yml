@@ -22,24 +22,9 @@ services:
     <<: *mysql-base
     container_name: adco-mysql-baseline
     ports:
-      - "3307:3306"
-    volumes:
-      - mysql_baseline_data:/var/lib/mysql
-      - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2g
-
-  mysql-staging:
-    profiles: ["mysql"]
-    <<: *mysql-base
-    container_name: adco-mysql-staging
-    ports:
       - "3308:3306"
     volumes:
-      - mysql_staging_data:/var/lib/mysql
+      - mysql_baseline_data:/var/lib/mysql
       - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
     deploy:
       resources:
@@ -52,7 +37,7 @@ services:
     <<: *mysql-base
     container_name: adco-mysql-production
     ports:
-      - "3306:3306"
+      - "3307:3306"
     volumes:
       - mysql_production_data:/var/lib/mysql
       - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
@@ -67,24 +52,9 @@ services:
     <<: *postgres-base
     container_name: adco-postgres-baseline
     ports:
-      - "5433:5432"
-    volumes:
-      - postgres_baseline_data:/var/lib/postgresql/data
-      - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2g
-
-  postgres-staging:
-    profiles: ["postgres"]
-    <<: *postgres-base
-    container_name: adco-postgres-staging
-    ports:
       - "5434:5432"
     volumes:
-      - postgres_staging_data:/var/lib/postgresql/data
+      - postgres_baseline_data:/var/lib/postgresql/data
       - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
     deploy:
       resources:
@@ -97,7 +67,7 @@ services:
     <<: *postgres-base
     container_name: adco-postgres-production
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_production_data:/var/lib/postgresql/data
       - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
@@ -109,8 +79,6 @@ services:
 
 volumes:
   mysql_baseline_data:
-  mysql_staging_data:
   mysql_production_data:
   postgres_baseline_data:
-  postgres_staging_data:
   postgres_production_data:

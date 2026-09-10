@@ -15,12 +15,6 @@ from .file_tools import (
     read_json_file,
     write_json_file,
 )
-from .restart_tools import (
-    restart_db_by_config,
-    restart_docker_db,
-    restart_local_db,
-    restart_remote_db,
-)
 from .kb_planner import (
     KnobStrategyDef,
     _parse_knob_kb,
@@ -29,6 +23,16 @@ from .kb_planner import (
 )
 from .benchmark_tools import (
     run_sysbench_benchmark,
+)
+from .docker_tools import (
+    cleanup_orphan_containers,
+    is_docker_available,
+    resolve_docker_image,
+    start_staging_db,
+    get_container_host_port,
+    stop_staging_db,
+    restart_docker_db,
+    recreate_docker_db,
 )
 
 __all__ = [
@@ -39,9 +43,7 @@ __all__ = [
     "read_json_file",
     "write_json_file",
     "restart_docker_db",
-    "restart_local_db",
-    "restart_remote_db",
-    "restart_db_by_config",
+    "recreate_docker_db",
     "apply_knobs",
     "test_database",
     "verify_active_knobs",
@@ -50,4 +52,11 @@ __all__ = [
     "KnobStrategyDef",
     "_parse_knob_kb",
     "run_sysbench_benchmark",
+    "is_docker_available",
+    "resolve_docker_image",
+    "start_staging_db",
+    "get_container_host_port",
+    "stop_staging_db",
+    "cleanup_orphan_containers",
 ]
+

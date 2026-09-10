@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import datetime
 import json
 import os
 import re
+import signal
 import sys
 import uuid
 from typing import Any
@@ -23,10 +25,53 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from src.knob_tuner.agent import create_root_agent
 from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
+from src.knob_tuner.tools.docker_tools import (
+    ACTIVE_CONTAINERS,
+    cleanup_orphan_containers,
+    register_active_container,
+    stop_staging_db,
+    unregister_active_container,
+)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+_cleanup_handlers_registered = False
+
+
+def _process_cleanup() -> None:
+    """Process-level cleanup hook to terminate any actively running staging containers."""
+    containers = list(ACTIVE_CONTAINERS)
+    for name in containers:
+        try:
+            stop_staging_db(name)
+        except Exception:
+            pass
+
+
+def _signal_handler(signum: int, frame: Any) -> None:
+    """Signal handler for SIGINT and SIGTERM."""
+    _log_event(f"Received termination signal ({signum}). Cleaning up active containers...")
+    _process_cleanup()
+    sys.exit(128 + signum)
+
+
+def register_cleanup_handlers() -> None:
+    """Register process-level atexit and signal handlers for safe container teardown."""
+    global _cleanup_handlers_registered
+    if not _cleanup_handlers_registered:
+        atexit.register(_process_cleanup)
+        try:
+            signal.signal(signal.SIGINT, _signal_handler)
+            signal.signal(signal.SIGTERM, _signal_handler)
+        except (ValueError, AttributeError):
+            pass
+        _cleanup_handlers_registered = True
+
+
+# Automatically register on module import
+register_cleanup_handlers()
 
 
 def _maybe_parse(value: object) -> dict:
@@ -123,6 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Database memory limit in GB (default: auto)",
     )
     parser.add_argument(
+        "--db-name",
+        required=True,
+        help="Database name to target (required)",
+    )
+    parser.add_argument(
         "--db-config",
         default="db.config",
         help="Path to database configuration INI file (default: db.config)",
@@ -161,6 +211,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Print detailed execution progress and sub-agent events",
     )
+    parser.add_argument(
+        "--no-cleanup-orphans",
+        dest="cleanup_orphans",
+        action="store_false",
+        default=True,
+        help="Skip cleaning up orphan staging database containers on start (default: cleanup enabled)",
+    )
     return parser
 
 
@@ -175,12 +232,16 @@ def build_initial_state(
     knob_path: str,
     output_path: str,
     dry_run: bool,
+    db_name: str,
 ) -> dict[str, Any]:
     """Construct initial state dictionary for the knob tuner session."""
     env = "production" if production_db else "staging"
     state: dict[str, Any] = {
         "target": target,
         "db_type": db_type,
+        "db_name": db_name,
+        "database": db_name,
+        "dbname": db_name,
         "cpu_cores": cpu_cores,
         "memory_gb": memory_gb,
         "memory": memory_gb,
@@ -197,21 +258,18 @@ def build_initial_state(
 
     if os.path.isfile(db_config_path):
         try:
-            stg_cfg = load_db_config(db_config_path, env="staging", db_type=db_type)
-            state["staging_db_config"] = stg_cfg
-        except Exception:
-            pass
-
-        try:
-            prod_cfg = load_db_config(db_config_path, env="production", db_type=db_type)
-            state["production_db_config"] = prod_cfg
-            state["prod_db_config"] = prod_cfg
-        except Exception:
-            pass
-
-        try:
-            curr_cfg = load_db_config(db_config_path, env=env, db_type=db_type)
-            state["db_config"] = curr_cfg
+            cfg = load_db_config(db_config_path, db_type=db_type, db_override=db_name)
+            state["db_config"] = cfg
+            state["database"] = cfg.database
+            state["dbname"] = cfg.database
+            if not production_db:
+                state["staging_db_config"] = cfg
+                if getattr(cfg, "restart_type", "docker") == "docker":
+                    target_container = getattr(cfg, "restart_target", "") or f"{getattr(cfg, 'env', 'staging')}_{cfg.db_type}"
+                    register_active_container(target_container)
+            else:
+                state["production_db_config"] = cfg
+                state["prod_db_config"] = cfg
         except Exception:
             pass
 
@@ -254,8 +312,12 @@ async def run_pipeline(
     output_path: str = "out/knob_tuner/result.json",
     dry_run: bool = False,
     verbose: bool = False,
+    cleanup_orphans: bool = True,
+    db_name: str = "",
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using Google ADK Runner and session service."""
+    register_cleanup_handlers()
+
     target_abs = os.path.abspath(target)
     db_config_abs = os.path.abspath(db_config)
     knob_path_abs = os.path.abspath(knob_path)
@@ -265,6 +327,18 @@ async def run_pipeline(
     os.makedirs(os.path.dirname(log_file_abs), exist_ok=True)
     os.makedirs(knob_path_abs, exist_ok=True)
     os.makedirs(os.path.dirname(output_path_abs), exist_ok=True)
+
+    if cleanup_orphans:
+        try:
+            orphans = cleanup_orphan_containers()
+            if orphans:
+                _log_event(
+                    f"Cleaned up {len(orphans)} stale orphan container(s): {', '.join(orphans)}",
+                    log_file=log_file_abs,
+                    verbose=verbose,
+                )
+        except Exception as exc:
+            _log_event(f"Orphan cleanup warning: {exc}", log_file=log_file_abs, verbose=verbose)
 
     cpu_cores = _parse_cpu_cores(cpu_cores_arg)
     memory_gb = _parse_memory(memory_arg)
@@ -284,6 +358,7 @@ async def run_pipeline(
         knob_path=knob_path_abs,
         output_path=output_path_abs,
         dry_run=dry_run,
+        db_name=db_name,
     )
 
     await session_service.create_session(
@@ -301,6 +376,7 @@ async def run_pipeline(
         f"Tune database configuration knobs for the codebase at: {target_abs}\n\n"
         f"Configuration details:\n"
         f"- Database Type: {db_type}\n"
+        f"- Database Name: {db_name}\n"
         f"- CPU Cores: {cpu_cores}\n"
         f"- Memory: {memory_gb} GB\n"
         f"- Target Environment: {env_name}\n"
@@ -320,27 +396,36 @@ async def run_pipeline(
         verbose=verbose,
     )
 
-    async for event in runner.run_async(
-        user_id="pipeline",
-        session_id=sid,
-        new_message=types.Content(role="user", parts=[types.Part(text=user_message)]),
-    ):
-        if not event.content or not event.content.parts:
-            continue
+    try:
+        async for event in runner.run_async(
+            user_id="pipeline",
+            session_id=sid,
+            new_message=types.Content(role="user", parts=[types.Part(text=user_message)]),
+        ):
+            if not event.content or not event.content.parts:
+                continue
 
-        for part in event.content.parts:
-            if part.function_call:
-                name = part.function_call.name or ""
-                args = part.function_call.args
-                _log_event(f"  [tool call] {name}({args})", log_file=log_file_abs, verbose=verbose)
+            for part in event.content.parts:
+                if part.function_call:
+                    name = part.function_call.name or ""
+                    args = part.function_call.args
+                    _log_event(f"  [tool call] {name}({args})", log_file=log_file_abs, verbose=verbose)
 
-            if part.function_response:
-                resp = str(part.function_response.response)
-                preview = resp[:200] + "..." if len(resp) > 200 else resp
-                _log_event(f"  [tool result] {preview}", log_file=log_file_abs, verbose=verbose)
+                if part.function_response:
+                    resp = str(part.function_response.response)
+                    preview = resp[:200] + "..." if len(resp) > 200 else resp
+                    _log_event(f"  [tool result] {preview}", log_file=log_file_abs, verbose=verbose)
 
-            if part.text and not event.partial:
-                _log_event(f"  [agent] {part.text.strip()}", log_file=log_file_abs, verbose=verbose)
+                if part.text and not event.partial:
+                    _log_event(f"  [agent] {part.text.strip()}", log_file=log_file_abs, verbose=verbose)
+    except Exception as exc:
+        _log_event(
+            f"Pipeline error encountered: {exc}. Running active container cleanup...",
+            log_file=log_file_abs,
+            verbose=verbose,
+        )
+        _process_cleanup()
+        raise
 
     session = await session_service.get_session(
         app_name=app_name, user_id="pipeline", session_id=sid
@@ -355,6 +440,7 @@ async def run_pipeline(
 
 def main() -> None:
     """CLI main entry point."""
+    register_cleanup_handlers()
     parser = build_parser()
     args = parser.parse_args()
 
@@ -378,9 +464,12 @@ def main() -> None:
                 output_path=args.output_path,
                 dry_run=args.dry_run,
                 verbose=args.verbose,
+                cleanup_orphans=getattr(args, "cleanup_orphans", True),
+                db_name=args.db_name,
             )
         )
     except Exception as exc:
+        _process_cleanup()
         print(f"\n=== Knob Tuner Pipeline FAILED ===\nError: {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -393,6 +482,7 @@ def main() -> None:
     print(f"Target:             {target}")
     print(f"Model:              {args.model}")
     print(f"Database Type:      {args.db_type}")
+    print(f"Database Name:      {args.db_name}")
     print(f"Staging Validation: {checker_status}")
     print(f"Live Tuning Status: {live_status}")
     print(f"Output File:        {args.output_path}")

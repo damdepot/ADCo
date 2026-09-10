@@ -7,8 +7,33 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from google.adk.tools import ToolContext
+
+
+def _to_text(val: Any) -> str:
+    """Convert string, None, dict, list, Pydantic model, or arbitrary object into plain string text."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if hasattr(val, "model_dump_json") and callable(val.model_dump_json):
+        try:
+            return val.model_dump_json()
+        except Exception:
+            pass
+    if hasattr(val, "model_dump") and callable(val.model_dump):
+        try:
+            return json.dumps(val.model_dump())
+        except Exception:
+            pass
+    if isinstance(val, (dict, list)):
+        try:
+            return json.dumps(val)
+        except Exception:
+            return str(val)
+    return str(val)
 
 
 def _maybe_parse(value: object) -> dict:
@@ -167,16 +192,16 @@ CRASH_FEEDBACK_KEYWORDS: list[str] = [
 
 def _calculate_strategy_score(
     strat: KnobStrategyDef,
-    workload_lower: str = "",
-    feedback_lower: str = "",
+    workload_lower: Any = "",
+    feedback_lower: Any = "",
     keyword_map: dict[str, list[str]] | None = None,
 ) -> int:
     """Calculate the relevance score for a knob tuning strategy given workload and feedback."""
     if keyword_map is None:
         keyword_map = KEYWORD_MAP
 
-    workload = (workload_lower or "").lower()
-    feedback = (feedback_lower or "").lower()
+    workload = _to_text(workload_lower).lower()
+    feedback = _to_text(feedback_lower).lower()
     score = 0
 
     keywords = keyword_map.get(strat.name, [])
@@ -216,16 +241,24 @@ def _calculate_strategy_score(
     return score
 
 
-def plan_knob_tuning(db_type: str, workload_text: str = "", memory_gb: float = 1.0, cpu_cores: int = 1, feedback: str = "", max_strategies: int = 8) -> tuple[list[KnobStrategyDef], str]:
+def plan_knob_tuning(
+    db_type: str,
+    workload_text: Any = "",
+    memory_gb: float = 1.0,
+    cpu_cores: int = 1,
+    feedback: Any = "",
+    max_strategies: int = 8,
+) -> tuple[list[KnobStrategyDef], str]:
     """Produce a list of applicable strategies given workload intent, system specs, and failure feedback.
     
     Returns (selected_strategies, strategy_summary_text).
     """
-    engine = "postgresql" if db_type.lower() in ("postgres", "postgresql", "pg") else "mysql"
+    db_type_str = db_type if isinstance(db_type, str) else str(db_type)
+    engine = "postgresql" if db_type_str.lower() in ("postgres", "postgresql", "pg") else "mysql"
     all_strategies = _parse_knob_kb(target_engine=engine)
     
-    workload_lower = workload_text.lower()
-    feedback_lower = feedback.lower()
+    workload_lower = _to_text(workload_text).lower()
+    feedback_lower = _to_text(feedback).lower()
 
     scored: list[tuple[int, KnobStrategyDef]] = []
     
@@ -256,17 +289,20 @@ def get_knob_strategies(tool_context: ToolContext) -> str:
     and stores the strategy summary text back to state as `knob_strategies`.
     """
     db_type = tool_context.state.get("db_type", "postgres")
-    workload = tool_context.state.get("workload", "")
+    # Defensively coerce to str in case state stores a dict/object here
+    if not isinstance(db_type, str):
+        db_type = str(db_type.get("db_type", "postgres")) if isinstance(db_type, dict) else "postgres"
+    workload = tool_context.state.get("workload") or tool_context.state.get("workload_info") or tool_context.state.get("intent_analyzer_output") or ""
     memory_gb = float(tool_context.state.get("memory_gb", 1.0))
     cpu_cores = int(tool_context.state.get("cpu_cores", 1))
-    feedback = tool_context.state.get("knob_checker_output", "")
+    feedback = tool_context.state.get("knob_checker_output") or tool_context.state.get("feedback") or ""
     
     _, summary = plan_knob_tuning(
         db_type=db_type,
         workload_text=workload,
         memory_gb=memory_gb,
         cpu_cores=cpu_cores,
-        feedback=feedback
+        feedback=feedback,
     )
     
     tool_context.state["knob_strategies"] = summary

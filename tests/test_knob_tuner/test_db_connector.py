@@ -20,10 +20,10 @@ def test_db_config_dataclass_defaults():
         password="pwd",
         database="db",
         db_type="postgres",
-        env="dev",
     )
     assert cfg.host == "localhost"
     assert cfg.port == 5432
+    assert cfg.env == "production"
     assert cfg.restart_type == "docker"
     assert cfg.restart_target == ""
     assert cfg.restart_cmd == ""
@@ -31,63 +31,184 @@ def test_db_config_dataclass_defaults():
     assert cfg.remote_user == ""
 
 
-def test_load_db_config_postgres(sample_ini_path):
-    cfg = load_db_config(str(sample_ini_path), env="staging", db_type="postgres")
+def test_load_db_config_direct_section_postgres(tmp_path):
+    ini_content = """
+[postgres]
+host = 127.0.0.1
+port = 5432
+user = pg_user
+password = pg_pass
+database = pg_db
+env = staging
+restart_type = docker
+restart_target = pg_container
+"""
+    file_path = tmp_path / "direct_pg.config"
+    file_path.write_text(ini_content.strip(), encoding="utf-8")
+
+    cfg = load_db_config(str(file_path), db_type="postgres", db_override="test_db")
+    assert cfg.host == "127.0.0.1"
+    assert cfg.port == 5432
+    assert cfg.user == "pg_user"
+    assert cfg.password == "pg_pass"
+    assert cfg.database == "test_db"
+    assert cfg.db_type == "postgres"
+    assert cfg.env == "staging"
+    assert cfg.restart_type == "docker"
+    assert cfg.restart_target == "pg_container"
+
+
+def test_load_db_config_direct_section_mysql(tmp_path):
+    ini_content = """
+[mysql]
+host = 127.0.0.1
+port = 3306
+user = mysql_user
+password = mysql_pass
+database = mysql_db
+"""
+    file_path = tmp_path / "direct_mysql.config"
+    file_path.write_text(ini_content.strip(), encoding="utf-8")
+
+    cfg = load_db_config(str(file_path), db_type="mysql", db_override="test_db")
+    assert cfg.host == "127.0.0.1"
+    assert cfg.port == 3306
+    assert cfg.user == "mysql_user"
+    assert cfg.password == "mysql_pass"
+    assert cfg.database == "test_db"
+    assert cfg.db_type == "mysql"
+    assert cfg.env == "production"
+
+
+def test_load_db_config_postgresql_normalization(tmp_path):
+    ini_content = """
+[postgres]
+host = 127.0.0.1
+port = 5432
+user = pg_user
+password = pg_pass
+database = pg_db
+"""
+    file_path = tmp_path / "norm.config"
+    file_path.write_text(ini_content.strip(), encoding="utf-8")
+
+    cfg = load_db_config(str(file_path), db_type="postgresql", db_override="test_db")
+    assert cfg.host == "127.0.0.1"
+    assert cfg.port == 5432
+    assert cfg.database == "test_db"
+
+
+def test_load_db_config_sample_postgres(sample_ini_path):
+    cfg = load_db_config(str(sample_ini_path), db_type="postgres", db_override="test_db")
     assert cfg.host == "10.0.0.2"
     assert cfg.port == 5432
     assert cfg.user == "stg_postgres"
     assert cfg.password == "stg_pass"
-    assert cfg.database == "stg_db"
+    assert cfg.database == "test_db"
     assert cfg.db_type == "postgres"
     assert cfg.env == "staging"
     assert cfg.restart_type == "docker"
     assert cfg.restart_target == "stg_pg_container"
 
 
-def test_load_db_config_mysql(sample_ini_path):
-    cfg = load_db_config(str(sample_ini_path), env="production", db_type="mysql")
+def test_load_db_config_sample_mysql(sample_ini_path):
+    cfg = load_db_config(str(sample_ini_path), db_type="mysql", db_override="test_db")
     assert cfg.host == "127.0.0.1"
     assert cfg.port == 3306
     assert cfg.user == "prod_root"
     assert cfg.password == "prod_pass"
-    assert cfg.database == "prod_db"
+    assert cfg.database == "test_db"
     assert cfg.db_type == "mysql"
     assert cfg.env == "production"
     assert cfg.restart_type == "systemctl"
     assert cfg.restart_target == "mysql"
 
 
-def test_load_db_config_with_override(sample_ini_path):
-    cfg = load_db_config(
-        str(sample_ini_path),
-        env="staging",
-        db_type="postgres",
-        db_override="custom_override_db",
-    )
-    assert cfg.database == "custom_override_db"
+def test_load_db_config_requires_db_override(sample_ini_path):
+    with pytest.raises(KeyError, match=r"(?i)missing required database name"):
+        load_db_config(str(sample_ini_path), db_type="postgres")
+    with pytest.raises(KeyError, match=r"(?i)missing required database name"):
+        load_db_config(str(sample_ini_path), db_type="postgres", db_override="   ")
 
+def test_load_db_config_ignores_ini_database_uses_override(tmp_path):
+    ini_content = """
+[postgres]
+host = 127.0.0.1
+port = 5432
+user = pg_user
+password = pg_pass
+database = ini_db
+"""
+    file_path = tmp_path / "ignores.config"
+    file_path.write_text(ini_content.strip(), encoding="utf-8")
+    cfg = load_db_config(str(file_path), db_type="postgres", db_override="new_db")
+    assert cfg.database == "new_db"
 
-def test_load_db_config_remote_ssh(sample_ini_path):
-    cfg = load_db_config(str(sample_ini_path), env="remote", db_type="postgres")
+def test_load_db_config_without_ini_database_key(tmp_path):
+    ini_content = """
+[postgres]
+host = 127.0.0.1
+port = 5432
+user = pg_user
+password = pg_pass
+"""
+    file_path = tmp_path / "no_db.config"
+    file_path.write_text(ini_content.strip(), encoding="utf-8")
+    cfg = load_db_config(str(file_path), db_type="postgres", db_override="my_db")
+    assert cfg.database == "my_db"
+
+def test_load_db_config_remote_ssh(tmp_path):
+    ini_content = """
+[postgres]
+host = 192.168.1.100
+port = 5432
+user = remote_pg
+password = remote_pass
+database = remote_db
+restart_type = ssh
+remote_host = 192.168.1.100
+remote_user = ubuntu
+restart_cmd = sudo systemctl restart postgresql
+"""
+    file_path = tmp_path / "remote.config"
+    file_path.write_text(ini_content.strip(), encoding="utf-8")
+
+    cfg = load_db_config(str(file_path), db_type="postgres", db_override="test_db")
     assert cfg.restart_type == "ssh"
     assert cfg.remote_host == "192.168.1.100"
     assert cfg.remote_user == "ubuntu"
     assert cfg.restart_cmd == "sudo systemctl restart postgresql"
 
 
+def test_load_db_config_does_not_match_prefixed_section(tmp_path):
+    ini_content = """
+[staging.postgres]
+host = 127.0.0.1
+port = 5432
+user = pg_user
+password = pg_pass
+database = pg_db
+"""
+    file_path = tmp_path / "prefixed.config"
+    file_path.write_text(ini_content.strip(), encoding="utf-8")
+
+    with pytest.raises(KeyError, match=r"Section \[postgres\] not found"):
+        load_db_config(str(file_path), db_type="postgres", db_override="test_db")
+
+
 def test_load_db_config_file_not_found():
     with pytest.raises(FileNotFoundError, match="Database configuration file not found"):
-        load_db_config("/path/to/non_existent_file.config", env="staging", db_type="postgres")
+        load_db_config("/path/to/non_existent_file.config", db_type="postgres", db_override="test_db")
 
 
 def test_load_db_config_missing_section(sample_ini_path):
-    with pytest.raises(KeyError, match=r"Section \[non_existent\.postgres\] not found"):
-        load_db_config(str(sample_ini_path), env="non_existent", db_type="postgres")
+    with pytest.raises(KeyError, match=r"Section \[sqlite\] not found"):
+        load_db_config(str(sample_ini_path), db_type="sqlite", db_override="test_db")
 
 
 def test_load_db_config_missing_required_key(tmp_path):
     ini_content = """
-[staging.postgres]
+[postgres]
 host = 127.0.0.1
 port = 5432
 user = postgres
@@ -97,12 +218,12 @@ user = postgres
     file_path.write_text(ini_content, encoding="utf-8")
 
     with pytest.raises(KeyError, match="Missing required key 'password'"):
-        load_db_config(str(file_path), env="staging", db_type="postgres")
+        load_db_config(str(file_path), db_type="postgres", db_override="test_db")
 
 
 def test_load_db_config_invalid_port(tmp_path):
     ini_content = """
-[staging.postgres]
+[postgres]
 host = 127.0.0.1
 port = not_a_number
 user = postgres
@@ -113,7 +234,8 @@ database = db
     file_path.write_text(ini_content, encoding="utf-8")
 
     with pytest.raises(ValueError, match="Invalid port value"):
-        load_db_config(str(file_path), env="staging", db_type="postgres")
+        load_db_config(str(file_path), db_type="postgres", db_override="test_db")
+
 
 
 def test_get_connection_postgres_psycopg2(mock_db_config_pg):

@@ -13,7 +13,10 @@ from .tools import (
     apply_knobs_staging,
     benchmark_baseline_staging,
     benchmark_tuned_staging,
+    cleanup_staging_docker,
+    recreate_database_staging,
     restart_database_staging,
+    setup_staging_docker,
     test_database_staging,
 )
 
@@ -25,9 +28,13 @@ __all__ = [
     "KnobCheckerOutput",
     "StagingCheckDetails",
     "StagingTestResults",
-    "apply_knobs_staging",
+    "setup_staging_docker",
     "benchmark_baseline_staging",
-    "benchmark_tuned_staging",
+    "apply_knobs_staging",
     "restart_database_staging",
+    "recreate_database_staging",
     "test_database_staging",
+    "benchmark_tuned_staging",
+    "cleanup_staging_docker",
 ]
+
