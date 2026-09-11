@@ -1,13 +1,11 @@
 [mysql]
 host = 127.0.0.1
-port = 3307
+port = 3308
 user = root
 password = mysql_root_password
-database = smallbank
 
 [postgres]
 host = 127.0.0.1
-port = 5433
+port = 5434
 user = postgres
 password = postgres
-database = smallbank
