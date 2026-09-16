@@ -221,6 +221,7 @@ def test_write_selected_knobs_from_model_output():
         tc = MockToolContext({
             "knob_path": tmpdir,
             "knob_recommender_output": output,
+            "memory_gb": 16.0,
         })
         result = write_selected_knobs(tc)
 

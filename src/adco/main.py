@@ -137,6 +137,12 @@ async def run_pipeline(
     rewriter_state = {}
     sandbox = target_abs
     if mode in ("all", "rewrite-only"):
+        if not intent_output or not isinstance(intent_output, dict) or not intent_output.get("optimization_targets"):
+            raise RuntimeError(
+                "Intent analyzer returned no output or no optimization_targets. "
+                "The pipeline cannot proceed to code rewriting without intent context. "
+                f"Target: {target}"
+            )
         rewriter_extra_state: dict[str, Any] = {
             "intent_output": intent_output,
             "intent_extractor_output": intent_output,

@@ -95,6 +95,7 @@ def test_run_pipeline_success_with_tuning(mock_tuner, mock_rewriter, mock_intent
         "intent_output": {
             "queries": "SELECT * FROM users JOIN orders",
             "orm": "Peewee",
+            "optimization_targets": [{"file": "main.py", "description": "Optimize JOIN query"}],
             "workload": {
                 "query_types": ["SELECT", "JOIN"],
                 "orm_detected": "Peewee",
@@ -197,10 +198,14 @@ def test_run_pipeline_rewrite_only(mock_tuner, mock_rewriter, mock_intent, tmp_p
     intent_out = tmp_path / "intent.json"
     rewriter_out = tmp_path / "rewriter.json"
 
-    intent_out.write_text(json.dumps({"intent_output": {}}))
+    intent_out.write_text(json.dumps({"intent_output": {"optimization_targets": [{"file": "main.py"}]}}))
     rewriter_out.write_text(json.dumps({"status": "PASS", "sandbox": str(sandbox_dir)}))
 
-    mock_intent.return_value = {"intent_output": {}}
+    mock_intent.return_value = {
+        "intent_output": {
+            "optimization_targets": [{"file": "main.py", "description": "Optimize query"}]
+        }
+    }
     mock_rewriter.return_value = {
         "verifier_output": {"status": "PASS"},
         "sandbox": str(sandbox_dir),
@@ -235,7 +240,11 @@ def test_run_pipeline_rewriter_fail_fast(mock_rewriter, mock_intent, tmp_path):
     target_dir = tmp_path / "app"
     target_dir.mkdir()
 
-    mock_intent.return_value = {"intent_output": {}}
+    mock_intent.return_value = {
+        "intent_output": {
+            "optimization_targets": [{"file": "main.py", "description": "Optimize query"}]
+        }
+    }
     mock_rewriter.return_value = {
         "verifier_output": {
             "status": "FAIL",
@@ -253,6 +262,24 @@ def test_run_pipeline_rewriter_fail_fast(mock_rewriter, mock_intent, tmp_path):
         )
 
     assert "Code rewriter FAILED" in str(exc_info.value)
+
+
+@patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)
+def test_run_pipeline_intent_fail_fast(mock_intent, tmp_path):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+
+    mock_intent.return_value = {"intent_output": {}}
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(
+            run_pipeline(
+                target=str(target_dir),
+                db_name="testdb",
+            )
+        )
+
+    assert "Intent analyzer returned no output or no optimization_targets" in str(exc_info.value)
 
 
 @patch("src.adco.main.run_pipeline", new_callable=AsyncMock)

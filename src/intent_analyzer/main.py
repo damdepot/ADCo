@@ -128,6 +128,11 @@ async def run_pipeline(
     # Extract intent results
     intent_raw = final_state.get("intent_extractor_output") or {}
     intent_parsed = _maybe_parse(intent_raw)
+    if not intent_parsed or not isinstance(intent_parsed, dict):
+        raise RuntimeError(
+            f"Intent extractor produced no structured output for target: {target_abs}. "
+            "Ensure the target codebase contains database interaction code and is accessible."
+        )
     final_state["intent_output"] = intent_parsed
 
     if isinstance(intent_parsed, dict) and "workload" in intent_parsed:
