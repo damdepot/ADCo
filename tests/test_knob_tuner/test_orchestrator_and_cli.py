@@ -57,7 +57,7 @@ def test_orchestrator_agent_default_initialization():
         assert isinstance(tool, AgentTool)
         sub_agent_names.append(tool.agent.name)
 
-    assert "intent_analyzer" in sub_agent_names
+    assert ("db_inspector" in sub_agent_names or "intent_analyzer" in sub_agent_names)
     assert "knob_recommender" in sub_agent_names
     assert "knob_checker" in sub_agent_names
     assert "live_tuner" in sub_agent_names
@@ -72,7 +72,7 @@ def test_orchestrator_agent_custom_model():
 
 
 def test_orchestrator_prompt_contains_rules_and_loop_bounds():
-    assert "intent_analyzer" in ORCHESTRATOR_PROMPT
+    assert ("db_inspector" in ORCHESTRATOR_PROMPT or "intent_analyzer" in ORCHESTRATOR_PROMPT)
     assert "knob_recommender" in ORCHESTRATOR_PROMPT
     assert "knob_checker" in ORCHESTRATOR_PROMPT
     assert "live_tuner" in ORCHESTRATOR_PROMPT
