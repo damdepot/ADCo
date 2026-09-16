@@ -37,7 +37,7 @@ services:
     <<: *mysql-base
     container_name: adco-mysql-production
     ports:
-      - "3307:3306"
+      - "3306:3306"
     volumes:
       - mysql_production_data:/var/lib/mysql
       - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
@@ -67,7 +67,7 @@ services:
     <<: *postgres-base
     container_name: adco-postgres-production
     ports:
-      - "5433:5432"
+      - "5432:5432"
     volumes:
       - postgres_production_data:/var/lib/postgresql/data
       - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
