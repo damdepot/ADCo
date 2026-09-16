@@ -7,7 +7,7 @@ from src.code_rewriter.sub_agents.intent_extractor import tools
 from src.code_rewriter.sub_agents.intent_extractor import prompt
 
 
-def create_intent_extractor_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_intent_extractor_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     return LlmAgent(
         name="intent_extractor",
         model=model,

@@ -17,7 +17,7 @@ _CODE_OPTIMIZER_RETRY_CONFIG = RetryConfig(
 )
 
 
-def create_code_optimizer_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_code_optimizer_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     return LlmAgent(
         name="code_optimizer",
         model=model,

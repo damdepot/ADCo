@@ -30,7 +30,7 @@ targets and structured database workload characteristics.
 """
 
 
-def create_intent_analyzer_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_intent_analyzer_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     """Create and return the root intent analyzer LlmAgent."""
     return LlmAgent(
         name="intent_analyzer",
@@ -45,6 +45,6 @@ def create_intent_analyzer_agent(model: str = "gemini-3.5-flash-lite") -> LlmAge
     )
 
 
-def create_root_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_root_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     """Alias for create_intent_analyzer_agent for consistency."""
     return create_intent_analyzer_agent(model)

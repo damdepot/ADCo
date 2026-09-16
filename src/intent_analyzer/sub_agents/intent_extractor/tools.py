@@ -34,5 +34,5 @@ def read_selected_files(tool_context: ToolContext) -> str:
     contents = read_files(target, list(selected))
     if not contents:
         return "ERROR: no files could be read"
-    parts = [f"=== {path} ===\n{content[:4000]}" for path, content in contents.items()]
+    parts = [f"=== {path} ===\n{content[:128000]}" for path, content in contents.items()]
     return "\n\n".join(parts)

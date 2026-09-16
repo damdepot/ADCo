@@ -7,7 +7,7 @@ from src.knob_tuner.sub_agents.knob_checker import prompt, tools
 from src.knob_tuner.sub_agents.knob_checker.models import KnobCheckerOutput
 
 
-def create_knob_checker_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_knob_checker_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     """Create and return the knob checker LlmAgent."""
     return LlmAgent(
         name="knob_checker",

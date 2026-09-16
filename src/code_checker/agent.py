@@ -8,7 +8,7 @@ from src.code_checker.models import CheckerOutput
 from src.code_checker import prompt
 
 
-def create_checker_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_checker_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     return LlmAgent(
         name="adco_checker",
         model=model,

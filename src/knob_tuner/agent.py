@@ -66,7 +66,7 @@ The maximum allowed total attempts is 4 (1 initial attempt + up to 3 retries):
 """
 
 
-def create_root_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_root_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     """Create and return the root orchestrator LlmAgent for knob_tuner."""
     return LlmAgent(
         name="knob_tuner",

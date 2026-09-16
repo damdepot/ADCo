@@ -7,7 +7,7 @@ from src.knob_tuner.sub_agents.db_inspector import prompt, tools
 from src.knob_tuner.sub_agents.db_inspector.models import DbInspectorOutput
 
 
-def create_db_inspector_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_db_inspector_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     """Create and return the db_inspector LlmAgent."""
     return LlmAgent(
         name="db_inspector",

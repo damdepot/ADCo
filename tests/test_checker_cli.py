@@ -56,7 +56,7 @@ def test_build_parser():
     args = parser.parse_args(["/tmp/sandbox"])
     assert args.sandbox_dir == "/tmp/sandbox"
     assert args.original == ""
-    assert args.model == "gemini-3.5-flash-lite"
+    assert args.model == "gemini-3.5-flash"
     assert args.log_file == "logs/code_checker.log"
     assert args.output_path == "out/code_checker/result.json"
     assert args.verbose is False

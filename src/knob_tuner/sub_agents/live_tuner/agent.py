@@ -7,7 +7,7 @@ from src.knob_tuner.sub_agents.live_tuner import prompt, tools
 from src.knob_tuner.sub_agents.live_tuner.models import LiveTunerOutput
 
 
-def create_live_tuner_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_live_tuner_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     """Create and return the live tuner LlmAgent."""
     return LlmAgent(
         name="live_tuner",

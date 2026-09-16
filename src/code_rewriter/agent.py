@@ -80,7 +80,7 @@ Stop when the verifier returns PASS, or after 3 total code_optimizer attempts
 """
 
 
-def create_root_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_root_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     return LlmAgent(
         name="adco_rewriter",
         model=model,

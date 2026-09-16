@@ -47,7 +47,7 @@ def test_orchestrator_agent_default_initialization():
     agent = create_root_agent()
     assert isinstance(agent, LlmAgent)
     assert agent.name == "knob_tuner"
-    assert agent.model == "gemini-3.5-flash-lite"
+    assert agent.model == "gemini-3.5-flash"
     assert "ADCo Knob Tuner Orchestrator" in agent.instruction
     assert len(agent.tools) == 4
 
@@ -98,7 +98,7 @@ def test_cli_parser_defaults():
     args = parser.parse_args(["/tmp/target_app", "--db-name", "test_db"])
     assert args.db_name == "test_db"
     assert args.target == "/tmp/target_app"
-    assert args.model == "gemini-3.5-flash-lite"
+    assert args.model == "gemini-3.5-flash"
     assert args.db_type == "postgres"
     assert args.cpu_cores == "auto"
     assert args.memory == "auto"
@@ -412,7 +412,7 @@ def test_run_pipeline_mocked(tmp_path: Path):
             run_pipeline(
                 target=str(target_dir),
                 db_name="custom_db",
-                model="gemini-3.5-flash-lite",
+                model="gemini-3.5-flash",
                 db_type="postgres",
                 cpu_cores_arg=2,
                 memory_arg=4.0,
@@ -562,7 +562,7 @@ def test_run_pipeline_orphan_cleanup_called(tmp_path: Path):
                 run_pipeline(
                     target=str(target_dir),
                     db_name="custom_db",
-                    model="gemini-3.5-flash-lite",
+                    model="gemini-3.5-flash",
                     db_type="postgres",
                     output_path=str(tmp_path / "res.json"),
                     log_file=str(tmp_path / "log.log"),
@@ -595,7 +595,7 @@ def test_run_pipeline_orphan_cleanup_skipped(tmp_path: Path):
                 run_pipeline(
                     target=str(target_dir),
                     db_name="custom_db",
-                    model="gemini-3.5-flash-lite",
+                    model="gemini-3.5-flash",
                     db_type="postgres",
                     output_path=str(tmp_path / "res.json"),
                     log_file=str(tmp_path / "log.log"),
@@ -621,7 +621,7 @@ def test_run_pipeline_exception_triggers_cleanup(tmp_path: Path):
                 run_pipeline(
                     target=str(target_dir),
                     db_name="custom_db",
-                    model="gemini-3.5-flash-lite",
+                    model="gemini-3.5-flash",
                     db_type="postgres",
                     output_path=str(tmp_path / "res.json"),
                     log_file=str(tmp_path / "log.log"),

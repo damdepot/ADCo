@@ -7,7 +7,7 @@ from src.knob_tuner.sub_agents.intent_analyzer import prompt, tools
 from src.knob_tuner.sub_agents.intent_analyzer.models import IntentAnalyzerOutput
 
 
-def create_intent_analyzer_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_intent_analyzer_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
     """Create and return the intent analyzer LlmAgent."""
     return LlmAgent(
         name="intent_analyzer",

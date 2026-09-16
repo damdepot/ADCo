@@ -26,7 +26,7 @@ from src.intent_analyzer.main import run_pipeline as run_intent_analyzer
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
-DEFAULT_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_MODEL = "gemini-3.5-flash"
 
 
 def _maybe_parse(value: Any) -> Any:
