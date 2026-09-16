@@ -32,6 +32,7 @@ from src.knob_tuner.tools.docker_tools import (
     stop_staging_db,
     unregister_active_container,
 )
+from src.intent_analyzer.main import run_pipeline as run_intent_analyzer
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
@@ -149,33 +150,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help=f"Gemini model to use for orchestrator and sub-agents (default: {DEFAULT_MODEL})",
+        help=f"Gemini model to use for all agents (default: {DEFAULT_MODEL})",
     )
     parser.add_argument(
         "--db-type",
         choices=["postgres", "mysql"],
         default="postgres",
-        help="Target database engine type (postgres or mysql, default: postgres)",
-    )
-    parser.add_argument(
-        "--cpu-cores",
-        default="auto",
-        help="Number of CPU cores allocated for database (default: auto)",
-    )
-    parser.add_argument(
-        "--memory",
-        default="auto",
-        help="Database memory limit in GB (default: auto)",
+        help="Database engine type: 'postgres' or 'mysql' (default: postgres)",
     )
     parser.add_argument(
         "--db-name",
         required=True,
-        help="Database name to target (required)",
+        help="Database name to connect and optimize",
+    )
+    parser.add_argument(
+        "--cpu-cores",
+        default="auto",
+        help="Number of CPU cores allocated for the target DB or 'auto' (default: auto)",
+    )
+    parser.add_argument(
+        "--memory",
+        default="auto",
+        help="Database memory limit in GB or 'auto' (default: auto)",
     )
     parser.add_argument(
         "--db-config",
         default="db.config",
-        help="Path to database configuration INI file (default: db.config)",
+        help="Path to database connection config INI file (default: db.config)",
     )
     parser.add_argument(
         "--production-db",
@@ -205,11 +206,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Simulate tuning process without applying modifications to live database",
     )
     parser.add_argument(
-        "--verbose",
-        "-v",
+        "--verbose", "-v",
         action="store_true",
-        default=False,
-        help="Print detailed execution progress and sub-agent events",
+        help="Print detailed progress of each pipeline step",
     )
     parser.add_argument(
         "--no-cleanup-orphans",
@@ -232,7 +231,7 @@ def build_initial_state(
     knob_path: str,
     output_path: str,
     dry_run: bool,
-    db_name: str,
+    db_name: str = "",
 ) -> dict[str, Any]:
     """Construct initial state dictionary for the knob tuner session."""
     env = "production" if production_db else "staging"
@@ -254,6 +253,8 @@ def build_initial_state(
         "output_path": output_path,
         "dry_run": dry_run,
         "retry_count": 0,
+        "validation_attempt_count": 0,
+        "max_validation_attempts": 4,
     }
 
     if os.path.isfile(db_config_path):
@@ -280,19 +281,34 @@ def _write_output_result(output_path: str, state: dict[str, Any]) -> None:
     """Serialize and write final tuning outcome to the output path."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
+    db_inspector_out = _maybe_parse(state.get("db_inspector_output", state.get("intent_analyzer_output", {})))
+    recommender_out = _maybe_parse(state.get("knob_recommender_output", {}))
+    checker_out = _maybe_parse(state.get("knob_checker_output", {}))
+    live_out = _maybe_parse(state.get("live_tuner_output", {}))
+
     result_data = {
         "timestamp": datetime.datetime.now().isoformat(),
         "target": state.get("target"),
         "db_type": state.get("db_type"),
+        "db_name": state.get("db_name"),
         "cpu_cores": state.get("cpu_cores"),
         "memory_gb": state.get("memory_gb"),
         "production_db": state.get("production_db", False),
         "dry_run": state.get("dry_run", False),
         "staging_validated": state.get("staging_validated", False),
-        "intent_analyzer_output": _maybe_parse(state.get("intent_analyzer_output")),
-        "knob_recommender_output": _maybe_parse(state.get("knob_recommender_output")),
-        "knob_checker_output": _maybe_parse(state.get("knob_checker_output")),
-        "live_tuner_output": _maybe_parse(state.get("live_tuner_output")),
+        "status": checker_out.get("status", "UNKNOWN"),
+        "validation_attempt_count": state.get("validation_attempt_count", 0),
+        "intent_analyzer_output": db_inspector_out,
+        "knob_recommender_output": recommender_out,
+        "knob_checker_output": checker_out,
+        "live_tuner_output": live_out,
+        "outputs": {
+            "db_inspector": db_inspector_out,
+            "intent_analyzer": db_inspector_out,
+            "knob_recommender": recommender_out,
+            "knob_checker": checker_out,
+            "live_tuner": live_out,
+        },
     }
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -314,6 +330,7 @@ async def run_pipeline(
     verbose: bool = False,
     cleanup_orphans: bool = True,
     db_name: str = "",
+    extra_initial_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using Google ADK Runner and session service."""
     register_cleanup_handlers()
@@ -343,10 +360,6 @@ async def run_pipeline(
     cpu_cores = _parse_cpu_cores(cpu_cores_arg)
     memory_gb = _parse_memory(memory_arg)
 
-    session_service = InMemorySessionService()
-    sid = uuid.uuid4().hex[:12]
-    app_name = "knob_tuner"
-
     initial_state = build_initial_state(
         target=target_abs,
         db_type=db_type,
@@ -360,6 +373,33 @@ async def run_pipeline(
         dry_run=dry_run,
         db_name=db_name,
     )
+
+    if extra_initial_state:
+        initial_state.update(extra_initial_state)
+
+    # Standalone fallback: If workload_info is not provided in state, run intent_analyzer
+    if "workload_info" not in initial_state and "intent_output" not in initial_state:
+        _log_event(
+            f"Workload info not in state; running intent_analyzer on {target_abs}",
+            log_file=log_file_abs,
+            verbose=verbose,
+        )
+        try:
+            intent_state = await run_intent_analyzer(
+                target=target_abs,
+                model=model,
+                log_file=log_file_abs,
+                verbose=verbose,
+            )
+            workload = intent_state.get("workload_info")
+            if workload:
+                initial_state["workload_info"] = workload
+        except Exception as exc:
+            _log_event(f"Intent analyzer warning: {exc}", log_file=log_file_abs, verbose=verbose)
+
+    session_service = InMemorySessionService()
+    sid = uuid.uuid4().hex[:12]
+    app_name = "knob_tuner"
 
     await session_service.create_session(
         app_name=app_name,
@@ -384,7 +424,7 @@ async def run_pipeline(
         f"- Dry Run: {dry_run}\n"
         f"- Knob Path: {knob_path_abs}\n\n"
         f"Execute the pipeline in order:\n"
-        f"1. Delegate to intent_analyzer to extract schema, current knobs, hardware, and workload patterns.\n"
+        f"1. Delegate to db_inspector to extract schema, current knobs, and hardware capacity.\n"
         f"2. Delegate to knob_recommender to formulate tuned recommendations.\n"
         f"3. Delegate to knob_checker to validate recommendations in staging (loop up to 3 retries / 4 total attempts if FAIL).\n"
         f"4. If knob_checker passes, delegate to live_tuner to apply dynamic knobs to production."
@@ -499,7 +539,6 @@ def main() -> None:
             if sugg:
                 print(f"     Suggestion: {sugg}")
 
-    # Next Steps section
     restart_knobs = (
         live_output.get("restart_required_knobs", [])
         or result.get("prod_restart_required_knobs", [])

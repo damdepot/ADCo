@@ -1,4 +1,3 @@
-"""Alias/forwarder for renamed db_inspector subagent."""
 from src.knob_tuner.sub_agents.db_inspector.agent import (
     create_db_inspector_agent,
     create_intent_analyzer_agent,

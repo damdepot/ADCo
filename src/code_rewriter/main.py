@@ -22,6 +22,7 @@ from google.genai import types
 from src.code_rewriter.agent import create_root_agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from src.intent_analyzer.main import run_pipeline as run_intent_analyzer
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
@@ -104,8 +105,9 @@ def _write_output_result(output_path: str, state: dict[str, Any], model: str = "
         "status": _maybe_parse(state.get("verifier_output")).get("status", "FAIL"),
         "modified_files": state.get("modified_files", []),
         "outputs": {
-            "scan_result": _maybe_parse(state.get("scan_result")),
-            "file_selector_output": _maybe_parse(state.get("file_selector_output")),
+            "scan_result": _maybe_parse(state.get("scan_result", state.get("intent_output", {}))),
+            "file_selector_output": _maybe_parse(state.get("file_selector_output", {})),
+            "intent_output": _maybe_parse(state.get("intent_output")),
             "intent_extractor_output": _maybe_parse(state.get("intent_extractor_output")),
             "code_optimizer_output": _maybe_parse(state.get("code_optimizer_output")),
             "verifier_output": _maybe_parse(state.get("verifier_output")),
@@ -123,6 +125,7 @@ async def run_pipeline(
     output_path: str = "out/code_rewriter/result.json",
     sandbox_dir: str | None = None,
     verbose: bool = False,
+    extra_initial_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
     log_file_abs = os.path.abspath(log_file)
@@ -132,14 +135,34 @@ async def run_pipeline(
     os.makedirs(os.path.dirname(log_file_abs), exist_ok=True)
     os.makedirs(os.path.dirname(output_path_abs), exist_ok=True)
 
-    session_service = InMemorySessionService()
-    sid = uuid.uuid4().hex[:12]
-    app_name = "adco_rewriter"
-
     initial_state = {
         "target": target_abs,
         "sandbox_dir": sandbox_dir_abs,
     }
+    if extra_initial_state:
+        initial_state.update(extra_initial_state)
+
+    # Standalone fallback: If intent has not been extracted, run intent_analyzer first
+    if "intent_extractor_output" not in initial_state and "intent_output" not in initial_state:
+        _log_event(
+            f"Intent not in state; running intent_analyzer on {target_abs}",
+            log_file=log_file_abs,
+            verbose=verbose,
+        )
+        intent_state = await run_intent_analyzer(
+            target=target_abs,
+            model=model,
+            log_file=log_file_abs,
+            verbose=verbose,
+        )
+        intent = intent_state.get("intent_output") or intent_state.get("intent_extractor_output")
+        if intent:
+            initial_state["intent_output"] = intent
+            initial_state["intent_extractor_output"] = intent
+
+    session_service = InMemorySessionService()
+    sid = uuid.uuid4().hex[:12]
+    app_name = "adco_rewriter"
 
     await session_service.create_session(
         app_name=app_name,
@@ -153,9 +176,8 @@ async def run_pipeline(
 
     user_message = (
         f"Optimize the database interaction code in the codebase at: {target_abs}\n\n"
-        f"Follow the pipeline order from your instructions: scan the codebase, "
-        f"delegate to file_selector (pass it the file listing), delegate to "
-        f"intent_extractor, copy_to_sandbox, get_optimization_strategies, "
+        f"The database interaction intent has already been extracted into session state. "
+        f"Follow the pipeline order: copy_to_sandbox, get_optimization_strategies, "
         f"delegate to code_optimizer, then delegate to verifier. Report the "
         f"verifier's verdict when done."
     )
