@@ -5,7 +5,7 @@ from src.intent_analyzer.sub_agents.intent_extractor import prompt, tools
 from src.intent_analyzer.sub_agents.intent_extractor.models import IntentExtractorOutput
 
 
-def create_intent_extractor_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
+def create_intent_extractor_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
     return LlmAgent(
         name="intent_extractor",
         model=model,

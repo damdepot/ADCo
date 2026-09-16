@@ -21,7 +21,7 @@ def test_build_parser():
     assert isinstance(parser, argparse.ArgumentParser)
     args = parser.parse_args(["target_dir"])
     assert args.target == "target_dir"
-    assert args.model == "gemini-3.5-flash"
+    assert args.model == "gemini-3.5-flash-lite"
     assert args.log_file == "logs/code_rewriter.log"
     assert args.output_path == "out/code_rewriter/result.json"
     assert args.sandbox_dir is None

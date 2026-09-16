@@ -20,7 +20,7 @@ from src.intent_analyzer.agent import create_intent_analyzer_agent
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
-DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 
 def _maybe_parse(val: Any) -> Any:
@@ -128,6 +128,33 @@ async def run_pipeline(
     # Extract intent results
     intent_raw = final_state.get("intent_extractor_output") or {}
     intent_parsed = _maybe_parse(intent_raw)
+
+    # If the orchestrator didn't invoke intent_extractor or it produced no output, run it directly
+    if not intent_parsed or not isinstance(intent_parsed, dict) or not intent_parsed.get("optimization_targets"):
+        if "file_selector_output" in final_state:
+            from src.intent_analyzer.sub_agents.intent_extractor.agent import create_intent_extractor_agent
+            ie_agent = create_intent_extractor_agent(model)
+            ie_runner = Runner(agent=ie_agent, app_name=app_name, session_service=session_service)
+            ie_msg = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="Extract database interaction patterns, optimization targets, and workload characteristics from the selected files.")],
+            )
+            async for event in ie_runner.run_async(
+                user_id="pipeline",
+                session_id=sid,
+                new_message=ie_msg,
+            ):
+                if verbose and hasattr(event, "content"):
+                    print(f"[intent_extractor_fallback] {event.content}")
+            session = await session_service.get_session(
+                app_name=app_name,
+                user_id="pipeline",
+                session_id=sid,
+            )
+            final_state = dict(session.state) if session else {}
+            intent_raw = final_state.get("intent_extractor_output") or {}
+            intent_parsed = _maybe_parse(intent_raw)
+
     if not intent_parsed or not isinstance(intent_parsed, dict):
         raise RuntimeError(
             f"Intent extractor produced no structured output for target: {target_abs}. "
@@ -138,15 +165,18 @@ async def run_pipeline(
     if isinstance(intent_parsed, dict) and "workload" in intent_parsed:
         final_state["workload_info"] = intent_parsed["workload"]
 
+    from src.intent_analyzer.models import IntentAnalyzerResult
+    result_obj = IntentAnalyzerResult(
+        timestamp=datetime.datetime.now().isoformat(),
+        target=target_abs,
+        model=model,
+        intent_output=intent_parsed,
+    )
+
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(
-            {
-                "timestamp": datetime.datetime.now().isoformat(),
-                "target": target_abs,
-                "model": model,
-                "intent_output": intent_parsed,
-            },
+            result_obj.model_dump(),
             f,
             indent=2,
             default=str,

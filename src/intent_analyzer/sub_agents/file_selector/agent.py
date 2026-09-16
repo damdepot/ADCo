@@ -5,7 +5,7 @@ from src.intent_analyzer.sub_agents.file_selector.models import FileSelectorOutp
 from src.intent_analyzer.sub_agents.file_selector import prompt
 
 
-def create_file_selector_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
+def create_file_selector_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
     return LlmAgent(
         name="file_selector",
         model=model,

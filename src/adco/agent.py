@@ -44,7 +44,7 @@ Delegate to `knob_tuner`:
 """
 
 
-def create_orchestrator_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
+def create_orchestrator_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
     return LlmAgent(
         name="adco_orchestrator",
         model=model,

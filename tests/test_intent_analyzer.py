@@ -15,21 +15,21 @@ from src.intent_analyzer.tools.scanner import scan_directory, scan_codebase
 
 
 def test_agent_creation():
-    agent = create_intent_analyzer_agent("gemini-3.5-flash")
+    agent = create_intent_analyzer_agent("gemini-3.5-flash-lite")
     assert agent.name == "intent_analyzer"
-    assert agent.model == "gemini-3.5-flash"
+    assert agent.model == "gemini-3.5-flash-lite"
     assert len(agent.tools) == 3
 
     root_agent = create_root_agent()
     assert root_agent.name == "intent_analyzer"
-    assert root_agent.model == "gemini-3.5-flash"
+    assert root_agent.model == "gemini-3.5-flash-lite"
 
 
 def test_subagent_creation():
-    fs_agent = create_file_selector_agent("gemini-3.5-flash")
+    fs_agent = create_file_selector_agent("gemini-3.5-flash-lite")
     assert fs_agent.name == "file_selector"
 
-    ie_agent = create_intent_extractor_agent("gemini-3.5-flash")
+    ie_agent = create_intent_extractor_agent("gemini-3.5-flash-lite")
     assert ie_agent.name == "intent_extractor"
 
 

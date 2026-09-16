@@ -18,7 +18,7 @@ from src.knob_tuner.main import run_pipeline as tuner_pipeline
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
-DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -137,12 +137,38 @@ async def run_pipeline(
     rewriter_state = {}
     sandbox = target_abs
     if mode in ("all", "rewrite-only"):
-        if not intent_output or not isinstance(intent_output, dict) or not intent_output.get("optimization_targets"):
+        if not intent_output or not isinstance(intent_output, dict):
             raise RuntimeError(
                 "Intent analyzer returned no output or no optimization_targets. "
                 "The pipeline cannot proceed to code rewriting without intent context. "
                 f"Target: {target}"
             )
+        if not intent_output.get("optimization_targets"):
+            fs_out = intent_state.get("file_selector_output", {})
+            selected_files = []
+            if hasattr(fs_out, "files"):
+                selected_files = list(fs_out.files)
+            elif isinstance(fs_out, dict):
+                selected_files = fs_out.get("files", [])
+            elif isinstance(fs_out, str):
+                try:
+                    parsed_fs = json.loads(fs_out)
+                    if isinstance(parsed_fs, dict):
+                        selected_files = parsed_fs.get("files", [])
+                except Exception:
+                    pass
+
+            if selected_files:
+                intent_output["optimization_targets"] = [
+                    {"file": f, "description": "Database interaction file to inspect and optimize"}
+                    for f in selected_files
+                ]
+            else:
+                raise RuntimeError(
+                    "Intent analyzer returned no output or no optimization_targets. "
+                    "The pipeline cannot proceed to code rewriting without intent context. "
+                    f"Target: {target}"
+                )
         rewriter_extra_state: dict[str, Any] = {
             "intent_output": intent_output,
             "intent_extractor_output": intent_output,

@@ -101,10 +101,21 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
               then try reasonable defaults if the app requires arguments.
     """
     sandbox = tool_context.state.get("sandbox", "") if tool_context else ""
+    entry = ""
     if tool_context:
-        entry = tool_context.state.get("file_selector_output", {}).get("entry_point", "")
-    else:
-        entry = ""
+        fs_out = tool_context.state.get("file_selector_output", {})
+        if hasattr(fs_out, "entry_point"):
+            entry = fs_out.entry_point or ""
+        elif isinstance(fs_out, str):
+            try:
+                import json
+                parsed = json.loads(fs_out)
+                if isinstance(parsed, dict):
+                    entry = parsed.get("entry_point", "")
+            except Exception:
+                pass
+        elif isinstance(fs_out, dict):
+            entry = fs_out.get("entry_point", "")
 
     if not entry:
         return "ERROR: no entry point"

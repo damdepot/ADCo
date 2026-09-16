@@ -7,7 +7,7 @@ from src.knob_tuner.sub_agents.knob_recommender import prompt, tools
 from src.knob_tuner.sub_agents.knob_recommender.models import KnobRecommenderOutput
 
 
-def create_knob_recommender_agent(model: str = "gemini-3.5-flash") -> LlmAgent:
+def create_knob_recommender_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
     """Create and return the knob recommender LlmAgent."""
     return LlmAgent(
         name="knob_recommender",

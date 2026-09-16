@@ -68,7 +68,7 @@ def test_build_parser_custom_options():
 def test_create_orchestrator_agent():
     agent = create_orchestrator_agent()
     assert agent.name == "adco_orchestrator"
-    assert agent.model == "gemini-3.5-flash"
+    assert agent.model == "gemini-3.5-flash-lite"
     assert len(agent.tools) == 3
 
 
@@ -118,7 +118,7 @@ def test_run_pipeline_success_with_tuning(mock_tuner, mock_rewriter, mock_intent
     res = asyncio.run(
         run_pipeline(
             target=str(target_dir),
-            model="gemini-3.5-flash",
+            model="gemini-3.5-flash-lite",
             log_file=str(log_file),
             output_path=str(out_file),
             intent_output_path=str(intent_out),
@@ -214,7 +214,7 @@ def test_run_pipeline_rewrite_only(mock_tuner, mock_rewriter, mock_intent, tmp_p
     res = asyncio.run(
         run_pipeline(
             target=str(target_dir),
-            model="gemini-3.5-flash",
+            model="gemini-3.5-flash-lite",
             mode="rewrite-only",
             log_file=str(log_file),
             output_path=str(out_file),
