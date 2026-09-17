@@ -21,6 +21,7 @@ from typing import Any
 from dotenv import load_dotenv
 from google.genai import types
 
+from google.adk.models import Gemini
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from src.knob_tuner.agent import create_root_agent
@@ -408,7 +409,12 @@ async def run_pipeline(
         state=initial_state,
     )
 
-    agent = create_root_agent(model=model)
+    if isinstance(model, str):
+        resilient_model = Gemini(model=model, retry_options=types.HttpRetryOptions(initial_delay=1, attempts=5, exp_base=2))
+    else:
+        resilient_model = model
+    
+    agent = create_root_agent(model=resilient_model)
     runner = Runner(agent=agent, app_name=app_name, session_service=session_service)
 
     env_name = "production" if production_db else "staging"

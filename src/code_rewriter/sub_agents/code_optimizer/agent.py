@@ -1,5 +1,9 @@
 """Code optimizer LlmAgent — applies rewrite strategies to optimize code using file tools."""
 
+import asyncio
+from typing import Union
+from google.adk.models import BaseLlm
+
 from google.adk.agents import LlmAgent
 from google.adk.workflow._retry_config import RetryConfig
 from google.genai import types
@@ -18,10 +22,16 @@ _CODE_OPTIMIZER_RETRY_CONFIG = RetryConfig(
 )
 
 
-def create_code_optimizer_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+    """Add a small buffer time before back-to-back LLM calls to prevent rate limiting."""
+    await asyncio.sleep(3)
+
+
+def create_code_optimizer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
     return LlmAgent(
         name="code_optimizer",
         model=model,
+        before_model_callback=buffer_callback,
         instruction=prompt.CODE_OPTIMIZER_AGENT_PROMPT,
         description="Optimizes database interaction code using rewrite strategies. Reads files from sandbox, writes optimized versions.",
         tools=[tools.read_file, tools.write_file, tools.list_sandbox, tools.get_optimization_context],

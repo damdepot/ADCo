@@ -1,19 +1,29 @@
 """db_inspector sub-agent — inspects live DB schema, parameters, and synthesizes with workload."""
 
+import asyncio
+from typing import Union
+
 from google.adk.agents import LlmAgent
+from google.adk.models import BaseLlm
 from google.genai import types
 
 from src.knob_tuner.sub_agents.db_inspector import prompt, tools
 from src.knob_tuner.sub_agents.db_inspector.models import DbInspectorOutput
 
 
-def create_db_inspector_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+    """Add a small buffer time before back-to-back LLM calls to prevent rate limiting."""
+    await asyncio.sleep(3)
+
+
+def create_db_inspector_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
     """Create and return the db_inspector LlmAgent."""
     return LlmAgent(
         name="db_inspector",
         model=model,
         instruction=prompt.DB_INSPECTOR_PROMPT,
         description="Inspects live database schema and parameters, saving knobs context for recommendation.",
+        before_model_callback=buffer_callback,
         tools=[
             tools.check_schema,
             tools.extract_knobs,

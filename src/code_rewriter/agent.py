@@ -1,5 +1,9 @@
 """Root orchestrator agent — coordinates the ADCo rewriter pipeline via ADK sub-agents."""
 
+import asyncio
+from typing import Union
+from google.adk.models import BaseLlm
+
 from google.adk.agents import LlmAgent
 from google.adk.tools.agent_tool import AgentTool
 
@@ -80,10 +84,16 @@ Stop when the verifier returns PASS, or after 3 total code_optimizer attempts
 """
 
 
-def create_root_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+    """Add a small buffer time before back-to-back LLM calls to prevent rate limiting."""
+    await asyncio.sleep(3)
+
+
+def create_root_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
     return LlmAgent(
         name="adco_rewriter",
         model=model,
+        before_model_callback=buffer_callback,
         instruction=ROOT_PROMPT,
         description="ADCo rewriter orchestrator — coordinates sandbox creation, optimization strategies, code optimization, and verification sub-agents.",
         tools=[
