@@ -1,5 +1,9 @@
 """Root orchestrator agent for the intent analyzer module."""
+import asyncio
+from typing import Union
+
 from google.adk.agents import LlmAgent
+from google.adk.models import BaseLlm
 from google.adk.tools.agent_tool import AgentTool
 
 from src.intent_analyzer.sub_agents.file_selector.agent import create_file_selector_agent
@@ -40,7 +44,11 @@ INTENT_ANALYZER_PROMPT = """You are the ADCo Codebase Intent Analyzer Orchestrat
 """
 
 
-def create_intent_analyzer_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+async def buffer_callback(ctx, req):
+    await asyncio.sleep(3)
+
+
+def create_intent_analyzer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
     """Create and return the root intent analyzer LlmAgent."""
     return LlmAgent(
         name="intent_analyzer",
@@ -52,9 +60,10 @@ def create_intent_analyzer_agent(model: str = "gemini-3.5-flash-lite") -> LlmAge
             AgentTool(create_file_selector_agent(model)),
             AgentTool(create_intent_extractor_agent(model)),
         ],
+        before_model_callback=buffer_callback,
     )
 
 
-def create_root_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_root_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
     """Alias for create_intent_analyzer_agent for consistency."""
     return create_intent_analyzer_agent(model)

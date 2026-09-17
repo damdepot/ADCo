@@ -12,6 +12,7 @@ import uuid
 from typing import Any
 
 from dotenv import load_dotenv
+from google.adk.models import Gemini
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
@@ -95,7 +96,11 @@ async def run_pipeline(
         state=initial_state,
     )
 
-    agent = create_intent_analyzer_agent(model)
+    resilient_model = Gemini(
+        model=model,
+        retry_options=types.HttpRetryOptions(initial_delay=1, attempts=5, multiplier=2)
+    )
+    agent = create_intent_analyzer_agent(resilient_model)
     runner = Runner(agent=agent, app_name=app_name, session_service=session_service)
 
     msg = (
@@ -133,7 +138,7 @@ async def run_pipeline(
     if not intent_parsed or not isinstance(intent_parsed, dict) or not intent_parsed.get("optimization_targets"):
         if "file_selector_output" in final_state:
             from src.intent_analyzer.sub_agents.intent_extractor.agent import create_intent_extractor_agent
-            ie_agent = create_intent_extractor_agent(model)
+            ie_agent = create_intent_extractor_agent(resilient_model)
             ie_runner = Runner(agent=ie_agent, app_name=app_name, session_service=session_service)
             ie_msg = types.Content(
                 role="user",
