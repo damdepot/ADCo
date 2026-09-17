@@ -44,7 +44,8 @@ INTENT_ANALYZER_PROMPT = """You are the ADCo Codebase Intent Analyzer Orchestrat
 """
 
 
-async def buffer_callback(ctx, req):
+async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+    """Add a small buffer time before back-to-back LLM calls to prevent rate limiting."""
     await asyncio.sleep(3)
 
 

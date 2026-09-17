@@ -98,7 +98,7 @@ async def run_pipeline(
 
     resilient_model = Gemini(
         model=model,
-        retry_options=types.HttpRetryOptions(initial_delay=1, attempts=5, multiplier=2)
+        retry_options=types.HttpRetryOptions(initial_delay=1, attempts=5, exp_base=2)
     )
     agent = create_intent_analyzer_agent(resilient_model)
     runner = Runner(agent=agent, app_name=app_name, session_service=session_service)

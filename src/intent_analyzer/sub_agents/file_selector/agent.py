@@ -9,7 +9,8 @@ from src.intent_analyzer.sub_agents.file_selector.models import FileSelectorOutp
 from src.intent_analyzer.sub_agents.file_selector import prompt
 
 
-async def buffer_callback(ctx, req):
+async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+    """Add a small buffer time before back-to-back LLM calls to prevent rate limiting."""
     await asyncio.sleep(3)
 
 
