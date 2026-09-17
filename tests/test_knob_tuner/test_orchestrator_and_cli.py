@@ -63,6 +63,16 @@ def test_orchestrator_agent_default_initialization():
     assert "live_tuner" in sub_agent_names
 
 
+
+def test_create_root_agent_buffer_time():
+    import asyncio
+    agent_default = create_root_agent()
+    assert agent_default.before_model_callback is None
+    
+    agent_buffer = create_root_agent(buffer_time=1.5)
+    assert callable(agent_buffer.before_model_callback)
+    assert asyncio.iscoroutinefunction(agent_buffer.before_model_callback)
+
 def test_orchestrator_agent_custom_model():
     agent = create_root_agent(model="gemini-1.5-pro")
     assert agent.model == "gemini-1.5-pro"
@@ -110,6 +120,7 @@ def test_cli_parser_defaults():
     assert args.dry_run is False
     assert args.verbose is False
     assert args.cleanup_orphans is True
+    assert args.buffer_time == 0.0
 
 
 def test_cli_parser_custom_args():
@@ -130,6 +141,7 @@ def test_cli_parser_custom_args():
         "--dry-run",
         "-v",
         "--no-cleanup-orphans",
+        "--buffer-time", "1.5",
     ])
     assert args.target == "/my/codebase"
     assert args.db_name == "custom_db"
@@ -146,6 +158,7 @@ def test_cli_parser_custom_args():
     assert args.dry_run is True
     assert args.verbose is True
     assert args.cleanup_orphans is False
+    assert args.buffer_time == 1.5
 
 
 def test_parse_cpu_cores():

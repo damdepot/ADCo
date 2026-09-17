@@ -44,12 +44,15 @@ INTENT_ANALYZER_PROMPT = """You are the ADCo Codebase Intent Analyzer Orchestrat
 """
 
 
-async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
-    """Add a small buffer time before back-to-back LLM calls to prevent rate limiting."""
-    await asyncio.sleep(3)
+def make_buffer_callback(buffer_time: float = 0.0):
+    if buffer_time <= 0:
+        return None
+    async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+        await asyncio.sleep(buffer_time)
+    return buffer_callback
 
 
-def create_intent_analyzer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_intent_analyzer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite", buffer_time: float = 0.0) -> LlmAgent:
     """Create and return the root intent analyzer LlmAgent."""
     return LlmAgent(
         name="intent_analyzer",
@@ -58,13 +61,13 @@ def create_intent_analyzer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-
         description="ADCo codebase intent analyzer — scans codebase, selects DB files, and extracts optimization targets and workload profile.",
         tools=[
             scan_codebase,
-            AgentTool(create_file_selector_agent(model)),
-            AgentTool(create_intent_extractor_agent(model)),
+            AgentTool(create_file_selector_agent(model, buffer_time=buffer_time)),
+            AgentTool(create_intent_extractor_agent(model, buffer_time=buffer_time)),
         ],
-        before_model_callback=buffer_callback,
+        before_model_callback=make_buffer_callback(buffer_time),
     )
 
 
-def create_root_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_root_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite", buffer_time: float = 0.0) -> LlmAgent:
     """Alias for create_intent_analyzer_agent for consistency."""
-    return create_intent_analyzer_agent(model)
+    return create_intent_analyzer_agent(model, buffer_time=buffer_time)

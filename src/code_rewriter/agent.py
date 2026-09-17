@@ -84,22 +84,25 @@ Stop when the verifier returns PASS, or after 3 total code_optimizer attempts
 """
 
 
-async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
-    """Add a small buffer time before back-to-back LLM calls to prevent rate limiting."""
-    await asyncio.sleep(3)
+def make_buffer_callback(buffer_time: float = 0.0):
+    if buffer_time <= 0:
+        return None
+    async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+        await asyncio.sleep(buffer_time)
+    return buffer_callback
 
 
-def create_root_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_root_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite", buffer_time: float = 0.0) -> LlmAgent:
     return LlmAgent(
         name="adco_rewriter",
         model=model,
-        before_model_callback=buffer_callback,
+        before_model_callback=make_buffer_callback(buffer_time),
         instruction=ROOT_PROMPT,
         description="ADCo rewriter orchestrator — coordinates sandbox creation, optimization strategies, code optimization, and verification sub-agents.",
         tools=[
             copy_to_sandbox,
             get_optimization_strategies,
-            AgentTool(create_code_optimizer_agent(model)),
-            AgentTool(create_verifier_agent(model)),
+            AgentTool(create_code_optimizer_agent(model, buffer_time=buffer_time)),
+            AgentTool(create_verifier_agent(model, buffer_time=buffer_time)),
         ],
     )

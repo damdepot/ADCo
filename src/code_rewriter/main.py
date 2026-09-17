@@ -87,6 +87,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to write the output project into (skips sandbox-id sub-dir)",
     )
     parser.add_argument(
+        "--buffer-time",
+        type=float,
+        default=0.0,
+        help="Buffer sleep time in seconds before each LLM call (default: 0.0)",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Print detailed progress of each pipeline step",
@@ -127,6 +133,7 @@ async def run_pipeline(
     sandbox_dir: str | None = None,
     verbose: bool = False,
     extra_initial_state: dict[str, Any] | None = None,
+    buffer_time: float = 0.0,
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
     log_file_abs = os.path.abspath(log_file)
@@ -177,7 +184,7 @@ async def run_pipeline(
     else:
         resilient_model = model
 
-    agent = create_root_agent(resilient_model)
+    agent = create_root_agent(resilient_model, buffer_time=buffer_time)
     runner = Runner(agent=agent, app_name=app_name, session_service=session_service)
 
     user_message = (
@@ -244,6 +251,7 @@ def main() -> None:
             output_path=args.output_path,
             sandbox_dir=args.sandbox_dir,
             verbose=args.verbose,
+            buffer_time=getattr(args, "buffer_time", 0.0),
         ))
     except Exception as exc:
         print(f"\n=== Pipeline FAILED ===\nError: {exc}", file=sys.stderr)

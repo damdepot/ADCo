@@ -26,11 +26,13 @@ def test_build_parser():
     assert args.output_path == "out/code_rewriter/result.json"
     assert args.sandbox_dir is None
     assert args.verbose is False
+    assert args.buffer_time == 0.0
 
-    args = parser.parse_args(["target_dir", "--model", "test-model", "-v", "--sandbox-dir", "sbx"])
+    args = parser.parse_args(["target_dir", "--model", "test-model", "-v", "--sandbox-dir", "sbx", "--buffer-time", "1.5"])
     assert args.model == "test-model"
     assert args.sandbox_dir == "sbx"
     assert args.verbose is True
+    assert args.buffer_time == 1.5
 
 
 def test_maybe_parse():

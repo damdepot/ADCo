@@ -70,23 +70,26 @@ The maximum allowed total attempts is 4 (1 initial attempt + up to 3 retries):
 """
 
 
-async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
-    """Add a small buffer time before back-to-back LLM calls to prevent rate limiting."""
-    await asyncio.sleep(3)
+def make_buffer_callback(buffer_time: float = 0.0):
+    if buffer_time <= 0:
+        return None
+    async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+        await asyncio.sleep(buffer_time)
+    return buffer_callback
 
 
-def create_root_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_root_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite", buffer_time: float = 0.0) -> LlmAgent:
     """Create and return the root orchestrator LlmAgent for knob_tuner."""
     return LlmAgent(
         name="knob_tuner",
         model=model,
         instruction=ORCHESTRATOR_PROMPT,
         description="ADCo knob tuner root orchestrator — coordinates database inspection, knob recommendation, staging validation, and live tuning sub-agents.",
-        before_model_callback=buffer_callback,
+        before_model_callback=make_buffer_callback(buffer_time),
         tools=[
-            AgentTool(create_db_inspector_agent(model)),
-            AgentTool(create_knob_recommender_agent(model)),
-            AgentTool(create_knob_checker_agent(model)),
-            AgentTool(create_live_tuner_agent(model)),
+            AgentTool(create_db_inspector_agent(model, buffer_time=buffer_time)),
+            AgentTool(create_knob_recommender_agent(model, buffer_time=buffer_time)),
+            AgentTool(create_knob_checker_agent(model, buffer_time=buffer_time)),
+            AgentTool(create_live_tuner_agent(model, buffer_time=buffer_time)),
         ],
     )

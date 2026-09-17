@@ -7,6 +7,15 @@ from src.intent_analyzer.agent import create_intent_analyzer_agent
 from src.code_rewriter.agent import create_root_agent as create_rewriter_agent
 from src.knob_tuner.agent import create_root_agent as create_tuner_agent
 
+import asyncio
+
+def make_buffer_callback(buffer_time: float = 0.0):
+    if buffer_time <= 0:
+        return None
+    async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+        await asyncio.sleep(buffer_time)
+    return buffer_callback
+
 ORCHESTRATOR_PROMPT = """You are the ADCo pipeline orchestrator. You coordinate three
 specialized sub-pipelines to jointly analyze codebase intent, optimize application code,
 and tune database configuration knobs.
@@ -44,7 +53,7 @@ Delegate to `knob_tuner`:
 """
 
 
-def create_orchestrator_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_orchestrator_agent(model: str = "gemini-3.5-flash-lite", buffer_time: float = 0.0) -> LlmAgent:
     return LlmAgent(
         name="adco_orchestrator",
         model=model,
@@ -54,8 +63,9 @@ def create_orchestrator_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
             "code_rewriter (Phase 2), and optionally knob_tuner (Phase 3) as ADK sub-agents."
         ),
         tools=[
-            AgentTool(create_intent_analyzer_agent(model)),
-            AgentTool(create_rewriter_agent(model)),
-            AgentTool(create_tuner_agent(model)),
+            AgentTool(create_intent_analyzer_agent(model, buffer_time=buffer_time)),
+            AgentTool(create_rewriter_agent(model, buffer_time=buffer_time)),
+            AgentTool(create_tuner_agent(model, buffer_time=buffer_time)),
         ],
+        before_model_callback=make_buffer_callback(buffer_time),
     )

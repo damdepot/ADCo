@@ -37,6 +37,7 @@ def test_build_parser():
     assert args.dry_run is False
     assert args.verbose is False
     assert args.mode == "all"
+    assert args.buffer_time == 0.0
 
 
 def test_build_parser_custom_options():
@@ -52,6 +53,7 @@ def test_build_parser_custom_options():
         "--dry-run",
         "-v",
         "--mode", "tune-only",
+        "--buffer-time", "2.5",
     ])
     assert args.target == "my_target"
     assert args.db_name == "my_db"
@@ -63,7 +65,19 @@ def test_build_parser_custom_options():
     assert args.dry_run is True
     assert args.verbose is True
     assert args.mode == "tune-only"
+    assert args.buffer_time == 2.5
 
+
+
+def test_create_orchestrator_agent_buffer_time():
+    import asyncio
+    
+    agent_default = create_orchestrator_agent()
+    assert agent_default.before_model_callback is None
+    
+    agent_with_buffer = create_orchestrator_agent(buffer_time=1.5)
+    assert callable(agent_with_buffer.before_model_callback)
+    assert asyncio.iscoroutinefunction(agent_with_buffer.before_model_callback)
 
 def test_create_orchestrator_agent():
     agent = create_orchestrator_agent()

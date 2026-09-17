@@ -96,6 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Simulate tuning process without applying modifications to live database",
     )
+    p.add_argument(
+        "--buffer-time",
+        type=float,
+        default=0.0,
+        help="Buffer sleep time in seconds before each LLM call (default: 0.0)",
+    )
     return p
 
 
@@ -118,6 +124,7 @@ async def run_pipeline(
     production_db: bool = False,
     dry_run: bool = False,
     verbose: bool = False,
+    buffer_time: float = 0.0,
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
 
@@ -128,6 +135,7 @@ async def run_pipeline(
         log_file=log_file,
         output_path=intent_output_path,
         verbose=verbose,
+        buffer_time=buffer_time,
     )
 
     intent_output = intent_state.get("intent_output") or intent_state.get("intent_extractor_output") or {}
@@ -182,6 +190,7 @@ async def run_pipeline(
             sandbox_dir=sandbox_dir,
             verbose=verbose,
             extra_initial_state=rewriter_extra_state,
+            buffer_time=buffer_time,
         )
 
         verdict = _maybe_parse(rewriter_state.get("verifier_output", {}))
@@ -219,6 +228,7 @@ async def run_pipeline(
             verbose=verbose,
             db_name=db_name,
             extra_initial_state=tuner_extra_state,
+            buffer_time=buffer_time,
         )
     else:
         if verbose:
@@ -287,6 +297,7 @@ def main() -> None:
                 production_db=args.production_db,
                 dry_run=args.dry_run,
                 verbose=args.verbose,
+                buffer_time=getattr(args, "buffer_time", 0.0),
             )
         )
     except Exception as exc:

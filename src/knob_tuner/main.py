@@ -218,6 +218,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Skip cleaning up orphan staging database containers on start (default: cleanup enabled)",
     )
+    parser.add_argument(
+        "--buffer-time",
+        type=float,
+        default=0.0,
+        help="Buffer sleep time in seconds before each LLM call (default: 0.0)",
+    )
     return parser
 
 
@@ -331,6 +337,7 @@ async def run_pipeline(
     verbose: bool = False,
     cleanup_orphans: bool = True,
     db_name: str = "",
+    buffer_time: float = 0.0,
     extra_initial_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using Google ADK Runner and session service."""
@@ -414,7 +421,7 @@ async def run_pipeline(
     else:
         resilient_model = model
     
-    agent = create_root_agent(model=resilient_model)
+    agent = create_root_agent(model=resilient_model, buffer_time=buffer_time)
     runner = Runner(agent=agent, app_name=app_name, session_service=session_service)
 
     env_name = "production" if production_db else "staging"
@@ -512,6 +519,7 @@ def main() -> None:
                 verbose=args.verbose,
                 cleanup_orphans=getattr(args, "cleanup_orphans", True),
                 db_name=args.db_name,
+                buffer_time=getattr(args, "buffer_time", 0.0),
             )
         )
     except Exception as exc:

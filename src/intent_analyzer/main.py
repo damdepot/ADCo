@@ -54,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to write final intent analysis output",
     )
     p.add_argument("--verbose", "-v", action="store_true", help="Print verbose progress")
+    p.add_argument(
+        "--buffer-time",
+        type=float,
+        default=0.0,
+        help="Buffer sleep time in seconds before each LLM call (default: 0.0)",
+    )
     return p
 
 
@@ -64,6 +70,7 @@ async def run_pipeline(
     output_path: str = "out/intent_analyzer/result.json",
     verbose: bool = False,
     extra_initial_state: dict[str, Any] | None = None,
+    buffer_time: float = 0.0,
 ) -> dict[str, Any]:
     """Execute intent analyzer pipeline on the given target codebase."""
     target_abs = os.path.abspath(target)
@@ -100,7 +107,7 @@ async def run_pipeline(
         model=model,
         retry_options=types.HttpRetryOptions(initial_delay=1, attempts=5, exp_base=2)
     )
-    agent = create_intent_analyzer_agent(resilient_model)
+    agent = create_intent_analyzer_agent(resilient_model, buffer_time=buffer_time)
     runner = Runner(agent=agent, app_name=app_name, session_service=session_service)
 
     msg = (

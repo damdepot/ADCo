@@ -22,16 +22,19 @@ _CODE_OPTIMIZER_RETRY_CONFIG = RetryConfig(
 )
 
 
-async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
-    """Add a small buffer time before back-to-back LLM calls to prevent rate limiting."""
-    await asyncio.sleep(3)
+def make_buffer_callback(buffer_time: float = 0.0):
+    if buffer_time <= 0:
+        return None
+    async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+        await asyncio.sleep(buffer_time)
+    return buffer_callback
 
 
-def create_code_optimizer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_code_optimizer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite", buffer_time: float = 0.0) -> LlmAgent:
     return LlmAgent(
         name="code_optimizer",
         model=model,
-        before_model_callback=buffer_callback,
+        before_model_callback=make_buffer_callback(buffer_time),
         instruction=prompt.CODE_OPTIMIZER_AGENT_PROMPT,
         description="Optimizes database interaction code using rewrite strategies. Reads files from sandbox, writes optimized versions.",
         tools=[tools.read_file, tools.write_file, tools.list_sandbox, tools.get_optimization_context],

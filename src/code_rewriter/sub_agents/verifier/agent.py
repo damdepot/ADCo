@@ -12,16 +12,19 @@ from src.code_rewriter.sub_agents.verifier import tools
 from src.code_rewriter.sub_agents.verifier.models import VerifierOutput
 
 
-async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
-    """Add a small buffer time before back-to-back LLM calls to prevent rate limiting."""
-    await asyncio.sleep(3)
+def make_buffer_callback(buffer_time: float = 0.0):
+    if buffer_time <= 0:
+        return None
+    async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
+        await asyncio.sleep(buffer_time)
+    return buffer_callback
 
 
-def create_verifier_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite") -> LlmAgent:
+def create_verifier_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite", buffer_time: float = 0.0) -> LlmAgent:
     return LlmAgent(
         name="verifier",
         model=model,
-        before_model_callback=buffer_callback,
+        before_model_callback=make_buffer_callback(buffer_time),
         output_key="verifier_output",
         output_schema=VerifierOutput,
         instruction=prompt.VERIFIER_PROMPT,
