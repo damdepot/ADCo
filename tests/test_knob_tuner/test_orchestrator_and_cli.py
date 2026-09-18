@@ -49,18 +49,22 @@ def test_orchestrator_agent_default_initialization():
     assert agent.name == "knob_tuner"
     assert agent.model == "gemini-3.5-flash-lite"
     assert "ADCo Knob Tuner Orchestrator" in agent.instruction
-    assert len(agent.tools) == 4
+    assert agent.generate_content_config.temperature == 0.0
 
-    # Verify all 4 sub-agents are registered as AgentTools
+    # Verify all 4 sub-agents are registered as AgentTools and configured with temperature=0.0
     sub_agent_names = []
     for tool in agent.tools:
         assert isinstance(tool, AgentTool)
         sub_agent_names.append(tool.agent.name)
+        assert tool.agent.generate_content_config.temperature == 0.0
 
     assert ("db_inspector" in sub_agent_names or "intent_analyzer" in sub_agent_names)
     assert "knob_recommender" in sub_agent_names
     assert "knob_checker" in sub_agent_names
     assert "live_tuner" in sub_agent_names
+
+    from src.knob_tuner.sub_agents.intent_analyzer.agent import create_intent_analyzer_agent
+    assert create_intent_analyzer_agent().generate_content_config.temperature == 0.0
 
 
 

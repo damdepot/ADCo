@@ -18,6 +18,6 @@ def create_intent_extractor_agent(model: str = "gemini-3.5-flash-lite") -> LlmAg
         output_key="intent_extractor_output",
         output_schema=IntentExtractorOutput,
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
         ),
     )

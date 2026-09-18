@@ -26,7 +26,7 @@ def create_file_selector_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-li
         output_schema=FileSelectorOutput,
         output_key="file_selector_output",
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
         ),
         before_model_callback=make_buffer_callback(buffer_time),
     )

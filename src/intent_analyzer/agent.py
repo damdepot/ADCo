@@ -5,6 +5,7 @@ from typing import Union
 from google.adk.agents import LlmAgent
 from google.adk.models import BaseLlm
 from google.adk.tools.agent_tool import AgentTool
+from google.genai import types
 
 from src.intent_analyzer.sub_agents.file_selector.agent import create_file_selector_agent
 from src.intent_analyzer.sub_agents.intent_extractor.agent import create_intent_extractor_agent
@@ -64,6 +65,9 @@ def create_intent_analyzer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-
             AgentTool(create_file_selector_agent(model, buffer_time=buffer_time)),
             AgentTool(create_intent_extractor_agent(model, buffer_time=buffer_time)),
         ],
+        generate_content_config=types.GenerateContentConfig(
+            temperature=0.0,
+        ),
         before_model_callback=make_buffer_callback(buffer_time),
     )
 

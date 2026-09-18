@@ -35,7 +35,7 @@ def create_db_inspector_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lit
         output_schema=DbInspectorOutput,
         output_key="db_inspector_output",
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
         ),
     )
 

@@ -23,6 +23,6 @@ def create_intent_analyzer_agent(model: str = "gemini-3.5-flash-lite") -> LlmAge
         output_schema=IntentAnalyzerOutput,
         output_key="intent_analyzer_output",
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
         ),
     )

@@ -34,6 +34,6 @@ def create_live_tuner_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite"
         output_schema=LiveTunerOutput,
         output_key="live_tuner_output",
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
         ),
     )

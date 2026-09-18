@@ -43,6 +43,6 @@ def create_code_optimizer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-l
         retry_config=_CODE_OPTIMIZER_RETRY_CONFIG,
         generate_content_config=types.GenerateContentConfig(
             max_output_tokens=65536,
-            temperature=0.1,
+            temperature=0.0,
         ),
     )

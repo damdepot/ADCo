@@ -104,11 +104,26 @@ def test_create_knob_recommender_agent():
     assert agent.name == "knob_recommender"
     assert agent.output_key == "knob_recommender_output"
     assert agent.output_schema == KnobRecommenderOutput
+    assert agent.generate_content_config.temperature == 0.0
     assert len(agent.tools) == 3
     tool_names = [t.__name__ for t in agent.tools]
     assert "read_knobs_file" in tool_names
     assert "write_selected_knobs" in tool_names
     assert "get_knob_strategies" in tool_names
+
+
+def test_knob_recommender_prompt_guardrails():
+    from src.knob_tuner.sub_agents.knob_recommender.prompt import KNOB_RECOMMENDER_PROMPT
+    assert "max_parallel_workers" in KNOB_RECOMMENDER_PROMPT
+    assert "max_parallel_workers_per_gather" in KNOB_RECOMMENDER_PROMPT
+    assert "max_worker_processes" in KNOB_RECOMMENDER_PROMPT
+    assert "effective_cache_size" in KNOB_RECOMMENDER_PROMPT
+    assert "autovacuum_vacuum_scale_factor >= 0.10" in KNOB_RECOMMENDER_PROMPT
+    assert "autovacuum_vacuum_cost_limit <= 400" in KNOB_RECOMMENDER_PROMPT
+    assert "wal_buffers" in KNOB_RECOMMENDER_PROMPT
+    assert "max_wal_size >= 4GB" in KNOB_RECOMMENDER_PROMPT
+    assert "checkpoint_completion_target = 0.9" in KNOB_RECOMMENDER_PROMPT
+
 
 
 # ===========================================================================

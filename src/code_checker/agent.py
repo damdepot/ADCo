@@ -23,6 +23,6 @@ def create_checker_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
         output_key="checker_output",
         output_schema=CheckerOutput,
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
         ),
     )

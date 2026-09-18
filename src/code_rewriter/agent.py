@@ -6,6 +6,7 @@ from google.adk.models import BaseLlm
 
 from google.adk.agents import LlmAgent
 from google.adk.tools.agent_tool import AgentTool
+from google.genai import types
 
 from src.code_rewriter.tools import copy_to_sandbox, get_optimization_strategies
 from src.code_rewriter.sub_agents.code_optimizer.agent import create_code_optimizer_agent
@@ -105,4 +106,7 @@ def create_root_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite", buff
             AgentTool(create_code_optimizer_agent(model, buffer_time=buffer_time)),
             AgentTool(create_verifier_agent(model, buffer_time=buffer_time)),
         ],
+        generate_content_config=types.GenerateContentConfig(
+            temperature=0.0,
+        ),
     )

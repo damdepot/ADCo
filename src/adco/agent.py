@@ -2,6 +2,7 @@
 
 from google.adk.agents import LlmAgent
 from google.adk.tools.agent_tool import AgentTool
+from google.genai import types
 
 from src.intent_analyzer.agent import create_intent_analyzer_agent
 from src.code_rewriter.agent import create_root_agent as create_rewriter_agent
@@ -67,5 +68,8 @@ def create_orchestrator_agent(model: str = "gemini-3.5-flash-lite", buffer_time:
             AgentTool(create_rewriter_agent(model, buffer_time=buffer_time)),
             AgentTool(create_tuner_agent(model, buffer_time=buffer_time)),
         ],
+        generate_content_config=types.GenerateContentConfig(
+            temperature=0.0,
+        ),
         before_model_callback=make_buffer_callback(buffer_time),
     )

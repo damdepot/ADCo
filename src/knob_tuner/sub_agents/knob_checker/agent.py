@@ -40,6 +40,6 @@ def create_knob_checker_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lit
         output_schema=KnobCheckerOutput,
         output_key="knob_checker_output",
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
         ),
     )

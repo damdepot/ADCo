@@ -6,6 +6,7 @@ from typing import Union
 from google.adk.agents import LlmAgent
 from google.adk.models import BaseLlm
 from google.adk.tools.agent_tool import AgentTool
+from google.genai import types
 
 from src.knob_tuner.sub_agents.db_inspector.agent import create_db_inspector_agent
 from src.knob_tuner.sub_agents.knob_recommender.agent import create_knob_recommender_agent
@@ -92,4 +93,7 @@ def create_root_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite", buff
             AgentTool(create_knob_checker_agent(model, buffer_time=buffer_time)),
             AgentTool(create_live_tuner_agent(model, buffer_time=buffer_time)),
         ],
+        generate_content_config=types.GenerateContentConfig(
+            temperature=0.0,
+        ),
     )

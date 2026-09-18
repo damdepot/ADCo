@@ -27,7 +27,7 @@ def create_intent_extractor_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash
         output_schema=IntentExtractorOutput,
         output_key="intent_extractor_output",
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
         ),
         before_model_callback=make_buffer_callback(buffer_time),
     )
