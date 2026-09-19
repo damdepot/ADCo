@@ -12,7 +12,10 @@ Identify:
 - Indexes in use and primary keys.
 
 Error Handling:
-- If `check_schema` fails, set `db_version` to "" (empty string) and `tables` to `[]`. Never invent table names or schemas.
+- If `check_schema` or connection fails because the target database does not exist or connection fails:
+  Set `status="FAILED"` and set `error_message` with the exact connection error (e.g. database does not exist), set `db_version=""`, `tables=[]`, `available_knobs=[]`, and state clearly in `summary_for_recommender` that the target database does not exist on the server.
+- If connection and schema extraction succeed:
+  Set `status="SUCCESS"` and `error_message=""`.
 
 ## Step 2 — Extract Database Knobs
 Call the `extract_knobs` tool to retrieve current database configuration settings and tunable knobs directly from the live database.
@@ -30,6 +33,8 @@ Call the `write_knobs_file` tool to save the extracted knobs data into `knobs.js
 
 ## Step 4 — Synthesize Findings & Output
 Emit a structured JSON output conforming to the `DbInspectorOutput` schema with:
+- `status` (string): 'SUCCESS' or 'FAILED'.
+- `error_message` (string): Failure reason if any.
 - `db_type` (string): Database type ('postgres' or 'mysql').
 - `db_version` (string): Version string of the database server strictly from `check_schema`.
 - `cpu_cores` (integer): CPU cores allocated or available.

@@ -33,7 +33,11 @@ After each tool call, STOP and evaluate the result before calling the next tool.
 
 ### Phase 1: Database Inspection
 - Delegate to `db_inspector` with a message requesting full database schema analysis, active knob extraction, and hardware capacity assessment.
-- Wait for `db_inspector` to complete and populate the state and knobs file.
+- Wait for `db_inspector` to complete.
+- Check the `db_inspector` output:
+  If `status == "FAILED"` or if the target database does not exist / could not be accessed:
+  STOP the pipeline immediately! Do NOT delegate to `knob_recommender`, `knob_checker`, or `live_tuner`. Report that the target database is missing on the live server and must be created before tuning can proceed.
+- Only if `status == "SUCCESS"` (or inspection succeeded without missing database error) proceed to Phase 2.
 
 ### Phase 2: Knob Recommendation & Staging Validation Loop
 You will coordinate an iterative recommendation-validation loop between `knob_recommender` and `knob_checker`.

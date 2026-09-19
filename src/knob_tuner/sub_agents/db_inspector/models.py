@@ -30,6 +30,8 @@ class WorkloadPattern(BaseModel):
 
 
 class DbInspectorOutput(BaseModel):
+    status: str = Field(default="SUCCESS", description="'SUCCESS' if database was connected and inspected, or 'FAILED' if database connection failed or database does not exist")
+    error_message: str = Field(default="", description="Failure reason when inspection fails")
     db_type: str = Field(default="", description="Database engine type (e.g. postgres, mysql)")
     db_version: str = Field(default="", description="Database engine version string")
     cpu_cores: int = Field(default=1, description="Number of CPU cores allocated or available")

@@ -18,6 +18,9 @@ Apply the following optimization patterns where applicable. Keep your optimizati
 - **Batch Operations**: If a loop executes individual `INSERT` or `UPDATE` statements per item, replace them with driver-native or framework batching mechanisms (such as batch/bulk execution with parameter sequences) to minimize network round-trips.
 - **Combine Consecutive Independent Queries**: Merge multiple independent `SELECT` queries within a transaction or unit of work into a single round-trip using `UNION ALL`, `IN`, or joins where permissible, eliminating unnecessary database round-trips.
 - **Predicate Pushdown**: Move application-side in-memory filtering into the database `WHERE` clause instead of fetching unneeded records across the network.
+- **Combine Validation and Data Fetch Queries**: If an operation executes a preliminary query solely to validate entity or record existence before fetching related data in a subsequent query, merge these into a single round-trip query using a `LEFT JOIN` or appropriate join. In the application code, inspect the joined columns for NULL or missing values to preserve the original existence validation or not-found exceptions.
+- **Exhaustive Handler Auditing**: Apply these optimizations exhaustively across ALL functions and transaction handlers in the file, including transaction handlers that subsequently perform `UPDATE` or `INSERT` operations (such as state updates, transfers, or status transitions).
+- **Dynamic Key Mapping**: When converting loops or multi-row queries into lookup dictionaries/maps, dynamically determine the lookup key based on the specific `SELECT` column list and driver cursor return type (tuple, list, or dict). Do not assume or hardcode tuple indices like `row[0]`.
 
 ### Phase 3: Verification & Save
 1. After updating the code, diff-read every SQL string against the original to ensure SQL identifier integrity (see rules below).
