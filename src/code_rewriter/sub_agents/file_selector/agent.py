@@ -14,6 +14,6 @@ def create_file_selector_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent
         output_schema=FileSelectorOutput,
         output_key="file_selector_output",
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
         ),
     )

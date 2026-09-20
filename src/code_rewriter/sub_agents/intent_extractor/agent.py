@@ -5,6 +5,7 @@ from google.genai import types
 
 from src.code_rewriter.sub_agents.intent_extractor import tools
 from src.code_rewriter.sub_agents.intent_extractor import prompt
+from src.code_rewriter.sub_agents.intent_extractor.models import IntentExtractorOutput
 
 
 def create_intent_extractor_agent(model: str = "gemini-3.5-flash-lite") -> LlmAgent:
@@ -15,7 +16,8 @@ def create_intent_extractor_agent(model: str = "gemini-3.5-flash-lite") -> LlmAg
         description="Extracts database interaction patterns and intent from code files.",
         tools=[tools.read_selected_files],
         output_key="intent_extractor_output",
+        output_schema=IntentExtractorOutput,
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
         ),
     )

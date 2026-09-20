@@ -1,6 +1,8 @@
 """Docker management tools for knob_tuner staging databases."""
 
+import os
 import re
+import socket
 import subprocess
 import time
 import uuid
@@ -11,6 +13,32 @@ from .db_connector import DBConfig, run_safe_query
 
 # Global registry of active containers tracked across the process lifecycle
 ACTIVE_CONTAINERS: set[str] = set()
+
+
+def get_current_docker_network() -> str | None:
+    """Get the current container's Docker network, if running in one."""
+    env_net = os.environ.get("ADCO_DOCKER_NETWORK")
+    if env_net:
+        return env_net.strip()
+    if not os.path.exists("/.dockerenv"):
+        return None
+
+    try:
+        hostname = socket.gethostname()
+        proc = subprocess.run(
+            ["docker", "inspect", hostname, "-f", "{{range $net, $v := .NetworkSettings.Networks}}{{$net}} {{end}}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            networks = [n.strip() for n in proc.stdout.split() if n.strip()]
+            for net in networks:
+                if net not in ("bridge", "host", "none"):
+                    return net
+    except Exception:
+        pass
+    return None
 
 
 def resolve_docker_image(db_type: str, db_version: str | None = None) -> str:
@@ -296,6 +324,8 @@ def start_staging_db(
     container_id_suffix = uuid.uuid4().hex[:8]
     container_name = f"adco-staging-{engine}-{container_id_suffix}"
 
+    current_network = get_current_docker_network()
+
     if engine == "postgres":
         internal_port = 5432
         user = "postgres"
@@ -358,6 +388,8 @@ def start_staging_db(
         "-p",
         f"127.0.0.1::{internal_port}",
     ]
+    if current_network:
+        cmd.extend(["--network", current_network])
     cmd.extend(env_vars)
 
     cmd.append(image)
@@ -403,9 +435,16 @@ def start_staging_db(
         stop_staging_db(container_name)
         raise RuntimeError(str(e)) from e
 
+    if current_network and current_network not in ("bridge", "host", "none"):
+        conn_host = container_name
+        conn_port = internal_port
+    else:
+        conn_host = "127.0.0.1"
+        conn_port = host_port
+
     cfg = DBConfig(
-        host="127.0.0.1",
-        port=host_port,
+        host=conn_host,
+        port=conn_port,
         user=user,
         password=password,
         database=database,
@@ -445,9 +484,10 @@ def start_staging_db(
                     run_safe_query(cfg, "SELECT 1")
                     return container_name, cfg
                 except Exception:
-                    if container_ip:
+                    fallback_host = container_ip or (container_name if cfg.host != container_name else None)
+                    if fallback_host:
                         fallback_cfg = DBConfig(
-                            host=container_ip,
+                            host=fallback_host,
                             port=internal_port,
                             user=user,
                             password=password,

@@ -378,6 +378,17 @@ def scan_codebase_workload(tool_context: ToolContext) -> str:
     and notable database interaction patterns.
     Writes result to ``tool_context.state['workload_info']``.
     """
+    existing = tool_context.state.get("workload_info")
+    if (
+        existing
+        and isinstance(existing, dict)
+        and existing.get("query_types")
+    ):
+        return (
+            "workload_info already populated in state (seeded by orchestrator). "
+            "Skipping codebase scan to avoid redundancy."
+        )
+
     target = tool_context.state.get("target", "")
     if not target or not os.path.isdir(target):
         return "ERROR: target path not set in state or directory does not exist"

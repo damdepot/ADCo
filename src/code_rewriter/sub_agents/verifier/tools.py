@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from google.adk.tools import ToolContext
 
+from src.code_rewriter.tools.validator import validate_format_strings
+
 _CODE_ERRORS = re.compile(
     r"SyntaxError|ImportError|ModuleNotFoundError|NameError|"
     r"AttributeError|TypeError|IndentationError|ValueError"
@@ -58,8 +60,13 @@ def check_syntax(tool_context: ToolContext) -> str:
             continue
         full = os.path.join(sandbox, rel)
         try:
-            compile(Path(full).read_text(), rel, "exec")
-            lines.append(f"  OK  {rel}")
+            content = Path(full).read_text()
+            compile(content, rel, "exec")
+            fmt_errors = validate_format_strings(content, rel)
+            if fmt_errors:
+                lines.append(f"  FAIL {rel}: format string error: {'; '.join(fmt_errors)}")
+            else:
+                lines.append(f"  OK  {rel}")
         except SyntaxError as e:
             lines.append(f"  FAIL {rel}: {e}")
         except FileNotFoundError:
@@ -101,10 +108,21 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
               then try reasonable defaults if the app requires arguments.
     """
     sandbox = tool_context.state.get("sandbox", "") if tool_context else ""
+    entry = ""
     if tool_context:
-        entry = tool_context.state.get("file_selector_output", {}).get("entry_point", "")
-    else:
-        entry = ""
+        fs_out = tool_context.state.get("file_selector_output", {})
+        if hasattr(fs_out, "entry_point"):
+            entry = fs_out.entry_point or ""
+        elif isinstance(fs_out, str):
+            try:
+                import json
+                parsed = json.loads(fs_out)
+                if isinstance(parsed, dict):
+                    entry = parsed.get("entry_point", "")
+            except Exception:
+                pass
+        elif isinstance(fs_out, dict):
+            entry = fs_out.get("entry_point", "")
 
     if not entry:
         return "ERROR: no entry point"

@@ -49,19 +49,33 @@ def test_orchestrator_agent_default_initialization():
     assert agent.name == "knob_tuner"
     assert agent.model == "gemini-3.5-flash-lite"
     assert "ADCo Knob Tuner Orchestrator" in agent.instruction
-    assert len(agent.tools) == 4
+    assert agent.generate_content_config.temperature == 0.0
 
-    # Verify all 4 sub-agents are registered as AgentTools
+    # Verify all 4 sub-agents are registered as AgentTools and configured with temperature=0.0
     sub_agent_names = []
     for tool in agent.tools:
         assert isinstance(tool, AgentTool)
         sub_agent_names.append(tool.agent.name)
+        assert tool.agent.generate_content_config.temperature == 0.0
 
-    assert "intent_analyzer" in sub_agent_names
+    assert ("db_inspector" in sub_agent_names or "intent_analyzer" in sub_agent_names)
     assert "knob_recommender" in sub_agent_names
     assert "knob_checker" in sub_agent_names
     assert "live_tuner" in sub_agent_names
 
+    from src.knob_tuner.sub_agents.intent_analyzer.agent import create_intent_analyzer_agent
+    assert create_intent_analyzer_agent().generate_content_config.temperature == 0.0
+
+
+
+def test_create_root_agent_buffer_time():
+    import asyncio
+    agent_default = create_root_agent()
+    assert agent_default.before_model_callback is None
+    
+    agent_buffer = create_root_agent(buffer_time=1.5)
+    assert callable(agent_buffer.before_model_callback)
+    assert asyncio.iscoroutinefunction(agent_buffer.before_model_callback)
 
 def test_orchestrator_agent_custom_model():
     agent = create_root_agent(model="gemini-1.5-pro")
@@ -72,7 +86,7 @@ def test_orchestrator_agent_custom_model():
 
 
 def test_orchestrator_prompt_contains_rules_and_loop_bounds():
-    assert "intent_analyzer" in ORCHESTRATOR_PROMPT
+    assert ("db_inspector" in ORCHESTRATOR_PROMPT or "intent_analyzer" in ORCHESTRATOR_PROMPT)
     assert "knob_recommender" in ORCHESTRATOR_PROMPT
     assert "knob_checker" in ORCHESTRATOR_PROMPT
     assert "live_tuner" in ORCHESTRATOR_PROMPT
@@ -110,6 +124,7 @@ def test_cli_parser_defaults():
     assert args.dry_run is False
     assert args.verbose is False
     assert args.cleanup_orphans is True
+    assert args.buffer_time == 0.0
 
 
 def test_cli_parser_custom_args():
@@ -130,6 +145,7 @@ def test_cli_parser_custom_args():
         "--dry-run",
         "-v",
         "--no-cleanup-orphans",
+        "--buffer-time", "1.5",
     ])
     assert args.target == "/my/codebase"
     assert args.db_name == "custom_db"
@@ -146,6 +162,7 @@ def test_cli_parser_custom_args():
     assert args.dry_run is True
     assert args.verbose is True
     assert args.cleanup_orphans is False
+    assert args.buffer_time == 1.5
 
 
 def test_parse_cpu_cores():

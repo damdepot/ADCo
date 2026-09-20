@@ -660,3 +660,37 @@ def test_get_container_host_port_exception():
         with pytest.raises(Exception, match="Docker daemon died"):
             get_container_host_port("my-container", 5432)
 
+
+def test_get_current_docker_network_env_override():
+    from src.knob_tuner.tools.docker_tools import get_current_docker_network
+    with patch.dict(os.environ, {"ADCO_DOCKER_NETWORK": "custom_net"}):
+        assert get_current_docker_network() == "custom_net"
+
+
+def test_get_current_docker_network_inside_container():
+    from src.knob_tuner.tools.docker_tools import get_current_docker_network
+    mock_res = MagicMock(returncode=0, stdout="bridge adco-experiments_default\n")
+    with patch.dict(os.environ, {}, clear=True), \
+         patch("os.path.exists", return_value=True), \
+         patch("subprocess.run", return_value=mock_res):
+        assert get_current_docker_network() == "adco-experiments_default"
+
+
+def test_start_staging_db_with_custom_network():
+    run_res = MagicMock(returncode=0, stdout="cid\n", stderr="")
+    port_res = MagicMock(returncode=0, stdout="127.0.0.1:54321\n", stderr="")
+    exec_res = MagicMock(returncode=0, stdout="accepting connections", stderr="")
+
+    with patch("src.knob_tuner.tools.docker_tools.get_current_docker_network", return_value="my_compose_net"), \
+         patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="172.18.0.5\n"), exec_res]) as mock_run, \
+         patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
+
+        cname, cfg = start_staging_db(db_type="postgres")
+        assert cfg.host == cname
+        assert cfg.port == 5432
+        # Verify --network my_compose_net was passed to docker run
+        run_cmd = mock_run.call_args_list[0][0][0]
+        assert "--network" in run_cmd
+        assert run_cmd[run_cmd.index("--network") + 1] == "my_compose_net"
+
+

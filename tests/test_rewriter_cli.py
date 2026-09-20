@@ -26,11 +26,13 @@ def test_build_parser():
     assert args.output_path == "out/code_rewriter/result.json"
     assert args.sandbox_dir is None
     assert args.verbose is False
+    assert args.buffer_time == 0.0
 
-    args = parser.parse_args(["target_dir", "--model", "test-model", "-v", "--sandbox-dir", "sbx"])
+    args = parser.parse_args(["target_dir", "--model", "test-model", "-v", "--sandbox-dir", "sbx", "--buffer-time", "1.5"])
     assert args.model == "test-model"
     assert args.sandbox_dir == "sbx"
     assert args.verbose is True
+    assert args.buffer_time == 1.5
 
 
 def test_maybe_parse():
@@ -89,11 +91,13 @@ def test_write_output_result(tmp_path):
     assert data["outputs"]["verifier_output"] == {"status": "PASS"}
 
 
+@patch("src.code_rewriter.main.run_intent_analyzer")
 @patch("src.code_rewriter.main.Runner")
 @patch("src.code_rewriter.main.create_root_agent")
-def test_run_pipeline(mock_create_root_agent, mock_runner_class, tmp_path):
+def test_run_pipeline(mock_create_root_agent, mock_runner_class, mock_run_intent, tmp_path):
     log_file = tmp_path / "log.txt"
     out_file = tmp_path / "out.json"
+    mock_run_intent.return_value = {"intent_output": {}}
     
     mock_runner_instance = MagicMock()
     mock_runner_class.return_value = mock_runner_instance

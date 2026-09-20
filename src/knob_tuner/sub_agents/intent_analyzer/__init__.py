@@ -1,9 +1,10 @@
-"""Intent analyzer sub-agent for knob_tuner pipeline."""
-
-from src.knob_tuner.sub_agents.intent_analyzer.agent import (
+"""Alias/forwarder for renamed db_inspector subagent."""
+from src.knob_tuner.sub_agents.db_inspector.agent import (
+    create_db_inspector_agent,
     create_intent_analyzer_agent,
 )
-from src.knob_tuner.sub_agents.intent_analyzer.models import (
+from src.knob_tuner.sub_agents.db_inspector.models import (
+    DbInspectorOutput,
     IntentAnalyzerOutput,
     KnobInfo,
     TableInfo,
@@ -11,9 +12,11 @@ from src.knob_tuner.sub_agents.intent_analyzer.models import (
 )
 
 __all__ = [
+    "create_db_inspector_agent",
     "create_intent_analyzer_agent",
+    "DbInspectorOutput",
     "IntentAnalyzerOutput",
-    "TableInfo",
     "KnobInfo",
+    "TableInfo",
     "WorkloadPattern",
 ]
