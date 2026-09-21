@@ -14,13 +14,56 @@ The `write_file` tool will REJECT your output if it is identical to the original
 ### Phase 2: Execution & Rewrite
 Apply the following optimization patterns where applicable. Keep your optimizations generic and codebase-agnostic so they work on any database-backed application and any SQL dialect/driver:
 
+#### Core Optimization Strategies
 - **N+1 Queries**: If a loop executes a query per item, replace it with a single set-based query using `IN (...)` or a `JOIN`. When replacing per-item queries with a multi-key query, index the fetched result rows by their unique identifier/lookup key (into a map/dictionary) before consumption to prevent order mismatches, index alignment issues, or missing record bugs.
 - **Batch Operations**: If a loop executes individual `INSERT` or `UPDATE` statements per item, replace them with driver-native or framework batching mechanisms (such as batch/bulk execution with parameter sequences) to minimize network round-trips.
 - **Combine Consecutive Independent Queries**: Merge multiple independent `SELECT` queries within a transaction or unit of work into a single round-trip using `UNION ALL`, `IN`, or joins where permissible, eliminating unnecessary database round-trips.
 - **Predicate Pushdown**: Move application-side in-memory filtering into the database `WHERE` clause instead of fetching unneeded records across the network.
 - **Combine Validation and Data Fetch Queries**: If an operation executes a preliminary query solely to validate entity or record existence before fetching related data in a subsequent query, merge these into a single round-trip query using a `LEFT JOIN` or appropriate join. In the application code, inspect the joined columns for NULL or missing values to preserve the original existence validation or not-found exceptions.
 - **Exhaustive Handler Auditing**: Apply these optimizations exhaustively across ALL functions and transaction handlers in the file, including transaction handlers that subsequently perform `UPDATE` or `INSERT` operations (such as state updates, transfers, or status transitions).
-- **Dynamic Key Mapping**: When converting loops or multi-row queries into lookup dictionaries/maps, dynamically determine the lookup key based on the specific `SELECT` column list and driver cursor return type (tuple, list, or dict). Do not assume or hardcode tuple indices like `row[0]`.
+- **Dynamic Key Mapping**: When converting loops or multi-row queries into lookup dictionaries/maps, dynamically determine the lookup key based on the specific `SELECT` column list and driver cursor return type (tuple, list, or dict). Do not assume or hardcode tuple indices like `row[0]` without checking the selected columns.
+
+#### Concrete Few-Shot Transformation Patterns
+
+1. **Batching Single-Key Lookups**:
+   - Original per-item loop:
+     ```python
+     items = []
+     for item_id in item_ids:
+         cursor.execute("SELECT name, price FROM items WHERE id = %s", [item_id])
+         items.append(cursor.fetchone())
+     ```
+   - Optimized batch transformation:
+     ```python
+     placeholders = ", ".join(["%s"] * len(item_ids))
+     # ALWAYS include the lookup key (id) in SELECT so rows can be indexed by key
+     sql = "SELECT id, name, price FROM items WHERE id IN (" + placeholders + ")"
+     cursor.execute(sql, item_ids)
+     item_map = dict((row[0], (row[1], row[2])) for row in cursor.fetchall())
+     items = [item_map.get(i_id, ()) for i_id in item_ids]
+     ```
+
+2. **Batching Multi-Key Lookups (Composite Keys)**:
+   - When querying by `(item_id, warehouse_id)`:
+     ```python
+     # If all items share the same warehouse:
+     placeholders = ", ".join(["%s"] * len(item_ids))
+     sql = "SELECT item_id, warehouse_id, qty, dist_%02d FROM stock WHERE warehouse_id = %%s AND item_id IN (%s)" % (d_id, placeholders)
+     cursor.execute(sql, [w_id] + list(item_ids))
+     stock_map = dict(((row[0], row[1]), row[2:]) for row in cursor.fetchall())
+     ```
+
+3. **Never Reuse `%` Format Strings on SQL Queries with `%s` Placeholders**:
+   - DO NOT do chained `%` formatting on SQL templates containing parameter placeholders `%s` or `%02d` (e.g. `(template % d_id) % placeholders` causes `TypeError: not enough arguments for format string`).
+   - Always build new SQL strings with concatenation rather than doing `template % placeholders`.
+   - Format dynamic table/column names first, and build the `IN (...)` clause cleanly:
+     - For MySQL / SQLite: `placeholders = ', '.join(['%s'] * len(ids))` -> `"SELECT ... WHERE id IN (" + placeholders + ")"` with params `ids`.
+     - For PostgreSQL: `WHERE id = ANY(%s)` with param `(ids,)` OR `"WHERE id IN (" + placeholders + ")"` with params `ids`.
+   - Always verify that the parameter list passed to `cursor.execute(sql, params)` exactly matches the count and order of parameter markers in `sql`.
+   - When querying columns, include the key columns in the `SELECT` clause so dictionary mapping (e.g. `(row[0], row[1])` or `row[0]`) is unambiguous.
+
+4. **Batch Updates and Inserts**:
+   - Accumulate rows into a list of tuples `updates = [...]` and execute in a batch with `cursor.executemany(sql, updates)` or `execute_batch(cursor, sql, updates)` instead of looping individual `cursor.execute(...)` calls per item.
 
 ### Phase 3: Verification & Save
 1. After updating the code, diff-read every SQL string against the original to ensure SQL identifier integrity (see rules below).

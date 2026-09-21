@@ -92,12 +92,10 @@ directly, e.g.:
   retry with arguments before treating as a failure
 
 ## Final output
-Your final output MUST be valid JSON with exactly these five fields and
-nothing else (no prose, no markdown fences):
-{
-  "status": "PASS" or "FAIL",
-  "category": "not_executable" | "name_error" | "syntax_error" | "args_required" | "NONE",
-  "reason": "<one-line explanation>",
-  "detail": "<specific error location and fix hint if FAIL, else empty string>",
-  "suggestion": "<actionable fix instruction for the optimizer, or empty string if none needed>"
-}"""
+Your final output MUST be valid JSON conforming to the VerifierOutput schema with exactly these five fields and nothing else (no prose, no markdown fences):
+- `status`: "PASS" or "FAIL"
+- `category`: "not_executable" | "name_error" | "syntax_error" | "args_required" | "NONE"
+- `reason`: one-line explanation string
+- `detail`: specific error location and fix hint if FAIL, else empty string
+- `suggestion`: actionable fix instruction for the optimizer, or empty string if none needed
+"""

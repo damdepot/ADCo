@@ -31,12 +31,24 @@ class StrategyDef:
     objective: str = ""
     conditions: str = ""
     mechanisms: str = ""
+    risks: str = ""
+    safety_rules: str = ""
 
     def detailed(self) -> str:
-        parts = [f"### {self.category}/{self.name}"]
-        parts.append(f"**Goal**: {self.objective}")
-        parts.append(f"**When**: {self.conditions}")
-        parts.append(f"**How**: {self.mechanisms}")
+        header = f"### {self.category}/{self.name}" if self.category and self.category != "TOP_LEVEL" else f"### {self.name}"
+        parts = [header]
+        if self.definition:
+            parts.append(f"**Definition**: {self.definition}")
+        if self.objective:
+            parts.append(f"**Goal**: {self.objective}")
+        if self.conditions:
+            parts.append(f"**When**: {self.conditions}")
+        if self.mechanisms:
+            parts.append(f"**How**:\n{self.mechanisms}" if "\n" in self.mechanisms else f"**How**: {self.mechanisms}")
+        if self.risks:
+            parts.append(f"**Risks**:\n{self.risks}" if "\n" in self.risks else f"**Risks**: {self.risks}")
+        if self.safety_rules:
+            parts.append(f"**Safety**:\n{self.safety_rules}" if "\n" in self.safety_rules else f"**Safety**: {self.safety_rules}")
         return "\n".join(parts)
 
 
@@ -67,41 +79,73 @@ def _parse_kb(kb_path: str | None = None) -> list[StrategyDef]:
                 objective=current_strategy.get("objective", ""),
                 conditions=current_strategy.get("conditions", ""),
                 mechanisms=current_strategy.get("mechanisms", ""),
+                risks=current_strategy.get("risks", ""),
+                safety_rules=current_strategy.get("safety_rules", ""),
             ))
 
+    FIELD_RE = re.compile(r"^[\*\-]\s+\*\*([^*]+)\*\*:\s*(.*)")
+    current_field = None
     for line in text.splitlines():
         if line.startswith("# ") and not line.startswith("## "):
-            pass  # skip main title
-
+            pass
         elif line.startswith("---"):
             _flush()
             current_strategy = {}
-
+            current_field = None
         elif line.startswith("### "):
             _flush()
             current_strategy = {"category": current_section, "name": line[4:].strip()}
-
+            current_field = None
         elif line.startswith("## "):
             _flush()
             name = line[3:].strip()
-            # Check if this is a strategy (numbered) or a section header
             if re.match(r"^\d+\.", name):
                 current_strategy = {"category": "TOP_LEVEL", "name": name}
                 current_section = name
             else:
                 current_section = name
                 current_strategy = {}
-
-        elif current_strategy:
+            current_field = None
+        elif current_strategy is not None:
             stripped = line.strip()
-            if stripped.startswith("*   **Definition**"):
-                current_strategy["definition"] = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
-            elif stripped.startswith("*   **Objective**"):
-                current_strategy["objective"] = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
-            elif stripped.startswith("*   **Conditions**"):
-                current_strategy["conditions"] = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
-            elif "*   **Mechanisms**" in stripped or "*   **Mechanism**" in stripped:
-                current_strategy["mechanisms"] = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+            match = FIELD_RE.match(line.lstrip())
+            if match:
+                field_name = match.group(1).strip().lower()
+                field_value = match.group(2).strip()
+                if field_name == "definition":
+                    current_strategy["definition"] = field_value
+                    current_field = "definition"
+                elif field_name == "objective":
+                    current_strategy["objective"] = field_value
+                    current_field = "objective"
+                elif field_name == "conditions":
+                    current_strategy["conditions"] = field_value
+                    current_field = "conditions"
+                elif field_name == "mechanisms" or field_name == "mechanism":
+                    current_strategy["mechanisms"] = field_value
+                    current_field = "mechanisms"
+                elif field_name == "risks":
+                    current_strategy["risks"] = field_value
+                    current_field = "risks"
+                elif field_name in [
+                    "safety requirement", "safety requirements",
+                    "safety rule", "safety rules", "safety",
+                    "decision factors", "decision factor",
+                    "verification principle", "verification principles"
+                ]:
+                    current_strategy["safety_rules"] = field_value
+                    current_field = "safety_rules"
+            elif line.strip().startswith("*") or line.strip().startswith("-"):
+                if current_field in ["mechanisms", "risks", "safety_rules"]:
+                    if current_strategy.get(current_field):
+                        current_strategy[current_field] += "\n" + line.strip()
+                    else:
+                        current_strategy[current_field] = line.strip()
+            elif line.strip() == "":
+                pass
+            else:
+                if current_field and current_strategy.get(current_field):
+                    pass # Or append to existing field if needed, but not specified.
 
     _flush()
 
@@ -160,21 +204,35 @@ def plan(intent_text: str, max_strategies: int = 5) -> tuple[list[StrategyDef], 
 
     keyword_map: dict[str, list[str]] = {
         "COMBINING_QUERIES": ["combine", "merge", "multiple", "sequential", "n+1", "loop", "for ", "cte", "round-trip"],
+        "N_PLUS_ONE_QUERY_ELIMINATION": ["n+1", "loop", "for ", "batch", "eager"],
+        "QUERY_BATCHING": ["batch", "in (", "executemany"],
+        "REDUNDANT_QUERY_ELIMINATION": ["redundant", "cache", "repeated"],
         "PREDICATE_PUSHDOWN": ["filter", "where", "pushdown", "early"],
-        "JOIN_ORDER_HINTS": ["join", "order", "hint", "plan", "optimizer"],
-        "SEPARATING_QUERIES": ["separate", "split", "deconstruct", "oom", "memory", "complex", "monolithic"],
-        "CONCURRENCY": ["parallel", "async", "batch", "concurrent", "thread", "execute many", "executemany"],
-        "AGGREGATE_MERGE": ["aggregate", "group by", "sum(", "count(", "avg("],
-        "FILTER_MERGE": ["filter", "where", "condition"],
-        "PROJECT_MERGE": ["select", "projection", "column"],
-        "SORT_REMOVE": ["order by", "sort", "limit"],
-        "SEMI_JOIN_JOIN_TRANSPOSE": ["exists", "semi join", "in (select"],
-        "SUBQUERY_UNNESTING": ["subquery", "correlated", "scalar", "unnest"],
-        "JOIN_CONDITION_PUSH": ["join", "push", "predicate"],
-        "FILTER_INTO_JOIN": ["join", "filter"],
-        "JOIN_ADD_REDUNDANT_SEMI_JOIN": ["semi join", "exists"],
-        "UNION_REMOVE": ["union", "set operation"],
-        "WINDOW_REDUCE_EXPRESSIONS": ["window", "over", "partition by"],
+        "PROJECTION_PUSHDOWN": ["select", "projection", "column"],
+        "APPLICATION_LOGIC_PUSHDOWN": ["logic", "database", "pushdown"],
+        "SUBQUERY_REWRITE": ["subquery", "correlated", "scalar", "unnest"],
+        "EXISTS_AND_IN_REWRITE": ["exists", "in ("],
+        "NOT_IN_TO_ANTI_JOIN": ["not in", "anti join", "not exists"],
+        "OR_TO_UNION": ["or ", "union"],
+        "UNION_OPTIMIZATION": ["union", "set operation"],
+        "CTE_OPTIMIZATION": ["cte", "with "],
+        "JOIN_ORDER_OPTIMIZATION": ["join", "order", "plan"],
+        "JOIN_TYPE_OPTIMIZATION": ["join", "inner", "outer"],
+        "JOIN_ELIMINATION": ["join", "eliminate", "redundant"],
+        "PRE_AGGREGATION_BEFORE_JOIN": ["aggregate", "before", "join"],
+        "SARGABILITY_OPTIMIZATION": ["sargable", "index", "function"],
+        "SELECT_STAR_ELIMINATION": ["select *", "star"],
+        "LIMIT_AND_TOP_N_PUSHDOWN": ["limit", "top", "offset"],
+        "REDUNDANT_OPERATION_ELIMINATION": ["redundant", "operation", "distinct"],
+        "APPLICATION_SIDE_AGGREGATION_TO_SQL": ["aggregate", "group by", "sum(", "count("],
+        "APPLICATION_SIDE_SORTING_TO_SQL": ["sort", "order by"],
+        "ROUND_TRIP_REDUCTION": ["round trip", "network", "latency"],
+        "INDEPENDENT_QUERY_PARALLELISM": ["parallel", "async", "concurrent"],
+        "LOOP_TO_SET_OPERATION": ["loop", "set", "union"],
+        "RESULT_SET_REDUCTION": ["result", "reduce", "size"],
+        "SQL_SEMANTIC_SAFETY": ["safety", "semantic", "sql"],
+        "OPTIMIZATION_SELECTION": ["optimization", "selection", "choose"],
+        "VERIFICATION": ["verify", "test", "check"],
     }
 
     scored: list[tuple[int, StrategyDef]] = []
@@ -186,9 +244,12 @@ def plan(intent_text: str, max_strategies: int = 5) -> tuple[list[StrategyDef], 
             scored.append((score, strat))
 
     scoring_boost = {
+        "N_PLUS_ONE_QUERY_ELIMINATION": 4,
+        "QUERY_BATCHING": 3,
         "COMBINING_QUERIES": 3,
+        "LOOP_TO_SET_OPERATION": 3,
         "PREDICATE_PUSHDOWN": 2,
-        "CONCURRENCY": 2,
+        "ROUND_TRIP_REDUCTION": 2,
     }
 
     # Use clean name for boost lookup too

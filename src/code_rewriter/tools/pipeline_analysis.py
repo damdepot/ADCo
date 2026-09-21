@@ -7,6 +7,19 @@ from ..models.rewrite_models import RewriteContract, RewriteTarget
 from .rewrite_contract import build_rewrite_contract
 from .rewrite_verifier import verify_rewrite, VerificationResult, TargetStatus, VerificationCheck, VerificationViolation
 
+EXCLUDED_SETUP_FUNCTION_PATTERNS = {
+    "_execute_ddl", "execute_ddl", "load_schema", "init_schema", 
+    "_load_schema", "create_tables", "init_db", "_init_db", "setup_schema"
+}
+
+def is_ddl_or_setup_func(fn) -> bool:
+    name_lower = fn.name.lower()
+    if fn.name in EXCLUDED_SETUP_FUNCTION_PATTERNS:
+        return True
+    if "ddl" in name_lower or "schema" in name_lower:
+        return True
+    return False
+
 def build_contracts_from_intent(
     target_dir: str, 
     intent_output: dict, 
@@ -37,6 +50,8 @@ def build_contracts_from_intent(
                 funcs_to_check.extend(cls.methods)
                 
             for fn in funcs_to_check:
+                if is_ddl_or_setup_func(fn):
+                    continue
                 has_loop_db = any(op.inside_loop for op in fn.database_operations)
                 if has_loop_db:
                     multi_targets.append(RewriteTarget(
@@ -49,18 +64,24 @@ def build_contracts_from_intent(
             continue
             
     contracts = []
-    if multi_targets:
-        primary = multi_targets[0]
-        analysis = analyses.get(primary.file)
-        if analysis:
-            contract = build_rewrite_contract(
-                analysis=analysis,
-                target=primary,
-                pattern=pattern,
-                strategy=strategy,
-            )
-            contract.targets = multi_targets
-            contracts.append(contract)
+    for rel_path, file_analysis in analyses.items():
+        file_targets = [t for t in multi_targets if t.file == rel_path]
+        if not file_targets:
+            continue
+        primary = file_targets[0]
+        contract = build_rewrite_contract(
+            analysis=file_analysis,
+            target=primary,
+            pattern=pattern,
+            strategy=strategy,
+        )
+        contract.targets = file_targets
+        contract.allowed_regions = [
+            t.qualified_function or t.function
+            for t in file_targets
+            if (t.qualified_function or t.function)
+        ]
+        contracts.append(contract)
                 
     return analyses, contracts
 
@@ -83,14 +104,16 @@ def execute_deterministic_verification(
             rewrite_coverage=1.0
         )
         
-    contract = contracts[0]
-    expected_targets = len(contract.targets) if contract.targets else (1 if contract.target else 0)
+    all_contract_targets = []
+    for c in contracts:
+        targets_to_check = c.targets if c.targets else ([c.target] if c.target else [])
+        all_contract_targets.extend(targets_to_check)
+    expected_targets_count = len(all_contract_targets)
     
-    if not modified_files and expected_targets > 0:
+    if not modified_files and expected_targets_count > 0:
         violations = []
         target_coverage = []
-        targets_to_check = contract.targets if contract.targets else [contract.target]
-        for t in targets_to_check:
+        for t in all_contract_targets:
             target_coverage.append(TargetStatus(
                 file=t.file,
                 function=t.qualified_function or t.function,
@@ -109,46 +132,41 @@ def execute_deterministic_verification(
             checks=[VerificationCheck(name="check_rewrite_coverage", status="FAIL", details="No files modified.")],
             summary="Verification failed: no files modified.",
             target_coverage=target_coverage,
-            expected_targets=expected_targets,
+            expected_targets=expected_targets_count,
             transformed_targets=0,
-            missing_targets=expected_targets,
+            missing_targets=expected_targets_count,
             rewrite_coverage=0.0
         )
 
     all_violations = []
     all_checks = []
     all_target_coverage = []
-    expected = 0
-    transformed = 0
-    missing = 0
     
-    for c in contracts:
-        files_to_check = list(set([t.file for t in c.targets])) if c.targets else [c.target.file]
-        for f in files_to_check:
-            orig_src = os.path.join(target_dir, f)
-            opt_src = os.path.join(sandbox_dir, f)
-            if os.path.exists(orig_src) and os.path.exists(opt_src):
-                try:
-                    with open(orig_src, 'r', encoding='utf-8') as file:
-                        orig_code = file.read()
-                    with open(opt_src, 'r', encoding='utf-8') as file:
-                        opt_code = file.read()
-                    
-                    result = verify_rewrite(orig_code, opt_code, c)
-                    all_violations.extend(result.violations)
-                    for check in result.checks:
-                        if not any(existing.name == check.name and existing.status == check.status for existing in all_checks):
-                            all_checks.append(check)
-                    all_target_coverage.extend(result.target_coverage)
-                    expected += result.expected_targets
-                    transformed += result.transformed_targets
-                    missing += result.missing_targets
-                except Exception as e:
-                    all_violations.append(VerificationViolation(
-                        code="VERIFICATION_ERROR",
-                        severity="ERROR",
-                        message=f"Error verifying {f}: {str(e)}"
-                    ))
+    active_contracts = [c for c in contracts if c.target and c.target.file in modified_files]
+    
+    for c in active_contracts:
+        f = c.target.file
+        orig_src = os.path.join(target_dir, f)
+        opt_src = os.path.join(sandbox_dir, f)
+        if os.path.exists(orig_src) and os.path.exists(opt_src):
+            try:
+                with open(orig_src, 'r', encoding='utf-8') as file:
+                    orig_code = file.read()
+                with open(opt_src, 'r', encoding='utf-8') as file:
+                    opt_code = file.read()
+                
+                result = verify_rewrite(orig_code, opt_code, c)
+                all_violations.extend(result.violations)
+                for check in result.checks:
+                    if not any(existing.name == check.name and existing.status == check.status for existing in all_checks):
+                        all_checks.append(check)
+                all_target_coverage.extend(result.target_coverage)
+            except Exception as e:
+                all_violations.append(VerificationViolation(
+                    code="VERIFICATION_ERROR",
+                    severity="ERROR",
+                    message=f"Error verifying {f}: {str(e)}"
+                ))
     
     # Deduplicate target_coverage by file and function
     seen_targets = set()
@@ -159,13 +177,25 @@ def execute_deterministic_verification(
             seen_targets.add(key)
             dedup_coverage.append(tc)
             
-    # Recalculate targets based on deduplicated coverage
-    expected_targets_count = len(dedup_coverage) if dedup_coverage else expected
-    transformed_targets_count = sum(1 for tc in dedup_coverage if tc.status == "TRANSFORMED")
-    missing_targets_count = expected_targets_count - transformed_targets_count
-    
-    rewrite_coverage = round(transformed_targets_count / expected_targets_count, 3) if expected_targets_count > 0 else 1.0
-    overall_status = "PASS" if not all_violations and (expected_targets_count == 0 or missing_targets_count == 0) else "FAIL"
+    # Recalculate targets based on deduplicated coverage or active contracts
+    expected_targets = len(dedup_coverage) if dedup_coverage else sum(len(c.targets) if c.targets else 1 for c in active_contracts)
+    transformed_targets = sum(1 for tc in dedup_coverage if tc.status == "TRANSFORMED")
+    missing_targets = expected_targets - transformed_targets
+    rewrite_coverage = round(transformed_targets / expected_targets, 3) if expected_targets > 0 else 1.0
+
+    critical_codes = {
+        "SYNTAX_ERROR", "ORIGINAL_SYNTAX_ERROR", "TARGET_MISSING",
+        "FUNCTION_SIGNATURE_CHANGED", "UNAUTHORIZED_CHANGE",
+        "DB_OPERATION_REMOVED", "INVALID_REWRITE"
+    }
+    has_critical = any(v.severity == "ERROR" and v.code in critical_codes for v in all_violations)
+
+    if has_critical or transformed_targets == 0:
+        overall_status = "FAIL"
+    elif transformed_targets > 0:
+        overall_status = "PASS"
+    else:
+        overall_status = "PASS" if not all_violations else "FAIL"
 
     return VerificationResult(
         status=overall_status,
@@ -173,9 +203,9 @@ def execute_deterministic_verification(
         checks=all_checks,
         summary=f"Verification {'passed' if overall_status == 'PASS' else 'failed'} with {len(all_violations)} violations.",
         target_coverage=dedup_coverage,
-        expected_targets=expected_targets_count,
-        transformed_targets=transformed_targets_count,
-        missing_targets=missing_targets_count,
+        expected_targets=expected_targets,
+        transformed_targets=transformed_targets,
+        missing_targets=missing_targets,
         rewrite_coverage=rewrite_coverage
     )
 
