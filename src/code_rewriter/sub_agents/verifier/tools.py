@@ -242,3 +242,56 @@ def compare_original_and_modified(tool_context: ToolContext) -> str:
         return "No modified files to compare."
 
     return "\n".join(sections)
+
+import json
+from src.code_rewriter.models.rewrite_models import RewriteContract
+from src.code_rewriter.tools.pipeline_analysis import execute_deterministic_verification
+
+def run_deterministic_verification(tool_context: ToolContext) -> str:
+    """Run deterministic AST verification against rewrite contracts.
+    
+    Validates structural changes made by the optimizer using the AST logic,
+    checking if N+1 database operations within loops were removed and replaced.
+    """
+    state = tool_context.state
+    target = state.get("target", "")
+    sandbox = state.get("sandbox", "")
+    modified_files = state.get("modified_files", [])
+    contracts_data = state.get("rewrite_contracts") or state.get("contracts")
+    
+    if not contracts_data:
+        return "No rewrite contracts in state."
+        
+    try:
+        contracts = [RewriteContract(**c) for c in contracts_data]
+    except Exception as e:
+        return f"ERROR deserializing contracts: {e}"
+        
+    result = execute_deterministic_verification(target, sandbox, contracts, modified_files)
+    state["deterministic_verification"] = result.model_dump()
+    
+    summary = []
+    summary.append(f"## Deterministic Verification Status: {result.status}")
+    summary.append(f"Summary: {result.summary}")
+    summary.append(f"Expected targets: {result.expected_targets}")
+    summary.append(f"Transformed targets: {result.transformed_targets}")
+    summary.append(f"Missing targets: {result.missing_targets}")
+    summary.append(f"Rewrite coverage: {result.rewrite_coverage:.2%}")
+    
+    if result.target_coverage:
+        summary.append("\n### Target Coverage")
+        for tc in result.target_coverage:
+            summary.append(f"- {tc.file}::{tc.function} -> {tc.status}")
+            if tc.details:
+                summary.append(f"  Details: {tc.details}")
+                
+    if result.violations:
+        summary.append("\n### Violations")
+        for v in result.violations:
+            summary.append(f"- [{v.severity}] {v.code}: {v.message}")
+            
+    summary.append("\n```json")
+    summary.append(json.dumps(result.model_dump(), indent=2))
+    summary.append("```")
+    
+    return "\n".join(summary)

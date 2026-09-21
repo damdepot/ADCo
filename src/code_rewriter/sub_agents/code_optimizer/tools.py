@@ -161,6 +161,23 @@ def get_optimization_context(tool_context: ToolContext) -> str:
             "optimizations you have already applied."
         )
         sections.append(failure_section)
+        
+    contracts = tool_context.state.get("rewrite_contracts") or tool_context.state.get("contracts")
+    if contracts:
+        contract_lines = ["## Rewrite Contracts (Deterministic AST Analysis)"]
+        for c in contracts:
+            contract_lines.append(f"- Rewrite ID: {c.get('rewrite_id')}")
+            contract_lines.append(f"  Strategy: {c.get('strategy')}")
+            contract_lines.append(f"  Pattern: {c.get('pattern')}")
+            contract_lines.append(f"  Must Preserve: {', '.join(c.get('must_preserve', []))}")
+            contract_lines.append(f"  Must Not Change: {', '.join(c.get('must_not_change', []))}")
+            targets = c.get('targets', [])
+            if targets:
+                contract_lines.append(f"  Targets:")
+                for t in targets:
+                    fn = t.get('qualified_function') or t.get('function')
+                    contract_lines.append(f"    - File: {t.get('file')}, Function: {fn}")
+        sections.append("\n".join(contract_lines))
 
     return "\n\n".join(sections)
 

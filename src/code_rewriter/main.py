@@ -24,6 +24,7 @@ from src.code_rewriter.agent import create_root_agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from src.intent_analyzer.main import run_pipeline as run_intent_analyzer
+from src.code_rewriter.tools.pipeline_analysis import build_contracts_from_intent
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
@@ -118,6 +119,7 @@ def _write_output_result(output_path: str, state: dict[str, Any], model: str = "
             "intent_extractor_output": _maybe_parse(state.get("intent_extractor_output")),
             "code_optimizer_output": _maybe_parse(state.get("code_optimizer_output")),
             "verifier_output": _maybe_parse(state.get("verifier_output")),
+            "deterministic_verification": _maybe_parse(state.get("deterministic_verification", {})),
         }
     }
 
@@ -167,6 +169,17 @@ async def run_pipeline(
         if intent:
             initial_state["intent_output"] = intent
             initial_state["intent_extractor_output"] = intent
+
+    intent_output = initial_state.get("intent_output")
+    if intent_output:
+        _log_event(f"Building rewrite contracts from intent...", log_file=log_file_abs, verbose=verbose)
+        try:
+            _, contracts = build_contracts_from_intent(target_abs, intent_output)
+            initial_state["rewrite_contracts"] = [c.model_dump() for c in contracts]
+            initial_state["contracts"] = [c.model_dump() for c in contracts]
+            _log_event(f"Built {len(contracts)} rewrite contracts.", log_file=log_file_abs, verbose=verbose)
+        except Exception as e:
+            _log_event(f"Error building contracts: {e}", log_file=log_file_abs, verbose=verbose)
 
     session_service = InMemorySessionService()
     sid = uuid.uuid4().hex[:12]

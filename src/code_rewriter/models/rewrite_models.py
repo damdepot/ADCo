@@ -17,6 +17,7 @@ class RewriteContract(BaseModel):
     """A contract defining constraints and strategies for a specific code rewrite."""
     rewrite_id: str = Field(description="A unique identifier for this rewrite operation")
     target: RewriteTarget = Field(description="The target file or function for this rewrite")
+    targets: list[RewriteTarget] = Field(default_factory=list, description="Optional list of all expected rewrite targets. When non-empty, the verifier checks coverage across all targets.")
     pattern: str = Field(description="The optimization or design pattern to apply")
     strategy: str = Field(description="The strategy detailing how the rewrite will be performed")
     allowed_regions: list[str] = Field(default_factory=list, description="Regions of the target that are allowed to be modified")

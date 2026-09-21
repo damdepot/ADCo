@@ -18,6 +18,15 @@ from .rewrite_models import (
     RewriteContract,
     RewriteTarget,
 )
+from .verification_models import (
+    CheckStatus,
+    TargetStatus,
+    VerificationCheck,
+    VerificationResult,
+    VerificationStatus,
+    VerificationViolation,
+    ViolationSeverity,
+)
 
 class RewriterOutputs(BaseModel):
     scan_result: Dict[str, Any] = Field(default_factory=dict)
@@ -53,4 +62,12 @@ __all__ = [
     "RewriteContract",
     "RewriterOutputs",
     "CodeRewriterResult",
+    "VerificationStatus",
+    "ViolationSeverity",
+    "CheckStatus",
+    "VerificationViolation",
+    "VerificationCheck",
+    "TargetStatus",
+    "VerificationResult",
 ]
+
