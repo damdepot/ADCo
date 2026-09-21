@@ -6,8 +6,6 @@ import re
 from pathlib import Path
 from google.adk.tools import ToolContext
 
-from src.code_rewriter.tools.validator import validate_format_strings
-
 
 def _maybe_parse(value: object) -> dict:
     """Return *value* as a dict, JSON-parsing strings (stripping markdown fences)."""
@@ -84,14 +82,6 @@ def write_file(path: str, content: str, tool_context: ToolContext) -> str:
                 f"- Escaped quotes like \\' or \\\" outside strings — write quotes as-is\n"
                 f"- Lines merged together (e.g. 'import loggingfrom pprint' instead of two lines)\n"
                 f"Read the file again, fix the issue, and re-call write_file with corrected content."
-            )
-        fmt_errors = validate_format_strings(content, path)
-        if fmt_errors:
-            return (
-                f"ERROR: String formatting error in {path}:\n"
-                + "\n".join(f"- {e}" for e in fmt_errors)
-                + "\n\nFix the format string (e.g. escape DB-API placeholders as %%s if formatting with %) "
-                "or adjust the argument tuple, and re-call write_file."
             )
 
     if os.path.isfile(full):

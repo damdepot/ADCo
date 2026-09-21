@@ -26,16 +26,10 @@ Apply the following optimization patterns where applicable. Keep your optimizati
 1. After updating the code, diff-read every SQL string against the original to ensure SQL identifier integrity (see rules below).
 2. Call `write_file(path, content)` with the COMPLETE optimized file.
 
-## SQL identifier integrity & string formatting (CRITICAL — violations cause runtime errors)
+## SQL identifier integrity (CRITICAL — violations cause runtime errors)
 - You MUST NOT invent SQL identifiers (column names, table names, aliases) — only reuse identifiers that already appear in the original source code.
 - When rewriting a query, extract column and table names from the original SQL strings verbatim. Do not guess, abbreviate, expand, or recombine them.
 - After writing optimized code, diff-read every SQL string against the original: every identifier in the new SQL must match an identifier in the original code character for character.
-- **DB-API parameter escaping vs Python string formatting**:
-  If a SQL query template undergoes Python `%` string formatting (e.g. dynamically formatting column numbers or identifiers like `q["getStockInfo"] % (d_id)` or `query % (prefix)`):
-  - Any DB-API parameter placeholders in that query MUST be escaped as `%%s`.
-  - Python `%` evaluation converts `%%s` -> `%s` (leaving valid `%s` placeholders for `cursor.execute(sql, (params...))`).
-  - If DB-API placeholders are left unescaped as `%s`, Python treats them as string formatting parameters, leading to `TypeError: not enough arguments for format string`.
-  - The argument count passed to `% (...)` or `.format(...)` must EXACTLY match the number of unescaped format specifiers in the string template.
 
 ## Retry handling (when a prior verifier failure exists)
 If `get_optimization_context` returns a **"Prior verifier failure"** section, you are on a retry attempt. You MUST:

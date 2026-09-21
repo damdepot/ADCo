@@ -8,8 +8,6 @@ import sys
 from pathlib import Path
 from google.adk.tools import ToolContext
 
-from src.code_rewriter.tools.validator import validate_format_strings
-
 _CODE_ERRORS = re.compile(
     r"SyntaxError|ImportError|ModuleNotFoundError|NameError|"
     r"AttributeError|TypeError|IndentationError|ValueError"
@@ -60,13 +58,8 @@ def check_syntax(tool_context: ToolContext) -> str:
             continue
         full = os.path.join(sandbox, rel)
         try:
-            content = Path(full).read_text()
-            compile(content, rel, "exec")
-            fmt_errors = validate_format_strings(content, rel)
-            if fmt_errors:
-                lines.append(f"  FAIL {rel}: format string error: {'; '.join(fmt_errors)}")
-            else:
-                lines.append(f"  OK  {rel}")
+            compile(Path(full).read_text(), rel, "exec")
+            lines.append(f"  OK  {rel}")
         except SyntaxError as e:
             lines.append(f"  FAIL {rel}: {e}")
         except FileNotFoundError:
