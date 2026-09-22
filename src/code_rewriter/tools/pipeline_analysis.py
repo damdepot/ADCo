@@ -263,7 +263,7 @@ def execute_deterministic_verification(
     if has_critical or (expected_targets > 0 and (transformed_targets < expected_targets or missing_targets > 0)):
         overall_status = "FAIL"
     else:
-        overall_status = "PASS" if not all_violations else "FAIL"
+        overall_status = "PASS" if not any(v.severity == "ERROR" for v in all_violations) else "FAIL"
 
     return VerificationResult(
         status=overall_status,

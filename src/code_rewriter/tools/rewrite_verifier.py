@@ -16,6 +16,7 @@ from ..models import (
 from .ast_analyzer import analyze_source
 from ..models.ast_models import FileAnalysis, FunctionAnalysis
 from .dependency_graph import build_dependency_graph, DependencyGraph
+from .sql_analysis import row_index_violations, planner_unfriendly_sql
 
 def _extract_function_ast_map(source: Optional[str]) -> Dict[str, ast.AST]:
     if not source:
@@ -41,6 +42,91 @@ def _is_n1(contract: RewriteContract) -> bool:
     pattern_upper = (contract.pattern or "").upper()
     strategy_upper = (contract.strategy or "").upper()
     return "N+1" in pattern_upper or "N_PLUS_ONE" in pattern_upper or "N_PLUS_ONE" in strategy_upper or "BATCH" in strategy_upper or "COMBINING" in strategy_upper
+
+def _target_names(target: ast.AST) -> List[str]:
+    """Resolve the assigned name(s) from an assignment/unpacking target."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: List[str] = []
+        for elt in target.elts:
+            names.extend(_target_names(elt))
+        return names
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    return []
+
+def _collect_local_names(node: ast.AST) -> tuple[set[str], set[str], set[str]]:
+    """Return (assigned, loaded, excluded) names for a function AST node."""
+    assigned: set[str] = set()
+    loaded: set[str] = set()
+    excluded: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Assign):
+            for t in child.targets:
+                assigned.update(_target_names(t))
+        elif isinstance(child, ast.AnnAssign):
+            assigned.update(_target_names(child.target))
+        elif isinstance(child, ast.AugAssign):
+            names = _target_names(child.target)
+            assigned.update(names)
+            loaded.update(names)
+        elif isinstance(child, (ast.For, ast.AsyncFor)):
+            assigned.update(_target_names(child.target))
+        elif isinstance(child, ast.NamedExpr):
+            assigned.update(_target_names(child.target))
+        elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+            loaded.add(child.id)
+        elif isinstance(child, ast.Global):
+            excluded.update(child.names)
+        elif isinstance(child, ast.Nonlocal):
+            excluded.update(child.names)
+    return assigned, loaded, excluded
+
+def _dead_locals(node: ast.AST) -> set[str]:
+    assigned, loaded, excluded = _collect_local_names(node)
+    dead = assigned - loaded
+    return {name for name in dead if not name.startswith("_") and name not in excluded}
+
+def check_assert_preservation(orig_node: ast.AST, opt_node: ast.AST) -> List[VerificationViolation]:
+    """ADVISORY: warn when assert statements are dropped from the target function."""
+    if orig_node is None or opt_node is None:
+        return []
+    orig_count = sum(1 for n in ast.walk(orig_node) if isinstance(n, ast.Assert))
+    opt_count = sum(1 for n in ast.walk(opt_node) if isinstance(n, ast.Assert))
+    if opt_count < orig_count:
+        return [VerificationViolation(
+            code="ASSERT_REMOVED",
+            severity="WARNING",
+            message=f"{orig_count - opt_count} assert statement(s) removed from the target function (was {orig_count}, now {opt_count}); preserve failure semantics.",
+            expected=orig_count,
+            actual=opt_count,
+        )]
+    return []
+
+def check_dead_locals(orig_node: ast.AST, opt_node: ast.AST) -> List[VerificationViolation]:
+    """ADVISORY: warn when the rewrite introduces assigned-but-unused locals."""
+    if orig_node is None or opt_node is None:
+        return []
+    newly_dead = _dead_locals(opt_node) - _dead_locals(orig_node)
+    if newly_dead:
+        return [VerificationViolation(
+            code="DEAD_LOCAL",
+            severity="WARNING",
+            message=f"Unused local variable(s) introduced: {', '.join(sorted(newly_dead))}.",
+        )]
+    return []
+
+def _resolve_region_node(ast_map: Dict[str, ast.AST], region: Optional[str]) -> Optional[ast.AST]:
+    if not region:
+        return None
+    if region in ast_map:
+        return ast_map[region]
+    bare = region.split(".")[-1]
+    for key, node in ast_map.items():
+        if key.endswith("." + region) or key == bare:
+            return node
+    return None
 
 def verify_rewrite(original_source: str, optimized_source: str, contract: RewriteContract) -> VerificationResult:
     violations: List[VerificationViolation] = []
@@ -243,6 +329,20 @@ def verify_rewrite(original_source: str, optimized_source: str, contract: Rewrit
                 ))
     checks.append(VerificationCheck(name="check_n_plus_one_strategy", status=n1_status, details=n1_details))
 
+    # 8. Advisory (non-blocking) checks: assert preservation & newly-dead locals
+    seen_advisory_pairs = set()
+    for region in target_regions:
+        orig_node = _resolve_region_node(orig_ast_map, region)
+        opt_node = _resolve_region_node(opt_ast_map, region)
+        if orig_node is None and opt_node is None:
+            continue
+        pair_key = (id(orig_node), id(opt_node))
+        if pair_key in seen_advisory_pairs:
+            continue
+        seen_advisory_pairs.add(pair_key)
+        violations.extend(check_assert_preservation(orig_node, opt_node))
+        violations.extend(check_dead_locals(orig_node, opt_node))
+
     coverage_result = check_rewrite_coverage(orig_ast, opt_ast, contract, orig_source=original_source, opt_source=optimized_source)
     violations.extend(coverage_result.violations)
     checks.extend(coverage_result.checks)
@@ -258,7 +358,52 @@ def verify_rewrite(original_source: str, optimized_source: str, contract: Rewrit
         details=f"{len(dep_violations)} dependency violations"
     ))
 
-    overall_status: VerificationStatus = "PASS" if not violations else "FAIL"
+    # 9. Deterministic SQL checks (optimized source only; pre-existing patterns ignored)
+    opt_row = row_index_violations(optimized_source)
+    orig_row = row_index_violations(original_source)
+    orig_row_sigs = {
+        (v["function"], v["sql"], v["max_index"], v["line"]) for v in orig_row
+    }
+    seen_row = set()
+    for site in opt_row:
+        signature = (site["function"], site["sql"], site["max_index"], site["line"])
+        dedup_key = (site["function"], site["sql"], site["line"])
+        if dedup_key in seen_row or signature in orig_row_sigs:
+            continue
+        seen_row.add(dedup_key)
+        violations.append(VerificationViolation(
+            code="ROW_INDEX_OUT_OF_RANGE",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} reads row[{site['max_index']}] but its SELECT "
+                f"returns only {site['column_count']} column(s) — the lookup key columns are "
+                "probably missing from the SELECT. Add the key column(s) to the SELECT list "
+                "or fix the row indices."
+            ),
+            expected=site["column_count"],
+            actual=site["max_index"],
+        ))
+
+    opt_plan = planner_unfriendly_sql(optimized_source)
+    orig_plan = planner_unfriendly_sql(original_source)
+    orig_plan_keys = {(v["function"], v["sql"], v["line"]) for v in orig_plan}
+    seen_plan = set()
+    for site in opt_plan:
+        dedup_key = (site["function"], site["sql"], site["line"])
+        if dedup_key in seen_plan or dedup_key in orig_plan_keys:
+            continue
+        seen_plan.add(dedup_key)
+        violations.append(VerificationViolation(
+            code="PLANNER_UNFRIENDLY_SQL",
+            severity="WARNING",
+            message=(
+                f"Function {site['function']} comma-cross-joins a derived table in FROM, "
+                "which can raise per-execution planning cost. Prefer a scalar subquery in "
+                "WHERE or an explicit JOIN instead."
+            ),
+        ))
+
+    overall_status: VerificationStatus = "FAIL" if any(v.severity == "ERROR" for v in violations) else "PASS"
     summary = f"Verification {'passed' if overall_status == 'PASS' else 'failed'} with {len(violations)} violations."
     
     return VerificationResult(

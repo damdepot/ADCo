@@ -20,7 +20,16 @@ The `replace_function` and `write_file` tools will REJECT your output if it is i
 - NEVER `%`-format a SQL template that contains `%s` placeholders — pre-format any dynamic identifier into a variable first (e.g. `col_name = "col_%02d" % idx`), then build the SQL with concatenation or f-strings and pass parameter values separately.
 - Detect the placeholder dialect from the original source (`?` vs `%s`) and never mix dialects in one statement.
 - Composite-key batching: one tuple `IN ((%s,%s), ...)` query; include the key columns in the SELECT so results map unambiguously. NEVER execute a database call inside a loop — including a chunking loop. Execute each batch query exactly once.
+- Batched-lookup mapping (CRITICAL): the SELECT list MUST explicitly include the key column(s) you use to build the lookup dict, and every `row[i]` index you read must be within the SELECT column list. Reusing a single-row query template and indexing columns that the template does not select causes `IndexError: tuple index out of range` at runtime. Example: if you map `{(row[0], row[1]): (row[2], ...)}`, the SELECT must start with the two key columns.
 - Never invent column/table identifiers — reuse identifiers verbatim from the original SQL.
+- Keep combined queries planner-friendly: prefer a simple `JOIN` or scalar subqueries in `WHERE`; do NOT cross-join a derived table in `FROM` (e.g. `FROM t, (SELECT ...) d WHERE ...`). Such forms can blow up query planning time per execution and make the "optimized" code slower. When in doubt, keep the query shape close to the original.
+
+## Quality rules
+
+- Push reduction into SQL: when batching a per-row `SELECT ... LIMIT 1` / single-value lookup, reduce in the database (`MIN`/`MAX`/`SUM ... GROUP BY`) instead of fetching all rows and reducing in Python. Example: `SELECT NO_D_ID, MIN(NO_O_ID) FROM NEW_ORDER WHERE NO_D_ID = ANY(%s) AND NO_W_ID = %s AND NO_O_ID > -1 GROUP BY NO_D_ID`.
+- Read-modify-write batching: if the original read a row and wrote accumulated state to it per iteration, the batch must preserve sequential accumulation. If duplicate keys are possible, aggregate deltas per key in memory before the batched write (do not assume keys are unique).
+- Preserve failure semantics: keep every `assert` and its condition; do not "fix" unrelated pre-existing bugs (e.g. missing-row `len(None)` crashes) — the rewrite must be behavior-preserving.
+- No dead code: remove any local/temporary you introduce but never read; do not leave unused query or helper references.
 
 ## Retry handling
 

@@ -97,6 +97,7 @@ def make_orchestrate(
             qfn = target.get("qualified_function") or target.get("function") or ""
             passed = False
             failure: Any = None
+            verdict: Any = None
 
             for attempt in range(1, max_attempts + 1):
                 yield Event(
@@ -125,7 +126,7 @@ def make_orchestrate(
                     "file": target.get("file", ""),
                     "function": qfn,
                     "status": "PASS" if passed else "FAIL",
-                    "verification": failure,
+                    "verification": verdict,
                 }
             )
 
@@ -140,6 +141,19 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
     n_total = len(results)
     n_pass = sum(1 for r in results if r.get("status") == "PASS")
     all_pass = all(r.get("status") == "PASS" for r in results)
+
+    errors = [
+        v
+        for r in results
+        for v in ((r.get("verification") or {}).get("violations") or [])
+        if v.get("severity") == "ERROR"
+    ]
+    warnings = [
+        v
+        for r in results
+        for v in ((r.get("verification") or {}).get("violations") or [])
+        if v.get("severity") == "WARNING"
+    ]
 
     det = {
         "status": "PASS" if all_pass else "FAIL",
@@ -163,12 +177,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
             }
             for r in results
         ],
-        "violations": [
-            v
-            for r in results
-            if r.get("status") != "PASS"
-            for v in ((r.get("verification") or {}).get("violations") or [])
-        ],
+        "violations": errors + warnings,
     }
 
     llm = _maybe_parse(ctx.state.get("verifier_output"))
@@ -197,12 +206,15 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         # Deterministic verification is authoritative: every target transformed
         # means PASS. The advisory LLM review may add a suggestion, but it must
         # not flip a deterministic PASS into a FAIL (observed hallucinated
-        # "residual loop ops" on already-batched code).
+        # "residual loop ops" on already-batched code). Advisory warnings are
+        # surfaced in `detail`; they never change `status`.
         vo = {
             "status": "PASS",
             "category": "NONE",
             "reason": det["summary"],
-            "detail": "",
+            "detail": "; ".join(
+                f"[{w.get('code')}] {w.get('message')}" for w in warnings
+            ),
             "suggestion": llm.get("suggestion", ""),
         }
 

@@ -2,7 +2,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 VerificationStatus = Literal["PASS", "FAIL"]
-ViolationSeverity = Literal["ERROR"]
+ViolationSeverity = Literal["ERROR", "WARNING"]
 CheckStatus = Literal["PASS", "FAIL"]
 
 class VerificationViolation(BaseModel):
