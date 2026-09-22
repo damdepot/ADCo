@@ -30,7 +30,7 @@ INTENT_ANALYZER_PROMPT = """You are the ADCo Codebase Intent Analyzer Orchestrat
 
 <step_2>
 **Action**: Call the `file_selector` sub-agent tool.
-**Description**: Pass the file listing from step 1 under the heading "## Project listing". It will identify database-relevant files and store `file_selector_output` in session state.
+**Description**: Pass the file listing from step 1 under the heading "## Project listing". `file_selector` will retrieve or use the file listing to select all database-relevant files (including database driver implementations in `drivers/`, schemas, queries, and entry points) and store `file_selector_output` in session state.
 </step_2>
 
 <step_3>
