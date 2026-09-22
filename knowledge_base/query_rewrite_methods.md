@@ -46,7 +46,9 @@
   * Replace repeated inserts with multi-row `INSERT`.
   * Replace repeated updates with batch or set-based `UPDATE`.
   * Use database-driver batch APIs such as `executemany` where appropriate.
-  * Split excessively large batches into bounded chunks.
+  * Push reduction into SQL: reduce in the database with `MIN`/`MAX`/`SUM`/`COUNT` ... `GROUP BY` rather than fetching the full batch and reducing in Python.
+  * Prefer a single batch statement. Never place a database call inside a loop (including a chunking loop) — the strict-zero rewrite contract forbids it.
+  * When combining queries, keep the plan simple: prefer a plain `JOIN` or scalar subqueries in `WHERE`; avoid cross-joining a derived table in `FROM`, which can make per-execution planning time dominate and slow the "optimized" code down.
 * **Risks**:
 
   * Parameter-count limits.
@@ -502,3 +504,25 @@
   * Validate application tests after source-code transformations.
   * Reject transformations that cannot be shown to preserve required semantics.
 * **Verification Principle**: Semantic correctness must be established before treating a transformation as a valid optimization.
+
+## 31. COMPOSITE_KEY_BATCH_LOOKUP
+
+* **Definition**: Replace per-row SELECT queries inside a loop (where rows are identified by 2+ columns) with a single batch query using a multi-column tuple IN clause, then re-index results into a composite-key lookup dictionary.
+* **Objective**: Reduce N per-row DB round-trips to exactly one batch query (never a loop of chunked queries).
+* **Conditions**: Loop fetches rows by (col_a, col_b) per iteration; all pairs are known before loop entry; database supports tuple IN syntax (PostgreSQL, MySQL 5.7+, SQLite 3.15+).
+* **Mechanisms**:
+  * Collect `(a_val, b_val)` pairs before the loop
+  * Build `pair_ph = "(%s,%s)"` or `"(?,?)"` per detected dialect
+  * `placeholders = ", ".join([pair_ph] * len(pairs))`
+  * `flat_params = [v for pair in pairs for v in pair]`
+  * If SELECT list includes a dynamic column name (e.g. `"col_%02d" % idx`): format it into a variable FIRST, then concatenate into SQL with `+` — never apply `%` to a template containing `%s`/`?` placeholders
+  * Index results: `{(row[0], row[1]): row[2:] for row in cursor.fetchall()}`
+  * In loop: `lookup.get((a_val, b_val))` — zero `cursor.execute` calls
+  * When the batched write is a read-modify-write, preserve sequential accumulation: if duplicate keys are possible, aggregate deltas per key in memory before the batch write (do not assume keys are unique).
+  * Preserve failure semantics: keep every `assert` and its condition; the rewrite must be behavior-preserving (do not fix unrelated pre-existing bugs).
+* **Risks**:
+  * Parameter-count limits — a single batch query must stay within the driver limit; never wrap batch execution in a loop to chunk it (strict-zero forbids DB calls inside loops)
+  * Tuple-IN not supported by all driver versions — verify before applying
+  * Result rows may differ in order — always look up by composite key, not by index
+  * Large batches increase transaction scope and lock duration
+* **Safety**: Include both key columns as first two SELECT columns. Use `.get()` not `[]` to preserve None-handling. Never mix `%s` and `?` placeholders in the same query. The SELECT list MUST contain every column used as a lookup key, and every `row[i]` index read must be within the SELECT column list — indexing a column the query does not select raises `IndexError: tuple index out of range` at runtime. For read-modify-write batches, aggregate duplicate-key deltas before writing, and preserve all `assert`/failure semantics.
