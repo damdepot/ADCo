@@ -8,7 +8,6 @@ def build_rewrite_contract(
     target: RewriteTarget,
     pattern: str,
     strategy: str,
-    required_conditions: Optional[list[str]] = None,
     must_preserve: Optional[list[str]] = None,
     must_not_change: Optional[list[str]] = None,
     rewrite_id: Optional[str] = None,
@@ -51,7 +50,7 @@ def build_rewrite_contract(
     _id = rewrite_id if rewrite_id is not None else str(uuid.uuid4())
     
     if must_preserve is None:
-        must_preserve = ["Existing business logic", "Return types"]
+        must_preserve = ["return_type", "function_signature", "transaction_semantics", "exception_behavior"]
     if must_not_change is None:
         must_not_change = ["Database schema", "External API contracts"]
 
@@ -61,7 +60,6 @@ def build_rewrite_contract(
         pattern=pattern,
         strategy=strategy,
         allowed_regions=[],
-        required_conditions=required_conditions or [],
         must_preserve=must_preserve,
         must_not_change=must_not_change,
     )

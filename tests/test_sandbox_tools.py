@@ -21,24 +21,10 @@ class MockToolContext:
 # ---------------------------------------------------------------------------
 
 def test_file_selector_output_schema_validates():
-    from src.code_rewriter.sub_agents.file_selector.models import FileSelectorOutput
+    from src.intent_analyzer.sub_agents.file_selector.models import FileSelectorOutput
     m = FileSelectorOutput.model_validate({"files": ["a.py", "b.py"], "entry_point": "main.py"})
     assert m.files == ["a.py", "b.py"]
     assert m.entry_point == "main.py"
-
-
-def test_intent_extractor_output_schema_validates():
-    from src.code_rewriter.sub_agents.intent_extractor.models import IntentExtractorOutput
-    data = {
-        "connection": "pool", "queries": "crud", "transactions": "manual",
-        "n_plus_one": "yes: loop in loader", "concurrency": "sequential",
-        "orm": "raw sql",
-        "optimization_targets": [{"file": "loader.py", "description": "batch inserts"}],
-        "notes": "n/a",
-    }
-    m = IntentExtractorOutput.model_validate(data)
-    assert m.optimization_targets[0].file == "loader.py"
-    assert m.optimization_targets[0].description == "batch inserts"
 
 
 def test_code_optimizer_output_schema_validates():
@@ -283,6 +269,65 @@ def test_codeopt_get_optimization_context_no_targets():
     assert "ERROR" in result
 
 
+def test_codeopt_get_optimization_context_single_target():
+    tc = MockToolContext({
+        "intent_extractor_output": {
+            "connection": "pool", "queries": "crud", "transactions": "manual",
+            "n_plus_one": "yes", "concurrency": "seq", "orm": "raw",
+            "optimization_targets": [
+                {"file": "driver.py", "description": "batch new order queries"},
+            ],
+            "notes": "n/a",
+        },
+        "strategies": "QUERY_BATCHING",
+        "sandbox": "/tmp/sb",
+        "current_contract": {
+            "rewrite_id": "r1",
+            "target": {
+                "file": "driver.py",
+                "function": "doNewOrder",
+                "qualified_function": "Db.doNewOrder",
+            },
+            "targets": [{"file": "driver.py", "function": "Db.doNewOrder"}],
+            "pattern": "N_PLUS_ONE_QUERY",
+            "strategy": "QUERY_BATCHING",
+            "allowed_regions": ["Db.doNewOrder"],
+            "must_preserve": ["function_signature"],
+            "must_not_change": ["return_type"],
+        },
+        "pipeline_analysis_markdown": {
+            "Db.doNewOrder": "# Dependency Slice: `doNewOrder`",
+        },
+        "last_failure": {
+            "status": "FAIL",
+            "target_coverage": [
+                {
+                    "file": "driver.py",
+                    "function": "Db.doNewOrder",
+                    "status": "MISSING_REWRITE",
+                    "details": "2 loop ops remain",
+                },
+            ],
+            "violations": [
+                {
+                    "code": "STRATEGY_NOT_APPLIED",
+                    "severity": "ERROR",
+                    "message": "Strict-zero violation",
+                },
+            ],
+        },
+    })
+
+    result = co_get_optimization_context(tc)
+
+    assert "Acceptance Checklist" in result
+    assert "0 database operations inside any loop" in result
+    assert "doNewOrder" in result
+    assert "MISSING_REWRITE" in result
+    assert "Strict-zero violation" in result
+    assert "Dependency Slice" in result
+
+
 # ---------------------------------------------------------------------------
 # verifier.tools
 # ---------------------------------------------------------------------------
@@ -411,11 +456,98 @@ def test_run_application_classified_as_code_error():
         assert result.startswith("STARTUP_FAILED_CODE:CODE")
 
 
+def test_run_application_deterministic_verification_pass():
+    from src.code_rewriter.sub_agents.verifier.tools import run_deterministic_verification
+    with tempfile.TemporaryDirectory() as target_dir, tempfile.TemporaryDirectory() as sandbox_dir:
+        orig_code = (
+            "def get_user_data(user_ids):\n"
+            "    results = []\n"
+            "    for uid in user_ids:\n"
+            "        cursor.execute('SELECT * FROM users WHERE id = %s', (uid,))\n"
+            "        results.append(cursor.fetchone())\n"
+            "    return results\n"
+        )
+        opt_code = (
+            "def get_user_data(user_ids):\n"
+            "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s)', (user_ids,))\n"
+            "    return cursor.fetchall()\n"
+        )
+        Path(os.path.join(target_dir, "app.py")).write_text(orig_code)
+        Path(os.path.join(sandbox_dir, "app.py")).write_text(opt_code)
+
+        entry = "app.py"
+        tc = MockToolContext({
+            "target": target_dir,
+            "sandbox": sandbox_dir,
+            "modified_files": ["app.py"],
+            "file_selector_output": {"entry_point": entry},
+            "rewrite_contracts": [
+                {
+                    "rewrite_id": "test_pass",
+                    "target": {"file": "app.py", "function": "get_user_data"},
+                    "targets": [{"file": "app.py", "function": "get_user_data"}],
+                    "pattern": "N+1 Query",
+                    "strategy": "Replace loop with IN clause",
+                    "allowed_regions": ["get_user_data"],
+                    "must_preserve": ["return_type", "function_signature"],
+                }
+            ],
+        })
+
+        result = run_application("", tc)
+        assert result.startswith("STARTED_OK")
+
+        standalone = run_deterministic_verification(tc)
+        assert "Deterministic Verification Status: PASS" in standalone
+
+
+def test_run_application_deterministic_verification_fail_blocks_started_ok():
+    with tempfile.TemporaryDirectory() as target_dir, tempfile.TemporaryDirectory() as sandbox_dir:
+        # Code is untransformed (queries still in loop), but valid python that exits 0
+        code = (
+            "def get_user_data(user_ids):\n"
+            "    results = []\n"
+            "    for uid in user_ids:\n"
+            "        cursor.execute('SELECT * FROM users WHERE id = %s', (uid,))\n"
+            "        results.append(cursor.fetchone())\n"
+            "    return results\n"
+        )
+        Path(os.path.join(target_dir, "app.py")).write_text(code)
+        Path(os.path.join(sandbox_dir, "app.py")).write_text(code)
+
+        entry = "app.py"
+        tc = MockToolContext({
+            "target": target_dir,
+            "sandbox": sandbox_dir,
+            "modified_files": ["app.py"],
+            "file_selector_output": {"entry_point": entry},
+            "rewrite_contracts": [
+                {
+                    "rewrite_id": "test_fail",
+                    "target": {"file": "app.py", "function": "get_user_data"},
+                    "targets": [{"file": "app.py", "function": "get_user_data"}],
+                    "pattern": "N+1 Query",
+                    "strategy": "Replace loop with IN clause",
+                    "allowed_regions": ["get_user_data"],
+                    "must_preserve": ["return_type", "function_signature"],
+                }
+            ],
+        })
+
+        result = run_application("", tc)
+        assert result.startswith("STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL")
+        assert "Violations:" in result
+        assert "Target Coverage:" in result
+        assert "MISSING_REWRITE" in result or "STRATEGY_NOT_APPLIED" in result
+        assert tc.state["deterministic_verification"]["status"] == "FAIL"
+
+
+
 # ---------------------------------------------------------------------------
 # intent_extractor.tools
 # ---------------------------------------------------------------------------
 
-from src.code_rewriter.sub_agents.intent_extractor.tools import read_selected_files
+from src.intent_analyzer.sub_agents.intent_extractor.tools import read_selected_files
 
 
 def test_read_selected_files_returns_contents():
@@ -451,29 +583,8 @@ def test_read_selected_files_no_files():
 # tools layer ADK wrappers
 # ---------------------------------------------------------------------------
 
-from src.code_rewriter.tools.scanner import scan_codebase
 from src.code_rewriter.tools.copier import copy_to_sandbox
 from src.code_rewriter.tools.planner import get_optimization_strategies
-
-
-def test_scan_codebase_writes_scan_result_to_state():
-    with tempfile.TemporaryDirectory() as root:
-        Path(os.path.join(root, "app.py")).write_text("print('hi')\n")
-        Path(os.path.join(root, "README.md")).write_text("docs")
-        tc = MockToolContext({"target": root})
-
-        result = scan_codebase(tc)
-
-        assert "app.py" in result
-        assert tc.state["scan_result"] == result
-
-
-def test_scan_codebase_missing_target():
-    tc = MockToolContext({})
-
-    result = scan_codebase(tc)
-
-    assert "ERROR" in result
 
 
 def test_copy_to_sandbox_writes_sandbox_to_state():

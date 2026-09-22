@@ -21,6 +21,5 @@ class RewriteContract(BaseModel):
     pattern: str = Field(description="The optimization or design pattern to apply")
     strategy: str = Field(description="The strategy detailing how the rewrite will be performed")
     allowed_regions: list[str] = Field(default_factory=list, description="Regions of the target that are allowed to be modified")
-    required_conditions: list[str] = Field(default_factory=list, description="Conditions that must be met for the rewrite to be valid")
     must_preserve: list[str] = Field(default_factory=list, description="Features or behaviors that must be preserved after the rewrite")
     must_not_change: list[str] = Field(default_factory=list, description="Features or behaviors that must explicitly not be changed")

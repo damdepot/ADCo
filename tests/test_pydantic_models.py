@@ -4,8 +4,6 @@ from pydantic import BaseModel
 from src.code_checker.agent import create_checker_agent
 from src.code_rewriter.sub_agents.verifier.agent import create_verifier_agent
 from src.code_rewriter.sub_agents.code_optimizer.agent import create_code_optimizer_agent
-from src.code_rewriter.sub_agents.intent_extractor.agent import create_intent_extractor_agent as create_rewriter_ie_agent
-from src.code_rewriter.sub_agents.file_selector.agent import create_file_selector_agent as create_rewriter_fs_agent
 from src.intent_analyzer.sub_agents.file_selector.agent import create_file_selector_agent as create_intent_fs_agent
 from src.intent_analyzer.sub_agents.intent_extractor.agent import create_intent_extractor_agent as create_intent_ie_agent
 from src.knob_tuner.sub_agents.db_inspector.agent import create_db_inspector_agent
@@ -15,7 +13,6 @@ from src.knob_tuner.sub_agents.knob_checker.agent import create_knob_checker_age
 from src.knob_tuner.sub_agents.live_tuner.agent import create_live_tuner_agent
 
 from src.intent_analyzer.models import IntentAnalyzerResult
-from src.code_rewriter.models import CodeRewriterResult, RewriterOutputs
 from src.knob_tuner.models import KnobTunerResult, TunerOutputs
 from src.adco.models import AdcoPipelineResult
 
@@ -25,8 +22,6 @@ def test_subagent_output_schemas():
         create_checker_agent(),
         create_verifier_agent(),
         create_code_optimizer_agent(),
-        create_rewriter_ie_agent(),
-        create_rewriter_fs_agent(),
         create_intent_fs_agent(),
         create_intent_ie_agent(),
         create_db_inspector_agent(),
@@ -51,29 +46,6 @@ def test_intent_analyzer_result_model():
     assert model.target == "/path/to/app"
     assert model.intent_output["queries"] == "SELECT 1"
     assert model.model_dump() == data
-
-
-def test_code_rewriter_result_model():
-    data = {
-        "timestamp": "2026-09-16T12:00:00",
-        "target": "/path/to/app",
-        "model": "gemini-3.5-flash-lite",
-        "sandbox": "/path/to/sandbox",
-        "status": "PASS",
-        "modified_files": ["db.py"],
-        "outputs": {
-            "scan_result": {},
-            "file_selector_output": {},
-            "intent_output": {},
-            "intent_extractor_output": {},
-            "code_optimizer_output": {},
-            "verifier_output": {"status": "PASS"},
-        },
-    }
-    model = CodeRewriterResult(**data)
-    assert model.status == "PASS"
-    assert model.modified_files == ["db.py"]
-    assert model.outputs.verifier_output == {"status": "PASS"}
 
 
 def test_knob_tuner_result_model():

@@ -1,3 +1,4 @@
+import ast
 from typing import Any, Dict, List, Optional
 import json
 
@@ -10,9 +11,36 @@ from ..models import (
     VerificationStatus,
     ViolationSeverity,
     TargetStatus,
+    DependencyType,
 )
 from .ast_analyzer import analyze_source
 from ..models.ast_models import FileAnalysis, FunctionAnalysis
+from .dependency_graph import build_dependency_graph, DependencyGraph
+
+def _extract_function_ast_map(source: Optional[str]) -> Dict[str, ast.AST]:
+    if not source:
+        return {}
+    try:
+        tree = ast.parse(source)
+    except Exception:
+        return {}
+    res: Dict[str, ast.AST] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            res[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    res[f"{node.name}.{child.name}"] = child
+                    if child.name not in res:
+                        res[child.name] = child
+    return res
+
+def _is_n1(contract: RewriteContract) -> bool:
+    """True when the contract targets an N+1 / batching / combining rewrite."""
+    pattern_upper = (contract.pattern or "").upper()
+    strategy_upper = (contract.strategy or "").upper()
+    return "N+1" in pattern_upper or "N_PLUS_ONE" in pattern_upper or "N_PLUS_ONE" in strategy_upper or "BATCH" in strategy_upper or "COMBINING" in strategy_upper
 
 def verify_rewrite(original_source: str, optimized_source: str, contract: RewriteContract) -> VerificationResult:
     violations: List[VerificationViolation] = []
@@ -52,15 +80,15 @@ def verify_rewrite(original_source: str, optimized_source: str, contract: Rewrit
         )
 
     # Get target function(s)
-    # The contract target is e.g. target.name.
-    # Actually, a contract target might not be just a single function, but usually is.
-    # I'll check all functions that match target.name, or all functions if target is file.
-    
-    # Let's extract functions to easily look them up by qualified_name
     orig_funcs = {f.qualified_name: f for f in _get_all_functions(orig_ast)}
     opt_funcs = {f.qualified_name: f for f in _get_all_functions(opt_ast)}
 
+    orig_ast_map = _extract_function_ast_map(original_source)
+    opt_ast_map = _extract_function_ast_map(optimized_source)
+
     target_name = contract.target.qualified_function or contract.target.function
+    target_file = contract.target.file or ""
+
     # 2. check_target_exists
     target_exists_status: CheckStatus = "PASS"
     target_exists_details = f"Target {target_name} found in optimized code"
@@ -76,6 +104,16 @@ def verify_rewrite(original_source: str, optimized_source: str, contract: Rewrit
                 expected=target_name,
                 actual=None
             ))
+        elif not contract.targets:
+            # Check single target transformation if targets list is empty
+            orig_node = orig_ast_map.get(target_name)
+            opt_node = opt_ast_map.get(target_name)
+            if orig_node is not None and opt_node is not None and ast.dump(orig_node) == ast.dump(opt_node):
+                violations.append(VerificationViolation(
+                    code="MISSING_REWRITE",
+                    severity="ERROR",
+                    message=f"Target function '{target_name}' in '{target_file}' has not been transformed (AST is unchanged from original)"
+                ))
     checks.append(VerificationCheck(name="check_target_exists", status=target_exists_status, details=target_exists_details))
 
     # 3. check_function_signature & 4. check_allowed_regions & 5. check_return_behavior
@@ -156,38 +194,69 @@ def verify_rewrite(original_source: str, optimized_source: str, contract: Rewrit
     # 7. check_n_plus_one_strategy
     n1_status: CheckStatus = "PASS"
     n1_details = "Strategy requirements met"
-    pattern_upper = (contract.pattern or "").upper()
-    strategy_upper = (contract.strategy or "").upper()
-    is_n1 = "N+1" in pattern_upper or "N_PLUS_ONE" in pattern_upper or "N_PLUS_ONE" in strategy_upper or "BATCH" in strategy_upper or "COMBINING" in strategy_upper
-    if is_n1:
-        # Check if original had DB ops in loops
-        orig_loops = [op for op in orig_ast.database_operations if op.inside_loop]
-        if orig_loops:
-            # Check if optimized still has DB ops in loops (in target)
-            opt_loops = [op for op in opt_ast.database_operations if op.inside_loop]
-            if opt_loops:
+    is_n1 = _is_n1(contract)
+
+    target_regions = set(contract.allowed_regions or [])
+    if contract.target:
+        target_regions.add(contract.target.qualified_function or contract.target.function)
+    for t in (contract.targets or []):
+        if t.qualified_function:
+            target_regions.add(t.qualified_function)
+        if t.function:
+            target_regions.add(t.function)
+
+    if is_n1 and target_regions:
+        target_orig_funcs = [f for f in _get_all_functions(orig_ast) if (f.qualified_name in target_regions or f.name in target_regions)]
+        target_opt_funcs = [f for f in _get_all_functions(opt_ast) if (f.qualified_name in target_regions or f.name in target_regions)]
+
+        orig_target_loops = [op for f in target_orig_funcs for op in f.database_operations if op.inside_loop]
+        opt_target_loops = [op for f in target_opt_funcs for op in f.database_operations if op.inside_loop]
+        opt_target_all = [op for f in target_opt_funcs for op in f.database_operations]
+
+        if orig_target_loops:
+            if opt_target_loops:
+                residual_fns = sorted(set(
+                    op.containing_function for op in opt_target_loops if op.containing_function
+                ))
                 n1_status = "FAIL"
-                n1_details = "N+1 strategy not applied"
+                n1_details = (
+                    f"Strict-zero not met: {len(opt_target_loops)} DB op(s) remain inside loops "
+                    f"(was {len(orig_target_loops)}, required 0). "
+                    f"Functions with residual loops: {residual_fns}"
+                )
                 violations.append(VerificationViolation(
                     code="STRATEGY_NOT_APPLIED",
                     severity="ERROR",
-                    message="Database operations remain inside loops"
+                    message=(
+                        f"Strict-zero violation: {len(opt_target_loops)} DB op(s) still inside loops "
+                        f"in {residual_fns} (required 0). "
+                        "Hoist all reads before loop with batch IN query; remove all cursor.execute from loop body."
+                    )
                 ))
-            else:
-                # Check for replacement op
-                if not opt_ast.database_operations:
-                    n1_status = "FAIL"
-                    n1_details = "Replacement DB operation missing"
-                    violations.append(VerificationViolation(
-                        code="REPLACEMENT_OP_MISSING",
-                        severity="ERROR",
-                        message="No replacement database operations found outside loop"
-                    ))
+            elif not opt_target_all:
+                n1_status = "FAIL"
+                n1_details = "Replacement DB operation missing"
+                violations.append(VerificationViolation(
+                    code="REPLACEMENT_OP_MISSING",
+                    severity="ERROR",
+                    message="No replacement database operations found outside loop"
+                ))
     checks.append(VerificationCheck(name="check_n_plus_one_strategy", status=n1_status, details=n1_details))
 
-    coverage_result = check_rewrite_coverage(orig_ast, opt_ast, contract)
+    coverage_result = check_rewrite_coverage(orig_ast, opt_ast, contract, orig_source=original_source, opt_source=optimized_source)
     violations.extend(coverage_result.violations)
     checks.extend(coverage_result.checks)
+
+    # Dependency integrity check
+    orig_graph = build_dependency_graph(orig_ast, original_source)
+    opt_graph = build_dependency_graph(opt_ast, optimized_source)
+    dep_violations = check_dependency_integrity(orig_graph, opt_graph, contract)
+    violations.extend(dep_violations)
+    checks.append(VerificationCheck(
+        name="check_dependency_integrity",
+        status="PASS" if not dep_violations else "FAIL",
+        details=f"{len(dep_violations)} dependency violations"
+    ))
 
     overall_status: VerificationStatus = "PASS" if not violations else "FAIL"
     summary = f"Verification {'passed' if overall_status == 'PASS' else 'failed'} with {len(violations)} violations."
@@ -209,7 +278,14 @@ def _get_all_functions(ast: FileAnalysis) -> List[FunctionAnalysis]:
     for cls in ast.classes:
         funcs.extend(cls.methods)
     return funcs
-def check_rewrite_coverage(orig_analysis: FileAnalysis, opt_analysis: FileAnalysis, contract: RewriteContract) -> VerificationResult:
+
+def check_rewrite_coverage(
+    orig_analysis: FileAnalysis, 
+    opt_analysis: FileAnalysis, 
+    contract: RewriteContract,
+    orig_source: Optional[str] = None,
+    opt_source: Optional[str] = None,
+) -> VerificationResult:
     target_coverage: List[TargetStatus] = []
     checks: List[VerificationCheck] = []
     violations: List[VerificationViolation] = []
@@ -238,9 +314,10 @@ def check_rewrite_coverage(orig_analysis: FileAnalysis, opt_analysis: FileAnalys
     opt_funcs = {f.qualified_name: f for f in _get_all_functions(opt_analysis)}
     opt_funcs.update({f.name: f for f in _get_all_functions(opt_analysis) if f.name not in opt_funcs})
 
-    pattern_upper = (contract.pattern or "").upper()
-    strategy_upper = (contract.strategy or "").upper()
-    is_n1 = "N+1" in pattern_upper or "N_PLUS_ONE" in pattern_upper or "N_PLUS_ONE" in strategy_upper or "BATCH" in strategy_upper or "COMBINING" in strategy_upper
+    orig_ast_map = _extract_function_ast_map(orig_source) if orig_source else {}
+    opt_ast_map = _extract_function_ast_map(opt_source) if opt_source else {}
+
+    is_n1 = _is_n1(contract)
 
     for t in contract.targets:
         fn_key = t.qualified_function or t.function
@@ -249,21 +326,26 @@ def check_rewrite_coverage(orig_analysis: FileAnalysis, opt_analysis: FileAnalys
             
         orig_f = orig_funcs.get(fn_key)
         opt_f = opt_funcs.get(fn_key)
+        orig_node = orig_ast_map.get(fn_key)
+        opt_node = opt_ast_map.get(fn_key)
         
-        if not orig_f or not opt_f or not is_n1:
+        if not orig_f or not opt_f:
             target_coverage.append(TargetStatus(
                 file=t.file,
                 function=fn_key,
-                status="UNVERIFIABLE",
-                details="Target not found or not N+1 strategy."
+                status="MISSING_REWRITE" if not opt_f else "UNVERIFIABLE",
+                details=f"Target function '{fn_key}' in '{t.file}' {'missing from optimized code' if not opt_f else 'not found in original code'}."
             ))
+            if not opt_f:
+                violations.append(VerificationViolation(
+                    code="MISSING_REWRITE",
+                    severity="ERROR",
+                    message=f"Target function '{fn_key}' in '{t.file}' missing in optimized code"
+                ))
             continue
             
-        orig_loops = [op for op in orig_f.database_operations if op.inside_loop]
-        opt_loops = [op for op in opt_f.database_operations if op.inside_loop]
-        opt_non_loops = [op for op in opt_f.database_operations if not op.inside_loop]
-        
-        if opt_loops:
+        # Check if AST is unchanged
+        if orig_node is not None and opt_node is not None and ast.dump(orig_node) == ast.dump(opt_node):
             target_coverage.append(TargetStatus(
                 file=t.file,
                 function=fn_key,
@@ -275,14 +357,33 @@ def check_rewrite_coverage(orig_analysis: FileAnalysis, opt_analysis: FileAnalys
                 severity="ERROR",
                 message=f"Expected optimization target '{fn_key}' in '{t.file}' remains structurally unchanged"
             ))
-        elif not opt_loops and opt_non_loops:
+            continue
+
+        orig_loops = [op for op in orig_f.database_operations if op.inside_loop]
+        opt_loops = [op for op in opt_f.database_operations if op.inside_loop]
+        opt_non_loops = [op for op in opt_f.database_operations if not op.inside_loop]
+        
+        if is_n1 and orig_loops and opt_loops:
             target_coverage.append(TargetStatus(
                 file=t.file,
                 function=fn_key,
-                status="TRANSFORMED",
-                details="N+1 loop DB operations eliminated and replaced."
+                status="MISSING_REWRITE",
+                details=(
+                    f"'{fn_key}' in '{t.file}': {len(opt_loops)} loop DB op(s) remain "
+                    f"(was {len(orig_loops)}, required 0). "
+                    "If the loop fetches by 2+ columns, apply composite-key batch (Pattern 6)."
+                )
             ))
-        else:
+            violations.append(VerificationViolation(
+                code="MISSING_REWRITE",
+                severity="ERROR",
+                message=(
+                    f"'{fn_key}': {len(opt_loops)}/{len(orig_loops)} loop ops remain "
+                    f"(strict zero required). Hoist batch query before loop; remove all "
+                    f"cursor.execute from loop body."
+                )
+            ))
+        elif is_n1 and orig_loops and not opt_loops and not opt_non_loops:
             target_coverage.append(TargetStatus(
                 file=t.file,
                 function=fn_key,
@@ -293,6 +394,13 @@ def check_rewrite_coverage(orig_analysis: FileAnalysis, opt_analysis: FileAnalys
                 code="INVALID_REWRITE",
                 severity="ERROR",
                 message=f"No replacement database operations found outside loop in target '{fn_key}'"
+            ))
+        else:
+            target_coverage.append(TargetStatus(
+                file=t.file,
+                function=fn_key,
+                status="TRANSFORMED",
+                details="Target function transformed."
             ))
             
     expected_targets = len(contract.targets)
@@ -320,3 +428,84 @@ def check_rewrite_coverage(orig_analysis: FileAnalysis, opt_analysis: FileAnalys
         missing_targets=missing_targets,
         rewrite_coverage=rewrite_coverage
     )
+
+def check_dependency_integrity(original_graph: DependencyGraph, optimized_graph: DependencyGraph, contract: RewriteContract) -> List[VerificationViolation]:
+    violations: List[VerificationViolation] = []
+    
+    targets_to_check = contract.targets if contract.targets else ([contract.target] if contract.target else [])
+    target_names = {t.qualified_function or t.function for t in targets_to_check if t.qualified_function or t.function}
+    
+    orig_nodes = original_graph.nodes
+    opt_nodes = optimized_graph.nodes
+    orig_edges = original_graph.edges
+    opt_edges = optimized_graph.edges
+    
+    opt_node_ids = set(opt_nodes.keys())
+    orig_node_ids = set(orig_nodes.keys())
+    
+    # 1. External callers outside targets must not be removed
+    for edge in orig_edges:
+        if edge.target_id in target_names and edge.kind == DependencyType.CALL:
+            caller_id = edge.source_id
+            if caller_id not in target_names:
+                if caller_id not in opt_node_ids:
+                    violations.append(VerificationViolation(
+                        code="CALLER_INTEGRITY_VIOLATION",
+                        severity="ERROR",
+                        message=f"Caller {caller_id} is missing in optimized code"
+                    ))
+                else:
+                    has_call = any(e.source_id == caller_id and e.target_id == edge.target_id and e.kind == DependencyType.CALL for e in opt_edges)
+                    if not has_call:
+                        violations.append(VerificationViolation(
+                            code="CALLER_INTEGRITY_VIOLATION",
+                            severity="ERROR",
+                            message=f"Call from {caller_id} to {edge.target_id} is missing in optimized code"
+                        ))
+                        
+    # 2. Invariant class state outside targets must not be removed
+    for edge in orig_edges:
+        if edge.kind == DependencyType.CLASS_STATE:
+            # Only check class state for non-target functions
+            if edge.source_id not in target_names and not any(t in edge.source_id for t in target_names):
+                has_edge = any(e.source_id == edge.source_id and e.target_id == edge.target_id and e.kind == DependencyType.CLASS_STATE for e in opt_edges)
+                if not has_edge:
+                    violations.append(VerificationViolation(
+                        code="CLASS_STATE_CORRUPTED",
+                        severity="ERROR",
+                        message=f"Class state edge {edge.source_id} -> {edge.target_id} corrupted"
+                    ))
+                    
+    # 3. New dependencies in targets
+    AUTHORIZED_BUILTINS = {"len", "range", "dict", "list", "set", "str", "int", "float", "bool", "min", "max", "sum", "zip", "enumerate"}
+    AUTHORIZED_METHODS = {"join", "append", "extend", "update", "get", "add", "execute", "executemany", "fetchall", "fetchone", "commit", "rollback", "close", "format", "strip", "split"}
+    AUTHORIZED_IMPORTS = {"psycopg2", "sqlite3", "mysql", "collections", "itertools", "typing", "json", "re", "os", "sys"}
+    
+    for t_name in target_names:
+        matched_opt_ids = [nid for nid in opt_node_ids if t_name in nid or nid.endswith(t_name)]
+        if not matched_opt_ids:
+            continue
+            
+        for opt_t_id in matched_opt_ids:
+            opt_out_edges = [e for e in opt_edges if e.source_id == opt_t_id]
+            orig_out_edges = [e for e in orig_edges if e.source_id == opt_t_id or t_name in e.source_id]
+            orig_out_targets = {e.target_id for e in orig_out_edges}
+            
+            for edge in opt_out_edges:
+                tid = edge.target_id
+                if tid in orig_out_targets or tid in orig_node_ids or edge.kind == DependencyType.DATABASE_OPERATION:
+                    continue
+                    
+                tid_base = tid.split('.')[0] if '.' in tid else tid
+                tid_method = tid.split('.')[-1] if '.' in tid else tid
+                
+                is_auth = (tid in AUTHORIZED_BUILTINS) or (tid_method in AUTHORIZED_METHODS) or (tid_base in AUTHORIZED_IMPORTS)
+                
+                if not is_auth:
+                    violations.append(VerificationViolation(
+                        code="UNAUTHORIZED_DEPENDENCY",
+                        severity="ERROR",
+                        message=f"Unauthorized dependency {tid} introduced in {t_name}"
+                    ))
+                    
+    return violations

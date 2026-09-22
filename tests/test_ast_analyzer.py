@@ -24,11 +24,7 @@ def function(y):
     assert analysis.parse_success is True
     assert analysis.file_path == "test.py"
     assert len(analysis.imports) == 2
-    assert analysis.structural_summary.class_count == 1
-    assert analysis.structural_summary.function_count == 2
-    assert analysis.structural_summary.for_loop_count == 1
-    assert analysis.structural_summary.db_operation_count == 1
-    
+
     db_ops = analysis.database_operations
     assert len(db_ops) == 1
     assert db_ops[0].call_name == "execute"
@@ -89,10 +85,6 @@ def complex_func():
     cf = func.control_flow
     assert cf.for_loops == 1
     assert cf.while_loops == 1
-    assert cf.conditionals == 1
-    assert cf.try_blocks == 1
-    assert cf.with_blocks == 1
-    assert cf.comprehensions == 1
 
 def test_analyze_function_calls():
     source = """
@@ -245,3 +237,29 @@ class ProductRepository:
     assert contract.strategy == "Batch Fetching"
     assert contract.must_preserve == ["Return correct results"]
     assert contract.must_not_change == ["Table schema"]
+
+
+def test_for_iter_fetchall_is_not_inside_loop():
+    """Regression: `for row in cursor.fetchall()` must not flag fetchall as inside the loop."""
+    source = """
+def batched(cursor, ids):
+    cursor.execute("SELECT id, name FROM users WHERE id = ANY(%s)", (ids,))
+    rows = {}
+    for row in cursor.fetchall():
+        rows[row[0]] = row[1]
+    for uid in ids:
+        cursor.execute("SELECT name FROM users WHERE id = %s", (uid,))
+    return rows
+"""
+    analysis = analyze_source(source, "test.py")
+    func = next(f for f in analysis.functions if f.name == "batched")
+    by_line = {op.source_location.start_line: op for op in func.database_operations}
+
+    fetchall_op = next(op for op in func.database_operations if op.call_name == "fetchall")
+    assert fetchall_op.inside_loop is False
+
+    loop_execute = next(
+        op for op in func.database_operations
+        if op.call_name == "execute" and "id = %s" in (op.sql or "")
+    )
+    assert loop_execute.inside_loop is True

@@ -2,9 +2,9 @@
 
 from src.code_rewriter.tools.planner import _parse_kb, plan, _clean_name
 
-def test_parse_kb_returns_30_strategies():
+def test_parse_kb_returns_31_strategies():
     strategies = _parse_kb()
-    assert len(strategies) == 30
+    assert len(strategies) == 31
 
 def test_top_5_strategies():
     strategies = _parse_kb()

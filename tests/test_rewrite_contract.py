@@ -106,5 +106,6 @@ def test_build_rewrite_contract_defaults():
         strategy="Modularization",
     )
     
-    assert "Existing business logic" in contract.must_preserve
+    assert "return_type" in contract.must_preserve
+    assert "transaction_semantics" in contract.must_preserve
     assert "Database schema" in contract.must_not_change

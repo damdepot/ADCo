@@ -11,7 +11,6 @@ import asyncio
 import datetime
 import json
 import os
-import re
 import sys
 import uuid
 from typing import Any
@@ -20,29 +19,16 @@ from dotenv import load_dotenv
 from google.genai import types
 
 from google.adk.models import Gemini
+from src.code_rewriter._common import _maybe_parse
 from src.code_rewriter.agent import create_root_agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from src.intent_analyzer.main import run_pipeline as run_intent_analyzer
-from src.code_rewriter.tools.pipeline_analysis import build_contracts_from_intent
+from src.code_rewriter.tools.pipeline_analysis import build_contracts_from_intent, format_dependency_slice_map
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-
-
-def _maybe_parse(value: Any) -> Any:
-    """Return *value* as a dict, JSON-parsing strings (stripping markdown fences)."""
-    if isinstance(value, str):
-        stripped = re.sub(r"^```[a-z]*\n?", "", value.strip(), flags=re.MULTILINE)
-        stripped = re.sub(r"```$", "", stripped.strip())
-        try:
-            return json.loads(stripped.strip())
-        except (json.JSONDecodeError, ValueError):
-            return {}
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    return value if isinstance(value, dict) else {}
 
 
 def _log_event(msg: str, log_file: str | None = None, verbose: bool = False) -> None:
@@ -148,6 +134,7 @@ async def run_pipeline(
     initial_state = {
         "target": target_abs,
         "sandbox_dir": sandbox_dir_abs,
+        "attempt_count": 0,
     }
     if extra_initial_state:
         initial_state.update(extra_initial_state)
@@ -174,10 +161,12 @@ async def run_pipeline(
     if intent_output:
         _log_event(f"Building rewrite contracts from intent...", log_file=log_file_abs, verbose=verbose)
         try:
-            _, contracts = build_contracts_from_intent(target_abs, intent_output)
+            analyses, contracts = build_contracts_from_intent(target_abs, intent_output)
             initial_state["rewrite_contracts"] = [c.model_dump() for c in contracts]
-            initial_state["contracts"] = [c.model_dump() for c in contracts]
             _log_event(f"Built {len(contracts)} rewrite contracts.", log_file=log_file_abs, verbose=verbose)
+            
+            slice_map = format_dependency_slice_map(analyses, contracts, target_abs)
+            initial_state["pipeline_analysis_markdown"] = slice_map
         except Exception as e:
             _log_event(f"Error building contracts: {e}", log_file=log_file_abs, verbose=verbose)
 
@@ -244,9 +233,6 @@ async def run_pipeline(
 
     return state
 
-# Alias for backwards compatibility
-_run_pipeline = run_pipeline
-
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -264,7 +250,7 @@ def main() -> None:
             output_path=args.output_path,
             sandbox_dir=args.sandbox_dir,
             verbose=args.verbose,
-            buffer_time=getattr(args, "buffer_time", 0.0),
+            buffer_time=args.buffer_time,
         ))
     except Exception as exc:
         print(f"\n=== Pipeline FAILED ===\nError: {exc}", file=sys.stderr)

@@ -28,9 +28,42 @@ def test_agent_creation():
 def test_subagent_creation():
     fs_agent = create_file_selector_agent("gemini-3.5-flash-lite")
     assert fs_agent.name == "file_selector"
+    assert len(fs_agent.tools) == 1
 
     ie_agent = create_intent_extractor_agent("gemini-3.5-flash-lite")
     assert ie_agent.name == "intent_extractor"
+
+
+def test_file_selector_get_project_files(tmp_path):
+    from src.intent_analyzer.sub_agents.file_selector.tools import get_project_files as intent_get_files
+
+    # 1. scan_result in state as list
+    ctx1 = MagicMock()
+    ctx1.state = {"scan_result": ["a.py", "b.py"]}
+    assert intent_get_files(ctx1) == ["a.py", "b.py"]
+
+    # 2. scan_result in state as str
+    ctx2 = MagicMock()
+    ctx2.state = {"scan_result": "file1.py\nfile2.py"}
+    assert intent_get_files(ctx2) == "file1.py\nfile2.py"
+
+    # 3. target in state (scans directory)
+    d = tmp_path / "app"
+    d.mkdir()
+    (d / "main.py").write_text("print(1)")
+    (d / "drivers").mkdir()
+    (d / "drivers" / "postgresdriver.py").write_text("# pg driver")
+
+    ctx3 = MagicMock()
+    ctx3.state = {"target": str(d)}
+    files = intent_get_files(ctx3)
+    assert "main.py" in files
+    assert "drivers/postgresdriver.py" in files
+
+    # 4. Neither in state
+    ctx4 = MagicMock()
+    ctx4.state = {}
+    assert "ERROR" in intent_get_files(ctx4)
 
 
 def test_models_serialization():

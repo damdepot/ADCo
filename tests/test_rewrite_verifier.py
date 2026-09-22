@@ -112,3 +112,48 @@ def test_checks_visibility_and_serialization(contract):
     assert dump["status"] == "PASS"
     assert "checks" in dump
     assert "violations" in dump
+
+
+def test_check_dependency_integrity_pass():
+    orig_code = """
+class OrderService:
+    def helper_method(self):
+        return 42
+
+    def process_order(self, order_ids):
+        res = []
+        for oid in order_ids:
+            cursor.execute("SELECT * FROM orders WHERE id = %s", (oid,))
+            res.append(cursor.fetchone())
+        return res
+"""
+    opt_code = """
+class OrderService:
+    def helper_method(self):
+        return 42
+
+    def process_order(self, order_ids):
+        cursor.execute("SELECT * FROM orders WHERE id = ANY(%s)", (order_ids,))
+        return cursor.fetchall()
+"""
+    contract = RewriteContract(
+        rewrite_id="test_integrity",
+        target=RewriteTarget(file="service.py", qualified_function="OrderService.process_order"),
+        pattern="N+1 Query Loop",
+        strategy="Query Batching",
+        allowed_regions=["OrderService.process_order"],
+    )
+    result = verify_rewrite(orig_code, opt_code, contract)
+    assert result.status == "PASS"
+    check_names = [c.name for c in result.checks]
+    assert "check_dependency_integrity" in check_names
+
+
+def test_untransformed_target_function(contract):
+    # Target function unchanged from original AST
+    orig = read_fixture("original_n_plus_one.py")
+    result = verify_rewrite(orig, orig, contract)
+    assert result.status == "FAIL"
+    assert any(v.code in ("MISSING_REWRITE", "STRATEGY_NOT_APPLIED") for v in result.violations)
+
+

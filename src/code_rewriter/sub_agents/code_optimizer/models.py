@@ -11,3 +11,15 @@ class CodeOptimizerOutput(BaseModel):
         default="",
         description="Summary of the optimizations applied",
     )
+    function: str = Field(
+        default="",
+        description="Qualified name of the target function optimized",
+    )
+    file: str = Field(
+        default="",
+        description="Relative path of the modified file",
+    )
+    status: str = Field(
+        default="",
+        description="PASS if the target function was optimized, FAIL otherwise",
+    )

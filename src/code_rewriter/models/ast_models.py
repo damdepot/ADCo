@@ -15,10 +15,6 @@ class ControlFlowAnalysis(BaseModel):
     """Analysis of control flow structures in a function."""
     for_loops: int = Field(default=0, description="Number of for loops")
     while_loops: int = Field(default=0, description="Number of while loops")
-    conditionals: int = Field(default=0, description="Number of if statements")
-    try_blocks: int = Field(default=0, description="Number of try blocks")
-    with_blocks: int = Field(default=0, description="Number of with blocks")
-    comprehensions: int = Field(default=0, description="Number of list/set/dict/generator comprehensions")
 
 
 class CallAnalysis(BaseModel):
@@ -78,15 +74,6 @@ class ClassAnalysis(BaseModel):
     source_location: SourceLocation = Field(description="The location of the class in the source code")
 
 
-class StructuralSummary(BaseModel):
-    """Summary of structural elements in a file."""
-    function_count: int = Field(default=0, description="Total number of functions and methods")
-    class_count: int = Field(default=0, description="Total number of classes")
-    for_loop_count: int = Field(default=0, description="Total number of for loops")
-    while_loop_count: int = Field(default=0, description="Total number of while loops")
-    db_operation_count: int = Field(default=0, description="Total number of database operations")
-
-
 class FileAnalysis(BaseModel):
     """Comprehensive analysis of a source file."""
     file_path: str = Field(default="", description="The path to the analyzed file")
@@ -96,4 +83,3 @@ class FileAnalysis(BaseModel):
     classes: List[ClassAnalysis] = Field(default_factory=list, description="Analysis of classes in the file")
     functions: List[FunctionAnalysis] = Field(default_factory=list, description="Analysis of top-level functions in the file")
     database_operations: List[DatabaseOperation] = Field(default_factory=list, description="Analysis of all database operations in the file")
-    structural_summary: StructuralSummary = Field(default_factory=StructuralSummary, description="Summary of the file's structure")

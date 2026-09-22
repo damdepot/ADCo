@@ -13,7 +13,6 @@ from ..models.ast_models import (
     ImportAnalysis,
     SourceLocation,
     SqlOperation,
-    StructuralSummary,
 )
 
 class _FileVisitor(ast.NodeVisitor):
@@ -35,9 +34,7 @@ class _FileVisitor(ast.NodeVisitor):
         # Track local string assignments per function scope
         self.module_strings: Dict[str, str] = {}
         self.function_strings: List[Dict[str, str]] = []
-        
-        self.structural_summary = StructuralSummary()
-        
+
     def _get_location(self, node: ast.AST) -> SourceLocation:
         return SourceLocation(
             start_line=getattr(node, "lineno", -1),
@@ -70,7 +67,6 @@ class _FileVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef):
-        self.structural_summary.class_count += 1
         base_classes = []
         for base in node.bases:
             if isinstance(base, ast.Name):
@@ -99,8 +95,6 @@ class _FileVisitor(ast.NodeVisitor):
         self._handle_function_def(node)
 
     def _handle_function_def(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]):
-        self.structural_summary.function_count += 1
-        
         parameters = []
         for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
             parameters.append(arg.arg)
@@ -168,77 +162,53 @@ class _FileVisitor(ast.NodeVisitor):
         return targets
 
     def visit_For(self, node: ast.For):
-        self.structural_summary.for_loop_count += 1
         if self.current_function:
             self.current_function.control_flow.for_loops += 1
-            
+
+        # The iterable expression is evaluated before the loop body, so a DB
+        # call used as the iterator (e.g. ``for row in cursor.fetchall()``) is
+        # NOT inside the loop. Visit it before pushing the loop scope.
+        self.visit(node.iter)
+
         targets = self._extract_targets(node.target)
         self.loop_stack.append(targets)
-        
-        self.generic_visit(node)
-        
+
+        for stmt in node.body:
+            self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
+
         self.loop_stack.pop()
 
     def visit_AsyncFor(self, node: ast.AsyncFor):
-        self.structural_summary.for_loop_count += 1
         if self.current_function:
             self.current_function.control_flow.for_loops += 1
-            
+
+        self.visit(node.iter)
+
         targets = self._extract_targets(node.target)
         self.loop_stack.append(targets)
-        
-        self.generic_visit(node)
-        
+
+        for stmt in node.body:
+            self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
+
         self.loop_stack.pop()
 
     def visit_While(self, node: ast.While):
-        self.structural_summary.while_loop_count += 1
         if self.current_function:
             self.current_function.control_flow.while_loops += 1
-            
+
+        # The test is evaluated outside the loop body.
+        self.visit(node.test)
+
         self.loop_stack.append([])
-        self.generic_visit(node)
+        for stmt in node.body:
+            self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
         self.loop_stack.pop()
-
-    def visit_If(self, node: ast.If):
-        if self.current_function:
-            self.current_function.control_flow.conditionals += 1
-        self.generic_visit(node)
-
-    def visit_Try(self, node: ast.Try):
-        if self.current_function:
-            self.current_function.control_flow.try_blocks += 1
-        self.generic_visit(node)
-
-    def visit_With(self, node: ast.With):
-        if self.current_function:
-            self.current_function.control_flow.with_blocks += 1
-        self.generic_visit(node)
-        
-    def visit_AsyncWith(self, node: ast.AsyncWith):
-        if self.current_function:
-            self.current_function.control_flow.with_blocks += 1
-        self.generic_visit(node)
-
-    def visit_ListComp(self, node: ast.ListComp):
-        if self.current_function:
-            self.current_function.control_flow.comprehensions += 1
-        self.generic_visit(node)
-        
-    def visit_SetComp(self, node: ast.SetComp):
-        if self.current_function:
-            self.current_function.control_flow.comprehensions += 1
-        self.generic_visit(node)
-        
-    def visit_DictComp(self, node: ast.DictComp):
-        if self.current_function:
-            self.current_function.control_flow.comprehensions += 1
-        self.generic_visit(node)
-        
-    def visit_GeneratorExp(self, node: ast.GeneratorExp):
-        if self.current_function:
-            self.current_function.control_flow.comprehensions += 1
-        self.generic_visit(node)
 
     def _determine_sql_op(self, sql: Optional[str]) -> SqlOperation:
         if not sql:
@@ -310,7 +280,6 @@ class _FileVisitor(ast.NodeVisitor):
                 
             db_op_type = self._determine_db_op(call_name)
             if db_op_type != "UNKNOWN":
-                self.structural_summary.db_operation_count += 1
                 sql = None
                 sql_op: SqlOperation = "UNKNOWN"
                 param_deps = []
@@ -371,8 +340,7 @@ def analyze_source(source: str, file_path: Optional[str] = None) -> FileAnalysis
     analysis.classes = visitor.classes
     analysis.functions = visitor.functions
     analysis.database_operations = visitor.database_operations
-    analysis.structural_summary = visitor.structural_summary
-    
+
     return analysis
 
 

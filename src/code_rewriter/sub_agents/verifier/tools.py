@@ -1,12 +1,16 @@
 """Tools for the verifier agent — syntax check, compare original vs modified, run application."""
 
 import difflib
+import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 from google.adk.tools import ToolContext
+
+from src.code_rewriter.models.rewrite_models import RewriteContract
+from src.code_rewriter.tools.pipeline_analysis import execute_deterministic_verification
 
 _CODE_ERRORS = re.compile(
     r"SyntaxError|ImportError|ModuleNotFoundError|NameError|"
@@ -39,9 +43,70 @@ def _classify_failure(stderr: str, stdout: str) -> str | None:
         return "DB"
     if _NETWORK_ERRORS.search(combined):
         return "NETWORK"
-    if _CODE_ERRORS.search(combined):
+    # ValueError alone is too generic (may be env); require a traceback to call it CODE.
+    if re.search(r"SyntaxError|ImportError|ModuleNotFoundError|NameError|AttributeError|TypeError|IndentationError", combined):
+        return "CODE"
+    if "ValueError" in combined and re.search(r"Traceback \(most recent call last\)", combined):
         return "CODE"
     return None
+
+
+def _deserialize_contracts(contracts_data: list) -> list[RewriteContract]:
+    """Coerce raw state entries into RewriteContract models (raises on invalid)."""
+    return [RewriteContract(**c) if isinstance(c, dict) else c for c in contracts_data]
+
+
+def _format_verification_details(result) -> list[str]:
+    """Shared summary lines for deterministic verification output."""
+    lines = [
+        f"Deterministic Verification Status: {result.status}",
+        f"Summary: {result.summary}",
+        f"Expected targets: {result.expected_targets}, Transformed targets: {result.transformed_targets}, Missing targets: {result.missing_targets}",
+        f"Rewrite coverage: {result.rewrite_coverage:.2%}",
+    ]
+    if result.violations:
+        lines.append("Violations:")
+        lines.extend(f"  - [{v.severity}] {v.code}: {v.message}" for v in result.violations)
+    if result.target_coverage:
+        lines.append("Target Coverage:")
+        for tc in result.target_coverage:
+            status_info = f"  - {tc.file}::{tc.function} -> {tc.status}"
+            if tc.details:
+                status_info += f" ({tc.details})"
+            lines.append(status_info)
+    return lines
+
+
+def _verify_deterministic(tool_context: ToolContext | None) -> tuple[str, str | None]:
+    """Run deterministic AST verification if contracts exist in tool_context.state.
+
+    Returns (status, details) where status is 'PASS', 'FAIL', or 'NONE' (if no contracts).
+    """
+    if not tool_context or not hasattr(tool_context, "state") or not tool_context.state:
+        return "NONE", None
+
+    state = tool_context.state
+    contracts_data = state.get("rewrite_contracts")
+    if not contracts_data:
+        return "NONE", None
+
+    try:
+        contracts = _deserialize_contracts(contracts_data)
+    except Exception:
+        return "NONE", None
+
+    result = execute_deterministic_verification(
+        state.get("target", ""),
+        state.get("sandbox", ""),
+        contracts,
+        state.get("modified_files", []),
+    )
+    state["deterministic_verification"] = result.model_dump()
+
+    if result.status == "FAIL":
+        return "FAIL", "\n".join(_format_verification_details(result))
+
+    return "PASS", None
 
 
 def check_syntax(tool_context: ToolContext) -> str:
@@ -79,6 +144,9 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
       returned along with the command and any early stdout/stderr.
     - If the process exited within 3 seconds with returncode 0, "STARTED_OK"
       is returned along with the captured output.
+    - If rewrite_contracts exist in state and fail deterministic AST
+      verification, "STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL"
+      is returned instead of "STARTED_OK".
     - If the process exited within 3 seconds with a non-zero returncode, the
       failure is classified into one of:
 
@@ -90,6 +158,8 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
         a code error — the code is syntactically correct.
       * ``STARTUP_FAILED_ENV:NETWORK`` — a network resource is unreachable.
         This is also **not** a code error.
+      * ``STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL`` — AST verification
+        failed (residual loop queries, untransformed targets).
       * ``STARTUP_FAILED_CODE`` — a real code-level error was detected
         (SyntaxError, ImportError, NameError, AttributeError, TypeError).
         This means the optimized code is broken.
@@ -108,7 +178,6 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
             entry = fs_out.entry_point or ""
         elif isinstance(fs_out, str):
             try:
-                import json
                 parsed = json.loads(fs_out)
                 if isinstance(parsed, dict):
                     entry = parsed.get("entry_point", "")
@@ -143,7 +212,10 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
             parts.append(f"stdout:\n{stdout.strip()[:2000]}")
         if stderr and stderr.strip():
             parts.append(f"stderr:\n{stderr.strip()[:2000]}")
-        if proc.returncode == 0:
+        det_status, det_details = _verify_deterministic(tool_context)
+        if det_status == "FAIL":
+            parts.insert(0, f"STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL\n{det_details}")
+        elif proc.returncode == 0:
             parts.insert(0, "STARTED_OK")
         else:
             category = _classify_failure(stderr or "", stdout or "")
@@ -159,7 +231,11 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
-        parts = ["STARTED_OK", f"Command: {cmd}"]
+        det_status, det_details = _verify_deterministic(tool_context)
+        if det_status == "FAIL":
+            parts = [f"STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL\n{det_details}", f"Command: {cmd}"]
+        else:
+            parts = ["STARTED_OK", f"Command: {cmd}"]
         if stdout and stdout.strip():
             parts.append(f"stdout:\n{stdout.strip()[:2000]}")
         if stderr and stderr.strip():
@@ -243,9 +319,6 @@ def compare_original_and_modified(tool_context: ToolContext) -> str:
 
     return "\n".join(sections)
 
-import json
-from src.code_rewriter.models.rewrite_models import RewriteContract
-from src.code_rewriter.tools.pipeline_analysis import execute_deterministic_verification
 
 def run_deterministic_verification(tool_context: ToolContext) -> str:
     """Run deterministic AST verification against rewrite contracts.
@@ -254,44 +327,25 @@ def run_deterministic_verification(tool_context: ToolContext) -> str:
     checking if N+1 database operations within loops were removed and replaced.
     """
     state = tool_context.state
-    target = state.get("target", "")
-    sandbox = state.get("sandbox", "")
-    modified_files = state.get("modified_files", [])
-    contracts_data = state.get("rewrite_contracts") or state.get("contracts")
-    
+    contracts_data = state.get("rewrite_contracts")
+
     if not contracts_data:
         return "No rewrite contracts in state."
-        
+
     try:
-        contracts = [RewriteContract(**c) for c in contracts_data]
+        contracts = _deserialize_contracts(contracts_data)
     except Exception as e:
         return f"ERROR deserializing contracts: {e}"
-        
-    result = execute_deterministic_verification(target, sandbox, contracts, modified_files)
+
+    result = execute_deterministic_verification(
+        state.get("target", ""),
+        state.get("sandbox", ""),
+        contracts,
+        state.get("modified_files", []),
+    )
     state["deterministic_verification"] = result.model_dump()
-    
-    summary = []
-    summary.append(f"## Deterministic Verification Status: {result.status}")
-    summary.append(f"Summary: {result.summary}")
-    summary.append(f"Expected targets: {result.expected_targets}")
-    summary.append(f"Transformed targets: {result.transformed_targets}")
-    summary.append(f"Missing targets: {result.missing_targets}")
-    summary.append(f"Rewrite coverage: {result.rewrite_coverage:.2%}")
-    
-    if result.target_coverage:
-        summary.append("\n### Target Coverage")
-        for tc in result.target_coverage:
-            summary.append(f"- {tc.file}::{tc.function} -> {tc.status}")
-            if tc.details:
-                summary.append(f"  Details: {tc.details}")
-                
-    if result.violations:
-        summary.append("\n### Violations")
-        for v in result.violations:
-            summary.append(f"- [{v.severity}] {v.code}: {v.message}")
-            
-    summary.append("\n```json")
-    summary.append(json.dumps(result.model_dump(), indent=2))
-    summary.append("```")
-    
-    return "\n".join(summary)
+
+    lines = _format_verification_details(result)
+    lines += ["```json", json.dumps(result.model_dump(), indent=2), "```"]
+    return "\n".join(lines)
+

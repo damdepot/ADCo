@@ -2,14 +2,13 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 VerificationStatus = Literal["PASS", "FAIL"]
-ViolationSeverity = Literal["ERROR", "WARNING"]
-CheckStatus = Literal["PASS", "FAIL", "UNVERIFIABLE"]
+ViolationSeverity = Literal["ERROR"]
+CheckStatus = Literal["PASS", "FAIL"]
 
 class VerificationViolation(BaseModel):
     code: str
     severity: ViolationSeverity
     message: str
-    location: Optional[dict[str, Any]] = None
     expected: Optional[Any] = None
     actual: Optional[Any] = None
 
