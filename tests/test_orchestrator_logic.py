@@ -99,6 +99,39 @@ def test_finalize_passes_when_all_targets_pass():
     assert delta["deterministic_verification"]["transformed_targets"] == 1
 
 
+def test_finalize_surfaces_warnings_without_failing():
+    """Advisory WARNINGs are surfaced but must not flip a deterministic PASS."""
+    ctx = _FakeContext({
+        "target_results": [
+            {
+                "file": "a.py",
+                "function": "f",
+                "status": "PASS",
+                "verification": {
+                    "status": "PASS",
+                    "violations": [
+                        {
+                            "code": "DEAD_LOCAL",
+                            "severity": "WARNING",
+                            "message": "unused x",
+                        }
+                    ],
+                },
+            }
+        ],
+        "verifier_output": {"status": "PASS", "category": "NONE"},
+    })
+    event = finalize(ctx)
+    delta = event.actions.state_delta
+    assert delta["verifier_output"]["status"] == "PASS"
+    assert delta["deterministic_verification"]["status"] == "PASS"
+    warning_text = "[DEAD_LOCAL] unused x"
+    assert warning_text in delta["verifier_output"]["detail"] or any(
+        w.get("code") == "DEAD_LOCAL"
+        for w in delta["deterministic_verification"]["violations"]
+    )
+
+
 def test_vacuous_pass_rejected_when_non_contract_file_modified_only(tmp_path):
     """Regression: modifying only a non-contract file must not yield PASS."""
     target_dir = tmp_path / "target"

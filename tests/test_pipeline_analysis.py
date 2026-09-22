@@ -275,3 +275,48 @@ def get_users(ids):
     assert missing_result.missing_targets == 1
     assert missing_result.rewrite_coverage == 0.0
 
+
+def test_execute_deterministic_verification_warning_only_passes(tmp_path):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    sandbox_dir = tmp_path / "sandbox"
+    sandbox_dir.mkdir()
+
+    (target_dir / "repo.py").write_text('''
+def get_users(ids):
+    result = []
+    for uid in ids:
+        cursor.execute("SELECT * FROM users WHERE id = ?", (uid,))
+        result.append(cursor.fetchone())
+    assert result
+    return result
+''')
+    (sandbox_dir / "repo.py").write_text('''
+def get_users(ids):
+    if not ids:
+        return []
+    cursor.execute("SELECT * FROM users WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)
+    return cursor.fetchall()
+''')
+
+    contracts = [
+        RewriteContract(
+            rewrite_id="test-warning",
+            target=RewriteTarget(file="repo.py", function="get_users"),
+            pattern="N_PLUS_ONE_QUERY",
+            strategy="COMBINING_QUERIES",
+            targets=[RewriteTarget(file="repo.py", function="get_users")]
+        )
+    ]
+
+    result = execute_deterministic_verification(
+        str(target_dir),
+        str(sandbox_dir),
+        contracts,
+        ["repo.py"]
+    )
+    assert result.status == "PASS"
+    assert result.transformed_targets == result.expected_targets
+    assert any(v.code == "ASSERT_REMOVED" and v.severity == "WARNING" for v in result.violations)
+
+

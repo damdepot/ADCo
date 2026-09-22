@@ -157,3 +157,99 @@ def test_untransformed_target_function(contract):
     assert any(v.code in ("MISSING_REWRITE", "STRATEGY_NOT_APPLIED") for v in result.violations)
 
 
+def _advisory_contract():
+    return RewriteContract(
+        rewrite_id="test_advisory",
+        target=RewriteTarget(file="test.py", function="get_user_data"),
+        pattern="N+1 Query",
+        strategy="Replace loop with IN clause",
+        allowed_regions=["get_user_data"],
+        must_preserve=["return_type", "function_signature"],
+    )
+
+
+def test_assert_removal_is_warning_not_failure():
+    orig = """
+def get_user_data(user_ids):
+    results = []
+    for uid in user_ids:
+        user = db.execute("SELECT * FROM users WHERE id = ?", uid)
+        results.append(user)
+    assert results is not None
+    return results
+"""
+    opt = """
+def get_user_data(user_ids):
+    if not user_ids:
+        return []
+    placeholders = ",".join(["?"] * len(user_ids))
+    results = db.execute(f"SELECT * FROM users WHERE id IN ({placeholders})", user_ids)
+    return results
+"""
+    result = verify_rewrite(orig, opt, _advisory_contract())
+    assert result.status == "PASS"
+    assert any(v.code == "ASSERT_REMOVED" and v.severity == "WARNING" for v in result.violations)
+
+
+def test_dead_local_is_warning_not_failure():
+    orig = """
+def get_user_data(user_ids):
+    results = []
+    for uid in user_ids:
+        user = db.execute("SELECT * FROM users WHERE id = ?", uid)
+        results.append(user)
+    return results
+"""
+    opt = """
+def get_user_data(user_ids):
+    if not user_ids:
+        return []
+    unused = []
+    placeholders = ",".join(["?"] * len(user_ids))
+    results = db.execute(f"SELECT * FROM users WHERE id IN ({placeholders})", user_ids)
+    return results
+"""
+    result = verify_rewrite(orig, opt, _advisory_contract())
+    assert result.status == "PASS"
+    assert any(v.code == "DEAD_LOCAL" and v.severity == "WARNING" for v in result.violations)
+
+
+def test_error_violations_still_fail(contract):
+    orig = read_fixture("original_n_plus_one.py")
+    opt = read_fixture("signature_changed.py")
+    result = verify_rewrite(orig, opt, contract)
+    assert result.status == "FAIL"
+    assert any(v.severity == "ERROR" for v in result.violations)
+
+
+def test_rewrite_with_row_index_overflow_fails():
+    orig = """
+def get_stock(self, d_id, item_ids):
+    result = {}
+    for item_id in item_ids:
+        self.cursor.execute("SELECT S_QUANTITY FROM STOCK WHERE S_I_ID = %s AND S_W_ID = %s", (item_id, d_id))
+        result[item_id] = self.cursor.fetchone()[0]
+    return result
+"""
+    opt = """
+def get_stock(self, d_id, item_ids):
+    placeholders = ",".join(["%s"] * len(item_ids))
+    stock_sql = "SELECT S_QUANTITY, S_YTD, S_ORDER_CNT, S_REMOTE_CNT, S_DIST_01, S_DATA FROM STOCK WHERE (S_I_ID, S_W_ID) IN (" + placeholders + ")"
+    self.cursor.execute(stock_sql, item_ids)
+    stock_map = {(row[0], row[1]): (row[2], row[3], row[4], row[5], row[6], row[7]) for row in self.cursor.fetchall()}
+    return stock_map
+"""
+    contract = RewriteContract(
+        rewrite_id="test_row_overflow",
+        target=RewriteTarget(file="t.py", function="get_stock"),
+        pattern="N+1 Query",
+        strategy="Query Batching",
+        allowed_regions=["get_stock"],
+    )
+    result = verify_rewrite(orig, opt, contract)
+    assert result.status == "FAIL"
+    assert any(v.code == "ROW_INDEX_OUT_OF_RANGE" for v in result.violations)
+
+
+
+
