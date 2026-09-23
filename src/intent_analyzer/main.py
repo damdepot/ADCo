@@ -18,6 +18,10 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from src.intent_analyzer.agent import create_intent_analyzer_agent
+from src.intent_analyzer.tools.db_engine import (
+    filter_paths_by_db_type,
+    filter_targets_by_db_type,
+)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
@@ -53,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="out/intent_analyzer/result.json",
         help="Path to write final intent analysis output",
     )
+    p.add_argument(
+        "--db-type",
+        choices=["postgres", "mysql"],
+        default="",
+        help="Target database engine; restricts optimization to that engine's code (default: no restriction)",
+    )
     p.add_argument("--verbose", "-v", action="store_true", help="Print verbose progress")
     p.add_argument(
         "--buffer-time",
@@ -71,6 +81,7 @@ async def run_pipeline(
     verbose: bool = False,
     extra_initial_state: dict[str, Any] | None = None,
     buffer_time: float = 0.0,
+    db_type: str = "",
 ) -> dict[str, Any]:
     """Execute intent analyzer pipeline on the given target codebase."""
     target_abs = os.path.abspath(target)
@@ -91,6 +102,8 @@ async def run_pipeline(
     }
     if extra_initial_state:
         initial_state.update(extra_initial_state)
+    if db_type:
+        initial_state["db_type"] = db_type
 
     session_service = InMemorySessionService()
     sid = uuid.uuid4().hex[:12]
@@ -116,6 +129,11 @@ async def run_pipeline(
         "2. Select database-relevant files.\n"
         "3. Extract code optimization targets and structured workload characteristics."
     )
+    if db_type:
+        msg = (
+            f"Target database engine: {db_type}. Select and optimize ONLY {db_type}-related "
+            "database code; exclude drivers/queries for other engines.\n"
+        ) + msg
 
     user_content = types.Content(
         role="user",
@@ -172,6 +190,16 @@ async def run_pipeline(
             f"Intent extractor produced no structured output for target: {target_abs}. "
             "Ensure the target codebase contains database interaction code and is accessible."
         )
+
+    if db_type:
+        if isinstance(intent_parsed.get("optimization_targets"), list):
+            intent_parsed["optimization_targets"] = filter_targets_by_db_type(
+                intent_parsed["optimization_targets"], db_type
+            )
+        fs_out = final_state.get("file_selector_output")
+        if isinstance(fs_out, dict) and isinstance(fs_out.get("files"), list):
+            fs_out["files"] = filter_paths_by_db_type(fs_out["files"], db_type)
+
     final_state["intent_output"] = intent_parsed
 
     if isinstance(intent_parsed, dict) and "workload" in intent_parsed:
@@ -214,6 +242,7 @@ def main() -> None:
                 log_file=args.log_file,
                 output_path=args.output_path,
                 verbose=args.verbose,
+                db_type=args.db_type,
             )
         )
     except Exception as exc:

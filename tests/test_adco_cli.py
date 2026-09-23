@@ -296,6 +296,146 @@ def test_run_pipeline_intent_fail_fast(mock_intent, tmp_path):
     assert "Intent analyzer returned no output or no optimization_targets" in str(exc_info.value)
 
 
+@patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.rewriter_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.tuner_pipeline", new_callable=AsyncMock)
+def test_run_pipeline_forwards_db_type_to_intent_analyzer(mock_tuner, mock_rewriter, mock_intent, tmp_path):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+    sandbox_dir = tmp_path / "sandbox"
+    sandbox_dir.mkdir()
+
+    log_file = tmp_path / "adco.log"
+    out_file = tmp_path / "result.json"
+    intent_out = tmp_path / "intent.json"
+    rewriter_out = tmp_path / "rewriter.json"
+
+    intent_out.write_text(json.dumps({"intent_output": {"optimization_targets": [{"file": "main.py"}]}}))
+    rewriter_out.write_text(json.dumps({"status": "PASS", "sandbox": str(sandbox_dir)}))
+
+    mock_intent.return_value = {
+        "intent_output": {"optimization_targets": [{"file": "main.py"}]}
+    }
+    mock_rewriter.return_value = {
+        "verifier_output": {"status": "PASS"},
+        "sandbox": str(sandbox_dir),
+    }
+
+    asyncio.run(
+        run_pipeline(
+            target=str(target_dir),
+            mode="rewrite-only",
+            log_file=str(log_file),
+            output_path=str(out_file),
+            intent_output_path=str(intent_out),
+            rewriter_output=str(rewriter_out),
+            db_name="testdb",
+            db_type="postgres",
+        )
+    )
+
+    assert mock_intent.called
+    assert mock_intent.call_args.kwargs["db_type"] == "postgres"
+
+
+@patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.rewriter_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.tuner_pipeline", new_callable=AsyncMock)
+def test_run_pipeline_filters_foreign_engine_targets(mock_tuner, mock_rewriter, mock_intent, tmp_path):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+    sandbox_dir = tmp_path / "sandbox"
+    sandbox_dir.mkdir()
+
+    log_file = tmp_path / "adco.log"
+    out_file = tmp_path / "result.json"
+    intent_out = tmp_path / "intent.json"
+    rewriter_out = tmp_path / "rewriter.json"
+
+    intent_out.write_text(json.dumps({"intent_output": {"optimization_targets": [{"file": "main.py"}]}}))
+    rewriter_out.write_text(json.dumps({"status": "PASS", "sandbox": str(sandbox_dir)}))
+
+    mock_intent.return_value = {
+        "intent_output": {
+            "optimization_targets": [
+                {"file": "drivers/postgresdriver.py"},
+                {"file": "drivers/mysqldriver.py"},
+                {"file": "db.py"},
+            ]
+        }
+    }
+    mock_rewriter.return_value = {
+        "verifier_output": {"status": "PASS"},
+        "sandbox": str(sandbox_dir),
+    }
+
+    asyncio.run(
+        run_pipeline(
+            target=str(target_dir),
+            mode="rewrite-only",
+            log_file=str(log_file),
+            output_path=str(out_file),
+            intent_output_path=str(intent_out),
+            rewriter_output=str(rewriter_out),
+            db_name="testdb",
+            db_type="postgres",
+        )
+    )
+
+    targets = mock_rewriter.call_args.kwargs["extra_initial_state"]["intent_output"]["optimization_targets"]
+    files = [t["file"] for t in targets]
+    assert "drivers/postgresdriver.py" in files
+    assert "db.py" in files
+    assert "drivers/mysqldriver.py" not in files
+
+
+@patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.rewriter_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.tuner_pipeline", new_callable=AsyncMock)
+def test_run_pipeline_fallback_targets_filtered_by_engine(mock_tuner, mock_rewriter, mock_intent, tmp_path):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+    sandbox_dir = tmp_path / "sandbox"
+    sandbox_dir.mkdir()
+
+    log_file = tmp_path / "adco.log"
+    out_file = tmp_path / "result.json"
+    intent_out = tmp_path / "intent.json"
+    rewriter_out = tmp_path / "rewriter.json"
+
+    intent_out.write_text(json.dumps({"intent_output": {"queries": "x"}}))
+    rewriter_out.write_text(json.dumps({"status": "PASS", "sandbox": str(sandbox_dir)}))
+
+    mock_intent.return_value = {
+        "intent_output": {"queries": "x"},
+        "file_selector_output": {
+            "files": ["drivers/postgresdriver.py", "drivers/mysqldriver.py", "db.py"],
+            "entry_point": "main.py",
+        },
+    }
+    mock_rewriter.return_value = {
+        "verifier_output": {"status": "PASS"},
+        "sandbox": str(sandbox_dir),
+    }
+
+    asyncio.run(
+        run_pipeline(
+            target=str(target_dir),
+            mode="rewrite-only",
+            log_file=str(log_file),
+            output_path=str(out_file),
+            intent_output_path=str(intent_out),
+            rewriter_output=str(rewriter_out),
+            db_name="testdb",
+            db_type="postgres",
+        )
+    )
+
+    targets = mock_rewriter.call_args.kwargs["extra_initial_state"]["intent_output"]["optimization_targets"]
+    files = [t["file"] for t in targets]
+    assert files == ["drivers/postgresdriver.py", "db.py"]
+
+
 @patch("src.adco.main.run_pipeline", new_callable=AsyncMock)
 def test_main_success(mock_run, monkeypatch, capsys, tmp_path):
     d = tmp_path / "target_app"

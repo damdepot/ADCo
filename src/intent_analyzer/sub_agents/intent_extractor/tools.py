@@ -1,6 +1,10 @@
 """Tools for the intent extractor agent — read selected files."""
 import os
 from google.adk.tools import ToolContext
+from src.intent_analyzer.tools.db_engine import (
+    engine_constraint_note,
+    filter_paths_by_db_type,
+)
 
 
 def read_files(root: str, relative_paths: list[str]) -> dict[str, str]:
@@ -41,14 +45,22 @@ def read_selected_files(tool_context: ToolContext) -> str:
     the file contents formatted for analysis.
     """
     target = tool_context.state.get("target", "")
+    db_type = tool_context.state.get("db_type", "")
     file_selector_output = tool_context.state.get("file_selector_output")
     if not target or not file_selector_output:
         return "ERROR: target or file_selector_output not set in state"
     selected = _extract_files(file_selector_output)
     if not selected:
         return "ERROR: file_selector_output has no files"
+    if db_type:
+        selected = filter_paths_by_db_type(selected, db_type)
+        if not selected:
+            return "ERROR: no files could be read"
     contents = read_files(target, list(selected))
     if not contents:
         return "ERROR: no files could be read"
     parts = [f"=== {path} ===\n{content[:128000]}" for path, content in contents.items()]
-    return "\n\n".join(parts)
+    result = "\n\n".join(parts)
+    if db_type:
+        result = engine_constraint_note(db_type) + "\n\n" + result
+    return result

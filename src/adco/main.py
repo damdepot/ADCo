@@ -13,6 +13,10 @@ from dotenv import load_dotenv
 
 from src.adco.auth_check import check_auth
 from src.intent_analyzer.main import run_pipeline as intent_analyzer_pipeline
+from src.intent_analyzer.tools.db_engine import (
+    filter_paths_by_db_type,
+    filter_targets_by_db_type,
+)
 from src.code_rewriter.main import run_pipeline as rewriter_pipeline, _maybe_parse
 from src.knob_tuner.main import run_pipeline as tuner_pipeline
 
@@ -136,9 +140,14 @@ async def run_pipeline(
         output_path=intent_output_path,
         verbose=verbose,
         buffer_time=buffer_time,
+        db_type=db_type,
     )
 
     intent_output = intent_state.get("intent_output") or intent_state.get("intent_extractor_output") or {}
+    if isinstance(intent_output, dict) and isinstance(intent_output.get("optimization_targets"), list):
+        intent_output["optimization_targets"] = filter_targets_by_db_type(
+            intent_output["optimization_targets"], db_type
+        )
     workload_info = intent_state.get("workload_info") or (intent_output.get("workload") if isinstance(intent_output, dict) else {})
 
     # ── Phase 2: Code Rewriter ─────────────────────────────
@@ -166,6 +175,7 @@ async def run_pipeline(
                 except Exception:
                     pass
 
+            selected_files = filter_paths_by_db_type(selected_files, db_type)
             if selected_files:
                 intent_output["optimization_targets"] = [
                     {"file": f, "description": "Database interaction file to inspect and optimize"}
