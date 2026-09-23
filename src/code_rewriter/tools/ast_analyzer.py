@@ -1,11 +1,10 @@
 import ast
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 
 from ..models.ast_models import (
     CallAnalysis,
     ClassAnalysis,
-    ControlFlowAnalysis,
     DatabaseOperation,
     DbOperationType,
     FileAnalysis,

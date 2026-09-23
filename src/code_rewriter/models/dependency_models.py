@@ -1,7 +1,7 @@
 """Dependency Graph and Slicing Models for ADCo."""
 
 from enum import StrEnum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from .ast_models import SourceLocation
 

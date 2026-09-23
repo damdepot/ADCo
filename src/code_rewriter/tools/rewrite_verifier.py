@@ -1,6 +1,5 @@
 import ast
-from typing import Any, Dict, List, Optional
-import json
+from typing import Dict, List, Optional
 
 from ..models import (
     RewriteContract,
@@ -9,7 +8,6 @@ from ..models import (
     VerificationCheck,
     CheckStatus,
     VerificationStatus,
-    ViolationSeverity,
     TargetStatus,
     DependencyType,
 )

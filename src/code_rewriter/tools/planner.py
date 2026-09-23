@@ -95,7 +95,6 @@ def _parse_kb(kb_path: str | None = None) -> list[StrategyDef]:
                 current_strategy = {}
             current_field = None
         elif current_strategy is not None:
-            stripped = line.strip()
             match = FIELD_RE.match(line.lstrip())
             if match:
                 field_name = match.group(1).strip().lower()

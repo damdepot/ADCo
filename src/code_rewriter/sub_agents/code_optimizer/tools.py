@@ -365,7 +365,7 @@ def _render_legacy(tool_context: ToolContext, intent_output: dict) -> str:
             contract_lines.append(f"  Must Not Change: {', '.join(c.get('must_not_change', []))}")
             targets = c.get('targets', [])
             if targets:
-                contract_lines.append(f"  Targets:")
+                contract_lines.append("  Targets:")
                 for t in targets:
                     fn = t.get('qualified_function') or t.get('function')
                     contract_lines.append(f"    - File: {t.get('file')}, Function: {fn}")

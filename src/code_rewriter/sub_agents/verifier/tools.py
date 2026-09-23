@@ -12,10 +12,6 @@ from google.adk.tools import ToolContext
 from src.code_rewriter.models.rewrite_models import RewriteContract
 from src.code_rewriter.tools.pipeline_analysis import execute_deterministic_verification
 
-_CODE_ERRORS = re.compile(
-    r"SyntaxError|ImportError|ModuleNotFoundError|NameError|"
-    r"AttributeError|TypeError|IndentationError|ValueError"
-)
 _DB_ERRORS = re.compile(
     r"OperationalError|Can't connect|Connection refused|"
     r"Unknown database|Access denied|could not translate host name|"
