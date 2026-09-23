@@ -1,8 +1,12 @@
 from src.code_rewriter.tools.sql_analysis import (
+    composite_any_array_sql,
     duplicate_column_predicate_sql,
     duplicate_where_sql,
     find_select_column_count,
+    find_select_columns,
+    fragile_composite_agg_sql,
     implicit_join_sql,
+    lookup_key_not_selected_sql,
     multi_statement_sql,
     placeholder_param_mismatch_sql,
     planner_unfriendly_sql,
@@ -293,4 +297,115 @@ def get_items(cursor, ids):
 
 def test_duplicate_column_syntax_error():
     assert duplicate_column_predicate_sql("def f(:") == []
+
+
+def test_find_select_columns_basic():
+    sql = "SELECT S_QUANTITY, S_YTD, S_ORDER_CNT FROM STOCK WHERE S_I_ID = %s"
+    assert find_select_columns(sql) == ["s_quantity", "s_ytd", "s_order_cnt"]
+
+
+def test_find_select_columns_alias_and_quoting():
+    sql = 'SELECT t."S_I_ID" AS item, "S_W_ID" qty, SUM(OL_AMOUNT) FROM STOCK'
+    assert find_select_columns(sql) == ["s_i_id", "s_w_id", "sum(ol_amount)"]
+
+
+def test_find_select_columns_star_returns_none():
+    assert find_select_columns("SELECT * FROM STOCK WHERE S_I_ID = %s") is None
+    assert find_select_columns("SELECT t.* FROM STOCK t") is None
+
+
+def test_find_select_columns_no_from_returns_none():
+    assert find_select_columns("SELECT 1") is None
+
+
+def test_fragile_composite_agg_flagged():
+    source = '''
+def get_items(cursor, ids):
+    cursor.execute("SELECT I_ID, ARRAY_AGG(ROW(I_PRICE, I_NAME)) FROM ITEM WHERE I_ID = ANY(%s)", (ids,))
+'''
+    violations = fragile_composite_agg_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["function"] == "get_items"
+    assert "ARRAY_AGG" in violations[0]["sql"]
+
+
+def test_fragile_composite_agg_plain_not_flagged():
+    source = '''
+def get_items(cursor, ids):
+    cursor.execute("SELECT I_ID, ARRAY_AGG(OL_AMOUNT) FROM ORDER_LINE WHERE OL_I_ID = ANY(%s)", (ids,))
+'''
+    assert fragile_composite_agg_sql(source) == []
+
+
+def test_composite_any_array_flagged():
+    source = '''
+def get_stock(cursor, keys):
+    cursor.execute("SELECT S_QUANTITY FROM STOCK WHERE (S_I_ID, S_W_ID) = ANY(%s)", (keys,))
+'''
+    violations = composite_any_array_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["function"] == "get_stock"
+
+
+def test_composite_in_flattened_not_flagged():
+    source = '''
+def get_stock(cursor, keys):
+    cursor.execute("SELECT S_QUANTITY FROM STOCK WHERE (S_I_ID, S_W_ID) IN ((%s, %s), (%s, %s))", keys)
+'''
+    assert composite_any_array_sql(source) == []
+
+
+def test_scalar_any_not_flagged_as_composite():
+    source = '''
+def get_stock(cursor, ids):
+    cursor.execute("SELECT S_QUANTITY FROM STOCK WHERE S_I_ID = ANY(%s)", (ids,))
+'''
+    assert composite_any_array_sql(source) == []
+
+
+def test_lookup_key_not_selected_flagged():
+    source = '''
+def doNewOrder(self, i_ids):
+    self.cursor.execute("SELECT I_PRICE, I_NAME, I_DATA FROM ITEM WHERE I_ID = ANY(%s)", [i_ids])
+    item_rows = self.cursor.fetchall()
+    item_map = {row[0]: (row[1], row[2], row[3]) for row in item_rows}
+    return item_map
+'''
+    violations = lookup_key_not_selected_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["column"] == "i_id"
+    assert violations[0]["function"] == "doNewOrder"
+
+
+def test_lookup_key_selected_not_flagged():
+    source = '''
+def doNewOrder(self, i_ids):
+    self.cursor.execute("SELECT I_ID, I_PRICE, I_NAME FROM ITEM WHERE I_ID = ANY(%s)", [i_ids])
+    item_rows = self.cursor.fetchall()
+    item_map = {row[0]: (row[1], row[2]) for row in item_rows}
+    return item_map
+'''
+    assert lookup_key_not_selected_sql(source) == []
+
+
+def test_lookup_key_composite_filter_skipped():
+    source = '''
+def get_stock(self, keys):
+    self.cursor.execute("SELECT S_QUANTITY, S_DATA FROM STOCK WHERE (S_I_ID, S_W_ID) IN (%s)", [keys])
+    stock_rows = self.cursor.fetchall()
+    stock_map = {row[0]: row[1] for row in stock_rows}
+    return stock_map
+'''
+    assert lookup_key_not_selected_sql(source) == []
+
+
+def test_lookup_key_select_star_skipped():
+    source = '''
+def doNewOrder(self, i_ids):
+    self.cursor.execute("SELECT * FROM ITEM WHERE I_ID = ANY(%s)", [i_ids])
+    item_rows = self.cursor.fetchall()
+    item_map = {row[0]: (row[1], row[2]) for row in item_rows}
+    return item_map
+'''
+    assert lookup_key_not_selected_sql(source) == []
 

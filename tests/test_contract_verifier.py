@@ -618,3 +618,79 @@ def get_stock(self, d_id):
     result = verify_contract(orig, opt, _static_check_contract())
     assert not any(v.code == "PERCENT_FORMAT_ARITY" for v in result.violations)
 
+
+def test_verify_rejects_fragile_composite_agg():
+    orig = """
+def get_stock(self, item_ids):
+    return None
+"""
+    opt = """
+def get_stock(self, item_ids):
+    self.cursor.execute("SELECT I_ID, ARRAY_AGG(ROW(I_PRICE, I_NAME)) FROM ITEM WHERE I_ID = ANY(%s)", (item_ids,))
+    return None
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert result.status == "FAIL"
+    assert any(
+        v.code == "FRAGILE_COMPOSITE_AGG" and v.severity == "ERROR"
+        for v in result.violations
+    )
+
+
+def test_verify_rejects_composite_any_array():
+    orig = """
+def get_stock(self, keys):
+    return None
+"""
+    opt = """
+def get_stock(self, keys):
+    self.cursor.execute("SELECT S_QUANTITY FROM STOCK WHERE (S_I_ID, S_W_ID) = ANY(%s)", (keys,))
+    return None
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert result.status == "FAIL"
+    assert any(
+        v.code == "COMPOSITE_ANY_ARRAY" and v.severity == "ERROR"
+        for v in result.violations
+    )
+
+
+def test_verify_rejects_lookup_key_not_selected():
+    orig = """
+def get_stock(self, item_ids):
+    return None
+"""
+    opt = """
+def get_stock(self, item_ids):
+    self.cursor.execute("SELECT I_PRICE, I_NAME FROM ITEM WHERE I_ID = ANY(%s)", (item_ids,))
+    item_rows = self.cursor.fetchall()
+    item_map = {row[0]: (row[1], row[2]) for row in item_rows}
+    return item_map
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert result.status == "FAIL"
+    assert any(
+        v.code == "LOOKUP_KEY_NOT_SELECTED" and v.severity == "ERROR"
+        for v in result.violations
+    )
+
+
+def test_preexisting_lookup_key_violation_is_deduped():
+    orig = """
+def get_stock(self, item_ids):
+    self.cursor.execute("SELECT I_PRICE, I_NAME FROM ITEM WHERE I_ID = ANY(%s)", (item_ids,))
+    item_rows = self.cursor.fetchall()
+    item_map = {row[0]: (row[1], row[2]) for row in item_rows}
+    return item_map
+"""
+    opt = """
+def get_stock(self, item_ids):
+    extra = 1
+    self.cursor.execute("SELECT I_PRICE, I_NAME FROM ITEM WHERE I_ID = ANY(%s)", (item_ids,))
+    item_rows = self.cursor.fetchall()
+    item_map = {row[0]: (row[1], row[2]) for row in item_rows}
+    return item_map
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert not any(v.code == "LOOKUP_KEY_NOT_SELECTED" for v in result.violations)
+

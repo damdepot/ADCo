@@ -24,6 +24,9 @@ from .sql_analysis import (
     unknown_query_key_sql,
     placeholder_param_mismatch_sql,
     duplicate_column_predicate_sql,
+    fragile_composite_agg_sql,
+    composite_any_array_sql,
+    lookup_key_not_selected_sql,
 )
 from .python_analysis import (
     percent_format_arity_violations,
@@ -667,6 +670,75 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
                 "per row and collapses bulk-write throughput. Import and use "
                 "`psycopg2.extras.execute_batch` (or `execute_values`) instead — a "
                 "function-local `from psycopg2.extras import execute_batch` is permitted."
+            ),
+        ))
+
+    opt_fragile = fragile_composite_agg_sql(optimized_source)
+    orig_fragile = fragile_composite_agg_sql(original_source)
+    orig_fragile_keys = {(v["function"], v["sql"]) for v in orig_fragile}
+    seen_fragile = set()
+    for site in opt_fragile:
+        dedup_key = (site["function"], site["sql"])
+        if dedup_key in seen_fragile or dedup_key in orig_fragile_keys:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_fragile.add(dedup_key)
+        violations.append(VerificationViolation(
+            code="FRAGILE_COMPOSITE_AGG",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} aggregates ROW(...) with ARRAY_AGG; psycopg2 "
+                "returns a Postgres composite array as opaque text, so any Python parsing of "
+                "it is fragile and usually wrong (e.g. invalid literal for int() with base 10: "
+                "'{'). Use json_agg/jsonb_agg, select the columns separately, or keep the "
+                "original second query."
+            ),
+        ))
+
+    opt_composite_any = composite_any_array_sql(optimized_source)
+    orig_composite_any = composite_any_array_sql(original_source)
+    orig_composite_any_keys = {(v["function"], v["sql"]) for v in orig_composite_any}
+    seen_composite_any = set()
+    for site in opt_composite_any:
+        dedup_key = (site["function"], site["sql"])
+        if dedup_key in seen_composite_any or dedup_key in orig_composite_any_keys:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_composite_any.add(dedup_key)
+        violations.append(VerificationViolation(
+            code="COMPOSITE_ANY_ARRAY",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} compares a composite key tuple to a single array "
+                "placeholder ((a, b) = ANY(%s) / IN (%s)). Postgres/psycopg2 cannot compare "
+                "record types reliably (e.g. 'cannot compare dissimilar column types smallint "
+                "and integer'). Use `(a, b) IN ((%s, %s), ...)` with flattened parameters "
+                "instead."
+            ),
+        ))
+
+    opt_lookup = lookup_key_not_selected_sql(optimized_source)
+    orig_lookup = lookup_key_not_selected_sql(original_source)
+    orig_lookup_keys = {(v["function"], v["sql"]) for v in orig_lookup}
+    seen_lookup = set()
+    for site in opt_lookup:
+        dedup_key = (site["function"], site["sql"])
+        if dedup_key in seen_lookup or dedup_key in orig_lookup_keys:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_lookup.add(dedup_key)
+        violations.append(VerificationViolation(
+            code="LOOKUP_KEY_NOT_SELECTED",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} builds a lookup dict from a query filtered by "
+                f"'{site['column']} = ANY/IN' but the SELECT projection does not include "
+                f"'{site['column']}'. The dict is keyed on a column that was not returned, so "
+                "lookups miss and the transaction silently aborts/rolls back. Add the filter "
+                "key column(s) to the SELECT projection."
             ),
         ))
 

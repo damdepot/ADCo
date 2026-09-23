@@ -31,6 +31,9 @@ _FIX_HINTS: dict[str, str] = {
     "PERCENT_FORMAT_ARITY": "Never %-format a string that contains %s placeholders. Pre-format only the dynamic identifier into a variable, then build the SQL with an f-string and pass values as execute() params.",
     "UNDEFINED_NAME": "Bind the name. In a comprehension always write `for <name> in <iterable>`; otherwise add the missing assignment or parameter.",
     "SLOW_EXECUTEMANY": "Use psycopg2.extras.execute_batch (or execute_values) for bulk writes instead of cursor.executemany.",
+    "FRAGILE_COMPOSITE_AGG": "Never ARRAY_AGG(ROW(...)) and parse the text; use json_agg/jsonb_agg, select columns separately, or keep the second query.",
+    "COMPOSITE_ANY_ARRAY": "Do not pass a list of tuples to = ANY(%s); use `(a, b) IN ((%s, %s), ...)` with flattened parameters.",
+    "LOOKUP_KEY_NOT_SELECTED": "Include the batched filter key column(s) in the SELECT projection before keying the lookup dict.",
 }
 
 

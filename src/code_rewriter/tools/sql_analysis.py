@@ -35,6 +35,23 @@ _PREDICATE_RE = re.compile(
     r'^\s*([A-Za-z_"`][\w."`]*)\s*(=\s*(?:ANY|ALL)\b|IN\b|<>|!=|>=|<=|=|>|<)',
     re.IGNORECASE,
 )
+_SELECT_AS_ALIAS_RE = re.compile(
+    r'\s+AS\s+("[^"]*"|`[^`]*`|[A-Za-z_]\w*)\s*$', re.IGNORECASE
+)
+_SELECT_BARE_ALIAS_RE = re.compile(r'\s+("[^"]*"|`[^`]*`|[A-Za-z_]\w*)\s*$')
+_FRAGILE_COMPOSITE_AGG_RE = re.compile(
+    r"ARRAY_AGG\s*\(\s*(?:DISTINCT\s+)?ROW\s*\(", re.IGNORECASE
+)
+_COMPOSITE_ANY_ARRAY_RE = re.compile(
+    r"\(\s*[A-Za-z_\"`][\w.\"`]*\s*,\s*[A-Za-z_\"`][\w.\"`]*"
+    r"(?:\s*,\s*[A-Za-z_\"`][\w.\"`]*)*\s*\)\s*"
+    r"(?:=\s*ANY\s*\(\s*%s\s*\)|IN\s*\(\s*%s\s*\))",
+    re.IGNORECASE,
+)
+_ANY_IN_FILTER_RE = re.compile(
+    r'([A-Za-z_\"`][\w.\"`]*)\s*(?:=\s*ANY\s*\(\s*%s\s*\)|IN\s*\(\s*%s\s*\))',
+    re.IGNORECASE,
+)
 
 
 def _is_call_attr(node: ast.AST, names: set) -> bool:
@@ -266,6 +283,38 @@ def find_select_column_count(sql: str) -> Optional[int]:
     return len(items)
 
 
+def find_select_columns(sql: str) -> Optional[List[str]]:
+    """Return normalized column names of the first top-level ``SELECT`` list.
+
+    Returns ``None`` when the statement has ``SELECT *`` / a qualified star, no
+    top-level ``FROM``, or an empty/unparseable select list.
+    """
+    if not isinstance(sql, str) or not sql:
+        return None
+    select_pos = _scan_keyword(sql, "SELECT", 0, 0)
+    if select_pos < 0:
+        return None
+    from_pos = _scan_keyword(sql, "FROM", select_pos + len("SELECT"), 0)
+    if from_pos < 0:
+        return None
+    select_list = sql[select_pos + len("SELECT") : from_pos].strip()
+    if not select_list:
+        return None
+    items = [item.strip() for item in _split_top_level(select_list)]
+    items = [item for item in items if item]
+    if not items:
+        return None
+    columns: List[str] = []
+    for item in items:
+        normalized = re.sub(r"^(DISTINCT|ALL)\s+", "", item, flags=re.IGNORECASE).strip()
+        if normalized == "*" or _QUALIFIED_STAR_RE.match(normalized):
+            return None
+        normalized = _SELECT_AS_ALIAS_RE.sub("", normalized).strip()
+        normalized = _SELECT_BARE_ALIAS_RE.sub("", normalized).strip()
+        columns.append(_normalize_column(normalized))
+    return columns
+
+
 class _FunctionAnalyzer:
     def __init__(self, function_name: str, module_dicts: Dict[str, Any]) -> None:
         self.function_name = function_name
@@ -278,6 +327,7 @@ class _FunctionAnalyzer:
         self.execute_sqls: List[tuple] = []
         self.execute_calls: List[tuple] = []
         self.unknown_query_keys: List[tuple] = []
+        self.lookup_dicts: List[tuple] = []
 
     def eval(self, node: Optional[ast.AST]) -> Any:
         return resolve(node, self.local_vars, self.module_dicts)
@@ -412,6 +462,8 @@ class _FunctionAnalyzer:
         sql = self._iter_sql(generator.iter)
         if not isinstance(sql, str):
             return
+        if isinstance(comp, ast.DictComp):
+            self.lookup_dicts.append((sql, comp.lineno))
         saved = dict(self.row_bindings)
         if isinstance(generator.target, ast.Name):
             self.row_bindings[generator.target.id] = sql
@@ -739,7 +791,103 @@ def placeholder_param_mismatch_sql(source: str) -> List[dict]:
 
 
 def _normalize_column(col: str) -> str:
-    return col.strip('"`').split(".")[-1].lower()
+    return col.split(".")[-1].strip('"`').lower()
+
+
+def _any_in_filter_columns(sql: str) -> set:
+    """Normalized columns matched by ``col = ANY(%s)`` / ``col IN (%s)``.
+
+    A composite LHS (a tuple before the operator) is deliberately not matched.
+    """
+    return {_normalize_column(m.group(1)) for m in _ANY_IN_FILTER_RE.finditer(sql)}
+
+
+def fragile_composite_agg_sql(source: str) -> List[dict]:
+    """Resolved SQL strings that aggregate ``ROW(...)`` with ``ARRAY_AGG``."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    module_dicts = collect_module_dicts(tree)
+    violations: List[dict] = []
+    seen = set()
+    for name, node in _iter_functions(tree):
+        analyzer = _FunctionAnalyzer(name, module_dicts)
+        analyzer.analyze(node.body)
+        for sql, line in analyzer.execute_sqls:
+            if SENTINEL in sql:
+                continue
+            if not _FRAGILE_COMPOSITE_AGG_RE.search(sql):
+                continue
+            key = (name, sql)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append({"function": name, "sql": sql, "line": line})
+    return violations
+
+
+def composite_any_array_sql(source: str) -> List[dict]:
+    """Resolved SQL comparing a composite key tuple to a single array placeholder."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    module_dicts = collect_module_dicts(tree)
+    violations: List[dict] = []
+    seen = set()
+    for name, node in _iter_functions(tree):
+        analyzer = _FunctionAnalyzer(name, module_dicts)
+        analyzer.analyze(node.body)
+        for sql, line in analyzer.execute_sqls:
+            if SENTINEL in sql:
+                continue
+            if not _COMPOSITE_ANY_ARRAY_RE.search(sql):
+                continue
+            key = (name, sql)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append({"function": name, "sql": sql, "line": line})
+    return violations
+
+
+def lookup_key_not_selected_sql(source: str) -> List[dict]:
+    """Batched lookup dicts keyed on a filter column missing from the SELECT."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    module_dicts = collect_module_dicts(tree)
+    violations: List[dict] = []
+    seen = set()
+    for name, node in _iter_functions(tree):
+        analyzer = _FunctionAnalyzer(name, module_dicts)
+        analyzer.analyze(node.body)
+        for sql, line in analyzer.lookup_dicts:
+            if SENTINEL in sql:
+                continue
+            filter_cols = _any_in_filter_columns(sql)
+            if not filter_cols:
+                continue
+            cols = find_select_columns(sql)
+            if cols is None:
+                continue
+            if any(col in set(cols) for col in filter_cols):
+                continue
+            key = (name, sql)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(
+                {
+                    "function": name,
+                    "line": line,
+                    "column": sorted(filter_cols)[0],
+                    "sql": sql,
+                }
+            )
+    return violations
 
 
 def duplicate_column_predicate_sql(source: str) -> List[dict]:

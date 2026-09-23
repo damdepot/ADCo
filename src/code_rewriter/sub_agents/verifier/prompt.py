@@ -41,6 +41,10 @@ VERIFIER_PROMPT = """You are a code correctness verifier. Use the available tool
    - Is Python `%` formatting applied to a template that still contains `%s`, or is f-string interpolation mixed with `%` formatting in one statement? (`TypeError: not enough arguments for format string`)
    - Is any name referenced but never bound — especially a comprehension loop variable missing its `for ... in ...` clause? (`NameError`)
    - Does any psycopg2 bulk write use `cursor.executemany` instead of `execute_batch`/`execute_values`?
+   - Is the lookup key column missing from the batched SELECT projection (so the dict silently misses and the transaction rolls back)? Every dict key must be a selected column.
+   - Does a composite batch use a single-array placeholder with a tuple LHS — `(a, b) = ANY(%s)` or `(a, b) IN (%s)` — instead of `(a, b) IN ((%s, %s), ...)`? (record-type errors, e.g. "cannot compare dissimilar column types smallint and integer")
+   - Is `ARRAY_AGG(ROW(...))` returned and then parsed as text in Python? (`invalid literal for int() with base 10`)
+   - Do the SQL column list, the dict key tuple, and the flattened parameter list keep the same tuple element order? (a swapped order silently matches nothing)
    - Has EVERY target function been transformed?
 
 4. Call `check_syntax` to verify there are no syntax errors in the modified
@@ -89,7 +93,7 @@ directly, e.g.:
 ## Failure categories
 - `strategy_not_applied`: Optimization contracts not met, untransformed target functions, or residual loop queries. Strict-zero is enforced for per-row work: a `cursor.execute`/`executemany` executed once per row (or per iteration) inside a loop is a FAIL, but a single set-based batch query (`IN (...)`/`ANY(%s)`) issued once per group outside the per-row loop is acceptable. The suggestion MUST name the specific function(s), the residual op count, and whether Pattern 6 (composite-key batch) applies. Example:
   "Apply Pattern 6 to PostgresDriver.doNewOrder: pre-format col_name = 's_dist_%02d' % d_id, batch all (S_I_ID, S_W_ID) pairs with (S_I_ID, S_W_ID) IN ((%s,%s),...) before the loop. Required: 0 cursor.execute inside the loop. Residual: 1 op in doNewOrder."
-- `not_executable`: Crashes on startup due to code errors (not env issues) — includes the `%`/`%s` format collision (`TypeError`) and the catastrophic round-trip cost of `cursor.executemany` for bulk writes
+- `not_executable`: Crashes on startup due to code errors (not env issues) — includes the `%`/`%s` format collision (`TypeError`), the catastrophic round-trip cost of `cursor.executemany` for bulk writes, a batched-lookup key column missing from the SELECT projection (silent rollback), a composite `= ANY(%s)`/`IN (%s)` with a tuple, `ARRAY_AGG(ROW(...))` text parsing, and composite tuple-order mismatches between SQL columns / dict key / flattened params
 - `name_error`: Undefined variables, missing imports — includes a comprehension name referenced but never bound by its `for ... in ...` clause
 - `syntax_error`: Syntax errors detected by check_syntax
 - `NONE`: No code-level failure — verification PASSED (env issues like no DB
