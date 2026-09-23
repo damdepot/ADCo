@@ -5,7 +5,7 @@ dir=$1
 dbms="postgres"
 warehouses=5
 clients=5
-exp_path="$(cd "$(dirname "$0")/.." && pwd)"
+exp_path="$(cd "$(dirname "$0")/../.." && pwd)"
 workload_path="${exp_path}/benchmarks/tools/tpcc"
 log_fname="${exp_path}/results/$dir"
 

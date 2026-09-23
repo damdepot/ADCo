@@ -1,6 +1,6 @@
 #!/bin/bash
 
-CMDRunTPCC="./benchmarks/scripts/run_tpcc.sh"
+CMDRunTPCC="./benchmarks/scripts/tpcc.sh"
 
 echo "----------------->> baseline <<-----------------"
 $CMDRunTPCC baseline
