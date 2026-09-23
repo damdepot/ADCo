@@ -114,6 +114,7 @@ async def run_pipeline(
         initial_state["read_write_map"] = build_read_write_map(analyses)
     except Exception as e:
         _log_event(f"Error building contracts: {e}", log_file=log_file_abs, verbose=verbose)
+        raise
 
     session_service = InMemorySessionService()
     sid = uuid.uuid4().hex[:12]

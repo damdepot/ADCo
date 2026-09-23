@@ -52,44 +52,13 @@ from ..models.db_interaction_models import FunctionDbModel
 from ..models.transformation_risk_models import RiskReport
 from .db_interaction import build_function_model
 from .sql_resolver import collect_module_dicts
+from .._common import find_function_node
 
 DEPENDENT_QUERY_FUSION = "DEPENDENT_QUERY_FUSION"
 JOIN_COMPLEXITY_INCREASE = "JOIN_COMPLEXITY_INCREASE"
 AGGREGATE_QUERY_EXPANSION = "AGGREGATE_QUERY_EXPANSION"
 CROSS_FUNCTION_READ_WRITE = "CROSS_FUNCTION_READ_WRITE"
 STATEMENT_ORDER_CHANGE = "STATEMENT_ORDER_CHANGE"
-
-
-def _find_function_node(tree: ast.Module, qualified: str) -> Optional[ast.AST]:
-    """Return the AST node for a (qualified) function/method name, or ``None``.
-
-    Walks classes and nested functions the same way ``ast_analyzer`` does, and
-    matches either the fully qualified name or the bare function name.
-    """
-    if not qualified:
-        return None
-    bare = qualified.rsplit(".", 1)[-1]
-
-    def _walk(node: ast.AST, prefix: str) -> Optional[ast.AST]:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.ClassDef):
-                found = _walk(child, f"{prefix}{child.name}.")
-                if found is not None:
-                    return found
-            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                full = f"{prefix}{child.name}"
-                if full == qualified or child.name == bare:
-                    return child
-                found = _walk(child, f"{full}.")
-                if found is not None:
-                    return found
-            else:
-                found = _walk(child, prefix)
-                if found is not None:
-                    return found
-        return None
-
-    return _walk(tree, "")
 
 
 def model_from_source(source: str, function_name: str) -> Optional[FunctionDbModel]:
@@ -106,7 +75,7 @@ def model_from_source(source: str, function_name: str) -> Optional[FunctionDbMod
         return None
 
     module_dicts = collect_module_dicts(tree)
-    node = _find_function_node(tree, function_name)
+    node = find_function_node(tree, function_name)
     if node is None:
         return None
 

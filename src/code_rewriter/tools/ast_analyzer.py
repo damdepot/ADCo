@@ -14,6 +14,7 @@ from ..models.ast_models import (
     SqlOperation,
 )
 from .sql_resolver import collect_module_dicts, resolve
+from .._common import target_names
 
 class _FileVisitor(ast.NodeVisitor):
     def __init__(self, module_dicts: Optional[Dict[str, Any]] = None):
@@ -172,13 +173,7 @@ class _FileVisitor(ast.NodeVisitor):
         self.generic_visit(node)
         
     def _extract_targets(self, node: ast.AST) -> List[str]:
-        targets = []
-        if isinstance(node, ast.Name):
-            targets.append(node.id)
-        elif isinstance(node, ast.Tuple) or isinstance(node, ast.List):
-            for elt in node.elts:
-                targets.extend(self._extract_targets(elt))
-        return targets
+        return target_names(node)
 
     def visit_For(self, node: ast.For):
         if self.current_function:

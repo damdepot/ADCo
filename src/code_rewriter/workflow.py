@@ -320,7 +320,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
     n_total = len(results)
     n_pass = sum(1 for r in results if r.get("status") == "PASS")
     n_restricted = sum(1 for r in results if r.get("status") == "RESTRICTED")
-    all_ok = all(r.get("status") in ("PASS", "RESTRICTED") for r in results)
+    all_ok = n_total > 0 and all(r.get("status") in ("PASS", "RESTRICTED") for r in results)
 
     errors = [
         v
@@ -349,7 +349,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         "transformed_targets": n_pass,
         "restricted_targets": n_restricted,
         "missing_targets": n_total - n_pass - n_restricted,
-        "rewrite_coverage": (n_pass / n_total) if n_total else 1.0,
+        "rewrite_coverage": (n_pass / n_total) if n_total else 0.0,
         "target_coverage": [
             {
                 "file": r.get("file", ""),

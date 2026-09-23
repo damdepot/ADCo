@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 _LOOP_BATCH_HINT = (
     "Remove every DB call from the loop. Hoist ONE set-based batch read per "
