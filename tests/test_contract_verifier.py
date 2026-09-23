@@ -457,3 +457,64 @@ def get_items(cursor, item_ids):
     result = verify_contract(orig, opt, contract)
     assert result.status == "PASS", [v.model_dump() for v in result.violations]
 
+
+def test_verify_rejects_duplicate_column_predicate():
+    orig = """
+def get_stock(self, d_id, item_ids):
+    result = {}
+    for item_id in item_ids:
+        self.cursor.execute("SELECT S_QUANTITY FROM STOCK WHERE S_I_ID = %s AND S_W_ID = %s", (item_id, d_id))
+        result[item_id] = self.cursor.fetchone()[0]
+    return result
+"""
+    opt = """
+TXN_QUERIES = {"NEW_ORDER": {"getStockInfo": "SELECT S_QUANTITY, S_DATA FROM STOCK WHERE S_I_ID = %%s AND S_W_ID = %%s"}}
+
+def get_stock(self, d_id, item_ids):
+    d_id = 1
+    q = TXN_QUERIES["NEW_ORDER"]
+    stock_sql = (q["getStockInfo"] % (d_id)) + " AND S_I_ID IN (%s)"
+    self.cursor.execute(stock_sql, [d_id] + item_ids)
+    return {row[0]: row[1] for row in self.cursor.fetchall()}
+"""
+    contract = RewriteContract(
+        rewrite_id="test_duplicate_column",
+        target=RewriteTarget(file="t.py", function="get_stock"),
+        pattern="N+1 Query",
+        strategy="Query Batching",
+        allowed_regions=["get_stock"],
+    )
+    result = verify_contract(orig, opt, contract)
+    assert result.status == "FAIL"
+    assert any(v.code == "DUPLICATE_COLUMN_PREDICATE" for v in result.violations)
+
+
+def test_verify_clean_composite_in_batch_passes():
+    orig = """
+def get_stock(self, d_id, item_ids):
+    result = {}
+    for item_id in item_ids:
+        self.cursor.execute("SELECT S_QUANTITY FROM STOCK WHERE S_I_ID = %s AND S_W_ID = %s", (item_id, d_id))
+        result[item_id] = self.cursor.fetchone()[0]
+    return result
+"""
+    opt = """
+TXN_QUERIES = {"NEW_ORDER": {"getStockInfo": "SELECT S_I_ID, S_QUANTITY FROM STOCK WHERE S_I_ID = %%s AND S_W_ID = %%s"}}
+
+def get_stock(self, d_id, item_ids):
+    q = TXN_QUERIES["NEW_ORDER"]
+    placeholders = ",".join(["%s"] * len(item_ids))
+    stock_sql = (q["getStockInfo"] % (d_id)).replace("WHERE S_I_ID = %s AND S_W_ID = %s", "WHERE (S_I_ID, S_W_ID) IN (" + placeholders + ")")
+    self.cursor.execute(stock_sql, item_ids)
+    return {row[0]: row[1] for row in self.cursor.fetchall()}
+"""
+    contract = RewriteContract(
+        rewrite_id="test_clean_composite",
+        target=RewriteTarget(file="t.py", function="get_stock"),
+        pattern="N+1 Query",
+        strategy="Query Batching",
+        allowed_regions=["get_stock"],
+    )
+    result = verify_contract(orig, opt, contract)
+    assert result.status == "PASS", [v.model_dump() for v in result.violations]
+

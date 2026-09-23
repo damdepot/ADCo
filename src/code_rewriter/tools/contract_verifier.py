@@ -22,6 +22,8 @@ from .sql_analysis import (
     multi_statement_sql,
     duplicate_where_sql,
     unknown_query_key_sql,
+    placeholder_param_mismatch_sql,
+    duplicate_column_predicate_sql,
 )
 
 def _extract_function_ast_map(source: Optional[str]) -> Dict[str, ast.AST]:
@@ -535,6 +537,54 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
                 f"Function {site['function']} executes query key '{site['key']}' which does "
                 "not exist in the resolved query dict — this raises KeyError at runtime. "
                 "Reuse an existing query key verbatim."
+            ),
+        ))
+
+    opt_dup_col = duplicate_column_predicate_sql(optimized_source)
+    orig_dup_col = duplicate_column_predicate_sql(original_source)
+    orig_dup_col_keys = {(v["function"], v["column"]) for v in orig_dup_col}
+    seen_dup_col = set()
+    for site in opt_dup_col:
+        dedup_key = (site["function"], site["column"], site["line"])
+        if dedup_key in seen_dup_col or (site["function"], site["column"]) in orig_dup_col_keys:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_dup_col.add(dedup_key)
+        snippet = " ".join(site["sql"].split())
+        if len(snippet) > 160:
+            snippet = snippet[:157] + "..."
+        violations.append(VerificationViolation(
+            code="DUPLICATE_COLUMN_PREDICATE",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} filters column {site['column']} both by equality "
+                f"and by IN/ANY in the same statement ({snippet}); appending a batch predicate "
+                "onto a template that already constrained that column produces mismatched "
+                "parameters and invalid semantics. Rewrite the existing predicate instead of "
+                "appending a second one."
+            ),
+        ))
+
+    opt_arity = placeholder_param_mismatch_sql(optimized_source)
+    orig_arity = placeholder_param_mismatch_sql(original_source)
+    orig_arity_keys = {(v["function"], v["sql"]) for v in orig_arity}
+    seen_arity = set()
+    for site in opt_arity:
+        dedup_key = (site["function"], site["sql"], site["line"])
+        if dedup_key in seen_arity or (site["function"], site["sql"]) in orig_arity_keys:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_arity.add(dedup_key)
+        violations.append(VerificationViolation(
+            code="PLACEHOLDER_PARAM_MISMATCH",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} passes {site['params']} parameter(s) to execute() "
+                f"but the SQL has {site['placeholders']} placeholder(s). The driver raises at "
+                "runtime (e.g. psycopg2 IndexError / 'not enough arguments'). Fix the parameter "
+                "list or the SQL."
             ),
         ))
 

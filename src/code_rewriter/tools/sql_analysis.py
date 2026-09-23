@@ -29,6 +29,12 @@ _FROM_CLAUSE_END_KEYWORDS = (
     "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "EXCEPT", "INTERSECT",
     "WINDOW", "QUALIFY", "RETURNING", "FETCH", "FOR",
 )
+_PLACEHOLDER_NAMED_RE = re.compile(r"%\(([A-Za-z_]\w*)\)s")
+_PLACEHOLDER_POSITIONAL_RE = re.compile(r"%s|\$\d+|(?<!:):[A-Za-z_]\w*|\?")
+_PREDICATE_RE = re.compile(
+    r'^\s*([A-Za-z_"`][\w."`]*)\s*(=\s*(?:ANY|ALL)\b|IN\b|<>|!=|>=|<=|=|>|<)',
+    re.IGNORECASE,
+)
 
 
 def _is_call_attr(node: ast.AST, names: set) -> bool:
@@ -114,6 +120,49 @@ def _split_top_level(text: str) -> List[str]:
         elif c == "," and depth == 0:
             items.append("".join(current))
             current = []
+        else:
+            current.append(c)
+        i += 1
+    items.append("".join(current))
+    return items
+
+
+def _split_top_level_and(clause: str) -> List[str]:
+    items: List[str] = []
+    current: List[str] = []
+    depth = 0
+    quote: Optional[str] = None
+    i = 0
+    n = len(clause)
+    while i < n:
+        c = clause[i]
+        if quote is not None:
+            if c == quote:
+                if i + 1 < n and clause[i + 1] == quote:
+                    current.append(c)
+                    current.append(c)
+                    i += 2
+                    continue
+                quote = None
+            current.append(c)
+        elif c in ("'", '"', "`"):
+            quote = c
+            current.append(c)
+        elif c == "(":
+            depth += 1
+            current.append(c)
+        elif c == ")":
+            depth = max(0, depth - 1)
+            current.append(c)
+        elif depth == 0 and clause[i : i + 3].upper() == "AND":
+            before = clause[i - 1] if i > 0 else " "
+            after = clause[i + 3] if i + 3 < n else " "
+            if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                items.append("".join(current))
+                current = []
+                i += 3
+                continue
+            current.append(c)
         else:
             current.append(c)
         i += 1
@@ -227,6 +276,7 @@ class _FunctionAnalyzer:
         self.row_reads: Dict[str, List[tuple]] = {}
         self.sql_candidates: List[tuple] = []
         self.execute_sqls: List[tuple] = []
+        self.execute_calls: List[tuple] = []
         self.unknown_query_keys: List[tuple] = []
 
     def eval(self, node: Optional[ast.AST]) -> Any:
@@ -269,6 +319,15 @@ class _FunctionAnalyzer:
                 if isinstance(sql, str):
                     self._record_candidate(sql, stmt.lineno)
                     self.execute_sqls.append((sql, stmt.lineno))
+                self.execute_calls.append(
+                    (
+                        sql if isinstance(sql, str) else None,
+                        stmt.lineno,
+                        call.args[0],
+                        call.args[1] if len(call.args) > 1 else None,
+                        call.func.attr,
+                    )
+                )
             self.collect_row_reads(stmt.value)
         elif isinstance(stmt, (ast.For, ast.AsyncFor)):
             self._process_for(stmt)
@@ -601,4 +660,131 @@ def duplicate_where_sql(source: str) -> List[dict]:
             violations.append(
                 {"function": name, "sql": sql, "line": line, "where_count": count}
             )
+    return violations
+
+
+def _placeholder_count(sql: str) -> tuple:
+    cleaned = sql.replace("%%", "")
+    return (
+        len(_PLACEHOLDER_POSITIONAL_RE.findall(cleaned)),
+        set(_PLACEHOLDER_NAMED_RE.findall(cleaned)),
+    )
+
+
+def _sql_placeholder_exact(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, (ast.JoinedStr, ast.Call)):
+            return False
+    return True
+
+
+def _static_params_count(node: Optional[ast.AST]) -> Optional[int]:
+    if node is None:
+        return 0
+    if isinstance(node, ast.Constant) and node.value is None:
+        return 0
+    if isinstance(node, (ast.List, ast.Tuple)):
+        if any(isinstance(elt, ast.Starred) for elt in node.elts):
+            return None
+        return len(node.elts)
+    return None
+
+
+def placeholder_param_mismatch_sql(source: str) -> List[dict]:
+    """Resolved execute() SQL whose static placeholder count differs from its params."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    module_dicts = collect_module_dicts(tree)
+    violations: List[dict] = []
+    seen = set()
+    for name, node in _iter_functions(tree):
+        analyzer = _FunctionAnalyzer(name, module_dicts)
+        analyzer.analyze(node.body)
+        for sql, line, sql_node, params_node, method in analyzer.execute_calls:
+            if method != "execute":
+                continue
+            if not isinstance(sql, str) or SENTINEL in sql:
+                continue
+            if not _sql_placeholder_exact(sql_node):
+                continue
+            positional, named = _placeholder_count(sql)
+            if named:
+                if not isinstance(params_node, ast.Dict):
+                    continue
+                expected = len(named)
+                actual = sum(1 for key in params_node.keys if key is not None)
+            else:
+                actual = _static_params_count(params_node)
+                if actual is None:
+                    continue
+                expected = positional
+            if expected == actual:
+                continue
+            key = (name, sql, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(
+                {
+                    "function": name,
+                    "sql": sql,
+                    "line": line,
+                    "placeholders": expected,
+                    "params": actual,
+                }
+            )
+    return violations
+
+
+def _normalize_column(col: str) -> str:
+    return col.strip('"`').split(".")[-1].lower()
+
+
+def duplicate_column_predicate_sql(source: str) -> List[dict]:
+    """Resolved SQL constraining one column by both equality and a set predicate."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    module_dicts = collect_module_dicts(tree)
+    violations: List[dict] = []
+    seen = set()
+    for name, node in _iter_functions(tree):
+        analyzer = _FunctionAnalyzer(name, module_dicts)
+        analyzer.analyze(node.body)
+        for sql, line in analyzer.execute_sqls:
+            if SENTINEL in sql:
+                continue
+            where_pos = _scan_keyword(sql, "WHERE", 0, 0)
+            if where_pos < 0:
+                continue
+            clause = sql[where_pos + len("WHERE") :]
+            kinds: Dict[str, set] = {}
+            for predicate in _split_top_level_and(clause):
+                predicate = predicate.strip().lstrip("(")
+                match = _PREDICATE_RE.match(predicate)
+                if not match:
+                    continue
+                col = _normalize_column(match.group(1))
+                op = match.group(2).upper().replace(" ", "")
+                if op.startswith("IN") or op.startswith("=ANY") or op.startswith("=ALL"):
+                    kind = "set"
+                elif op == "=":
+                    kind = "eq"
+                else:
+                    continue
+                kinds.setdefault(col, set()).add(kind)
+            duplicates = sorted(col for col, k in kinds.items() if "eq" in k and "set" in k)
+            if not duplicates:
+                continue
+            key = (name, sql, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            for col in duplicates:
+                violations.append(
+                    {"function": name, "sql": sql, "line": line, "column": col}
+                )
     return violations

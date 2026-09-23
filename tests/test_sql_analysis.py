@@ -1,8 +1,10 @@
 from src.code_rewriter.tools.sql_analysis import (
+    duplicate_column_predicate_sql,
     duplicate_where_sql,
     find_select_column_count,
     implicit_join_sql,
     multi_statement_sql,
+    placeholder_param_mismatch_sql,
     planner_unfriendly_sql,
     row_index_violations,
     unknown_query_key_sql,
@@ -211,4 +213,84 @@ def lookup(cursor, x):
     cursor.execute("SELECT a FROM t WHERE a IN (SELECT b FROM u, v WHERE u.id = v.id)", (x,))
 '''
     assert implicit_join_sql(source) == []
+
+
+def test_placeholder_param_mismatch_flagged():
+    source = '''
+def f(cursor, x):
+    cursor.execute("SELECT a FROM t WHERE a = %s AND b = %s", (x,))
+'''
+    violations = placeholder_param_mismatch_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["placeholders"] == 2
+    assert violations[0]["params"] == 1
+    assert violations[0]["function"] == "f"
+
+
+def test_placeholder_param_match_not_flagged():
+    source = '''
+def f(cursor, x, y):
+    cursor.execute("SELECT a FROM t WHERE a = %s AND b = %s", (x, y))
+'''
+    assert placeholder_param_mismatch_sql(source) == []
+
+
+def test_placeholder_param_executemany_not_flagged():
+    source = '''
+def f(cursor, rows):
+    cursor.executemany("INSERT INTO t (a, b) VALUES (%s, %s)", rows)
+'''
+    assert placeholder_param_mismatch_sql(source) == []
+
+
+def test_placeholder_param_dynamic_params_not_flagged():
+    source = '''
+def f(cursor, x, ids):
+    cursor.execute("SELECT a FROM t WHERE a = %s AND b IN (%s)", [x] + ids)
+'''
+    assert placeholder_param_mismatch_sql(source) == []
+
+
+def test_placeholder_param_fstring_not_flagged():
+    source = '''
+def f(cursor, x):
+    cursor.execute(f"SELECT a FROM t WHERE a = {x}", (x,))
+'''
+    assert placeholder_param_mismatch_sql(source) == []
+
+
+def test_placeholder_param_mismatch_syntax_error():
+    assert placeholder_param_mismatch_sql("def f(:") == []
+
+
+def test_duplicate_column_predicate_flagged():
+    source = '''
+def get_items(cursor, ids):
+    sql = "SELECT a FROM t WHERE id = %s" + " AND id IN (%s)"
+    cursor.execute(sql, ids)
+'''
+    violations = duplicate_column_predicate_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["column"] == "id"
+    assert violations[0]["function"] == "get_items"
+
+
+def test_duplicate_column_different_columns_not_flagged():
+    source = '''
+def get_items(cursor, a, bs):
+    cursor.execute("SELECT v FROM t WHERE A = %s AND B IN (%s)", (a, bs))
+'''
+    assert duplicate_column_predicate_sql(source) == []
+
+
+def test_duplicate_column_any_not_flagged():
+    source = '''
+def get_items(cursor, ids):
+    cursor.execute("SELECT v FROM t WHERE id = ANY(%s)", (ids,))
+'''
+    assert duplicate_column_predicate_sql(source) == []
+
+
+def test_duplicate_column_syntax_error():
+    assert duplicate_column_predicate_sql("def f(:") == []
 
