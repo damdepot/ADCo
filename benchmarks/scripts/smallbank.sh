@@ -3,8 +3,8 @@
 dir=$1
 
 dbms="postgres"
-accounts=100000
-transactions=10000
+accounts=1000000
+transactions=100000
 exp_path="$(cd "$(dirname "$0")/../.." && pwd)"
 workload_path="${exp_path}/benchmarks/tools/smallbank"
 log_fname="${exp_path}/results/$dir"
