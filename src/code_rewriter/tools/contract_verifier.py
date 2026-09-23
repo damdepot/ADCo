@@ -25,6 +25,11 @@ from .sql_analysis import (
     placeholder_param_mismatch_sql,
     duplicate_column_predicate_sql,
 )
+from .python_analysis import (
+    percent_format_arity_violations,
+    undefined_name_violations,
+    slow_executemany_violations,
+)
 
 def _extract_function_ast_map(source: Optional[str]) -> Dict[str, ast.AST]:
     if not source:
@@ -585,6 +590,83 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
                 f"but the SQL has {site['placeholders']} placeholder(s). The driver raises at "
                 "runtime (e.g. psycopg2 IndexError / 'not enough arguments'). Fix the parameter "
                 "list or the SQL."
+            ),
+        ))
+
+    opt_percent = percent_format_arity_violations(optimized_source)
+    orig_percent = percent_format_arity_violations(original_source)
+    orig_percent_sigs = {
+        (v["function"], v["template"], v["line"]) for v in orig_percent
+    }
+    seen_percent = set()
+    for site in opt_percent:
+        signature = (site["function"], site["template"], site["line"])
+        if signature in seen_percent or signature in orig_percent_sigs:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_percent.add(signature)
+        violations.append(VerificationViolation(
+            code="PERCENT_FORMAT_ARITY",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} applies Python `%` formatting to a template "
+                f"with {site['expected']} placeholder/conversion(s) but supplies "
+                f"{site['actual']} argument(s); at runtime the driver raises `TypeError: not "
+                "enough arguments for format string` (the SQL `%s` placeholders are consumed "
+                "by Python instead of being left for the database). Build the statement with "
+                "an f-string: pre-format ONLY the dynamic identifier into a variable (e.g. "
+                '`dist_col = f"S_DIST_{d_id:02d}"`), leave value placeholders as `%s` (or '
+                "`?`), and pass values via execute() params. Never `%`-format a string that "
+                "contains `%s`."
+            ),
+            expected=site["expected"],
+            actual=site["actual"],
+        ))
+
+    opt_undef = undefined_name_violations(optimized_source)
+    orig_undef = undefined_name_violations(original_source)
+    orig_undef_sigs = {(v["function"], v["name"]) for v in orig_undef}
+    seen_undef = set()
+    for site in opt_undef:
+        signature = (site["function"], site["name"])
+        if signature in seen_undef or signature in orig_undef_sigs:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_undef.add(signature)
+        violations.append(VerificationViolation(
+            code="UNDEFINED_NAME",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} references name '{site['name']}' which is never "
+                "bound in the function, an enclosing scope, the module, or builtins; this "
+                "raises `NameError` at runtime. Bind it — a comprehension must include its "
+                f"`for {site['name']} in <iterable>` clause; otherwise add the missing "
+                "assignment or parameter."
+            ),
+        ))
+
+    opt_slow = slow_executemany_violations(optimized_source)
+    orig_slow = slow_executemany_violations(original_source)
+    orig_slow_sigs = {(v["function"], v["line"]) for v in orig_slow}
+    seen_slow = set()
+    for site in opt_slow:
+        signature = (site["function"], site["line"])
+        if signature in seen_slow or signature in orig_slow_sigs:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_slow.add(signature)
+        violations.append(VerificationViolation(
+            code="SLOW_EXECUTEMANY",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} uses cursor.executemany in a psycopg2 file "
+                "without the fast path. psycopg2's executemany issues one server round-trip "
+                "per row and collapses bulk-write throughput. Import and use "
+                "`psycopg2.extras.execute_batch` (or `execute_values`) instead — a "
+                "function-local `from psycopg2.extras import execute_batch` is permitted."
             ),
         ))
 

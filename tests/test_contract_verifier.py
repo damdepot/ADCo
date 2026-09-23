@@ -518,3 +518,103 @@ def get_stock(self, d_id, item_ids):
     result = verify_contract(orig, opt, contract)
     assert result.status == "PASS", [v.model_dump() for v in result.violations]
 
+
+def _static_check_contract(function: str = "get_stock"):
+    return RewriteContract(
+        rewrite_id="test_static_check",
+        target=RewriteTarget(file="t.py", function=function),
+        pattern="N+1 Query",
+        strategy="Query Batching",
+        allowed_regions=[function],
+    )
+
+
+def test_verify_rejects_percent_format_arity_collision():
+    orig = """
+def get_stock(self, d_id):
+    return None
+"""
+    opt = """
+def get_stock(self, d_id):
+    stock_placeholders = "(%s, %s), (%s, %s)"
+    sql = (f"SELECT S_DIST_%02d FROM STOCK WHERE (S_I_ID, S_W_ID) IN ({stock_placeholders})") % (d_id,)
+    self.cursor.execute(sql)
+    return None
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert result.status == "FAIL"
+    assert any(
+        v.code == "PERCENT_FORMAT_ARITY" and v.severity == "ERROR"
+        for v in result.violations
+    )
+
+
+def test_verify_accepts_escaped_percent_placeholders():
+    orig = """
+def get_stock(self, d_id):
+    return None
+"""
+    opt = """
+def get_stock(self, d_id):
+    template = "SELECT S_DIST_%02d FROM STOCK WHERE S_I_ID = %%s AND S_W_ID = %%s"
+    return template % (d_id,)
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert not any(v.code == "PERCENT_FORMAT_ARITY" for v in result.violations)
+
+
+def test_verify_rejects_undefined_name_in_comprehension():
+    orig = """
+def get_stock(self, stock_rows):
+    return None
+"""
+    opt = """
+def get_stock(self, stock_rows):
+    stock_map = {(row[0], row[1]): (row[2], row[3])}
+    return stock_map
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert result.status == "FAIL"
+    assert any(
+        v.code == "UNDEFINED_NAME" and v.severity == "ERROR"
+        for v in result.violations
+    )
+
+
+def test_verify_rejects_slow_executemany():
+    orig = """
+def get_stock(self, rows):
+    return None
+"""
+    opt = """
+import psycopg2
+
+def get_stock(self, rows):
+    self.cursor.executemany("INSERT INTO STOCK (a, b) VALUES (%s, %s)", rows)
+    return None
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert result.status == "FAIL"
+    assert any(
+        v.code == "SLOW_EXECUTEMANY" and v.severity == "ERROR"
+        for v in result.violations
+    )
+
+
+def test_preexisting_percent_violation_is_deduped():
+    orig = """
+def get_stock(self, d_id):
+    sql = (f"SELECT S_DIST_%02d FROM STOCK WHERE S_W_ID = %s") % (d_id,)
+    self.cursor.execute(sql)
+    return None
+"""
+    opt = """
+def get_stock(self, d_id):
+    sql = (f"SELECT S_DIST_%02d FROM STOCK WHERE S_W_ID = %s") % (d_id,)
+    self.cursor.execute(sql)
+    row = self.cursor.fetchone()
+    return row
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert not any(v.code == "PERCENT_FORMAT_ARITY" for v in result.violations)
+

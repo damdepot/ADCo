@@ -11,15 +11,21 @@ The `replace_function` tool will REJECT your output if it is identical to the or
 1. Call `get_optimization_context`. It returns the single target function contract, its analysis, the exact function source, its dependency slice, the deterministic Acceptance Checklist, and any prior failure to fix. Every checklist item MUST hold.
 2. THINK / ACT / OBSERVE on the provided function source only:
    - THINK: identify every DB call executed inside loops (per-iteration SELECT/UPDATE/INSERT/DELETE). Compute the complete key set first, then plan ONE set-based batch read per table as a single statement over the full key set — never one query per group — using set-based filtering (`IN (...)`, `ANY(%s)`, or a JOIN) hoisted before the loop, plus one batched write per statement after the loop.
-   - ACT: hoist the batch reads before the loop and index the results in a dict keyed by the lookup column(s); remove ALL database calls from the loop body (only pure in-memory dict lookups and parameter appends remain); batch writes with `cursor.executemany(...)` after the loop.
+   - ACT: hoist the batch reads before the loop and index the results in a dict keyed by the lookup column(s); remove ALL database calls from the loop body (only pure in-memory dict lookups and parameter appends remain); batch writes after the loop with `psycopg2.extras.execute_batch(...)` (never `cursor.executemany`).
    - OBSERVE: 0 DB calls remain in the loop; dict keys align with the SELECT column order; the function signature, return statements and their values, and transaction/error-handling behavior are unchanged.
 3. Call `replace_function(file, qualified_function, new_function_code)` to surgically replace the one target function, using the `file` and `qualified_function` from the Contract section. Do NOT read the file and do NOT modify any other function.
 4. Re-check the Acceptance Checklist. If anything fails, fix and call `replace_function` again.
 
 ## SQL safety rules (condensed)
 
-- NEVER `%`-format a SQL template that contains `%s` placeholders — pre-format any dynamic identifier into a variable first (e.g. `col_name = "col_%02d" % idx`), then build the SQL with concatenation or f-strings and pass parameter values separately.
+- Convert Python `%` templating to f-strings. If the original applies `%` to a SQL template that contains a dynamic identifier (e.g. `S_DIST_%02d`) and/or escaped placeholders (`%%s`), rewrite it as an f-string: pre-format the dynamic identifier into a variable (`dist_col = f"S_DIST_{d_id:02d}"` or `"S_DIST_%02d" % d_id`) and assemble the statement with an f-string, converting every escaped `%%s` to a plain `%s`.
+- NEVER apply Python `%` to a string that contains `%s` placeholders — Python consumes each `%s` as a conversion and raises `TypeError: not enough arguments for format string`.
+- NEVER interpolate a parameter VALUE into SQL (via f-string or `%`); values stay `%s`/`?` placeholders passed through `execute()` params. Never mix f-string interpolation with `%` formatting in the same statement.
+  - WRONG: `self.cursor.execute(q["getStockInfo"] % (d_id), [ol_i_id, ol_supply_w_id])` where the template holds `S_DIST_%02d` and unescaped `%s` — Python eats the `%s`.
+  - RIGHT: `sql = f"SELECT S_QUANTITY, S_DATA, S_YTD, S_ORDER_CNT, S_REMOTE_CNT, S_DIST_{d_id:02d} FROM STOCK WHERE S_I_ID = %s AND S_W_ID = %s"; self.cursor.execute(sql, [ol_i_id, ol_supply_w_id])`
 - When a query template contains dynamic identifiers/placeholders (e.g. `S_DIST_%02d`, `%%s`), the Query Catalog / dependency slice show the UNFORMATTED template — never copy a formatted or dummy value (e.g. `S_DIST_00`) into the rewrite; reuse the template with the runtime variable exactly as the original did.
+- Every name used in a comprehension MUST be bound by its own `for ... in ...` clause: write `{(row[0], row[1]): row for row in rows}`, never `{(row[0], row[1]): row}` (runtime `NameError`).
+- psycopg2 bulk writes: use `psycopg2.extras.execute_batch` (or `execute_values`) for batched INSERT/UPDATE/DELETE — NEVER `cursor.executemany`, which costs one network round-trip per row. This is the ONE exception to "Do NOT change imports": a function-local `from psycopg2.extras import execute_batch` (or `execute_values`) is permitted.
 - Detect the placeholder dialect from the original source (`?` vs `%s`) and never mix dialects in one statement.
 - Composite-key batching: one tuple `IN ((%s,%s), ...)` query; include the key columns in the SELECT so results map unambiguously. NEVER execute a database call inside a loop — including a chunking loop. Execute each batch query exactly once.
 - No Python grouping loops: do NOT emulate batching with a Python grouping/chunking loop that issues one query per group (or per distinct key). Compute the complete key set first and issue exactly ONE statement; for composite keys use `(a, b) IN ((...), ...)` or the dialect's `a = ANY(%s) AND b IN (...)`.
@@ -57,7 +63,7 @@ When a **Repair Request** is present, you are repairing your OWN previous attemp
 - Use `replace_function(file, qualified_function, new_function_code)` for the one target function; do not read the file and do not touch other functions.
 - Pass real newlines in `new_function_code`, NOT literal backslash-n. Don't escape quotes.
 - `replace_function` validates Python syntax — fix and retry if an ERROR is returned.
-- Do NOT change imports.
+- Do NOT change imports, EXCEPT the one allowed function-local `from psycopg2.extras import execute_batch` (or `execute_values`) for bulk writes.
 - Preserve function signatures, return values, and error handling.
 
 ## Final output

@@ -26,7 +26,7 @@ VERIFIER_PROMPT = """You are a code correctness verifier. Use the available tool
    - EVERY target function identified in the rewrite contract (and `contract.targets`) MUST be actively transformed.
    - If deterministic verification FAILS (e.g. any target function is untransformed, unchanged from original AST, missing rewrites, or database queries remain inside loops), you MUST report `status: FAIL` with `category: "strategy_not_applied"` or `"not_executable"`. Include the untransformed targets and residual loop queries in `reason` and provide a concrete suggestion commanding the optimizer to apply the **Think - Act - Observe** loop engineering pattern to that specific function:
      * **THINK**: Identify queries in loops, identify lookup keys, plan batch queries and parameter accumulation lists.
-     * **ACT**: Move batch reads before loop, eliminate all queries inside loop (pure in-memory arithmetic and dictionary lookups), execute batch writes with `cursor.executemany(sql, params_list)` or `execute_batch` after loop.
+     * **ACT**: Move batch reads before loop, eliminate all queries inside loop (pure in-memory arithmetic and dictionary lookups), execute batch writes with `execute_batch(sql, params_list)` after loop.
      * **OBSERVE**: Verify zero database calls remain inside loop, verify dictionary key alignment, verify return signatures.
    - Do NOT pass the code just because it parses or runs `--help`.
    - **If deterministic verification PASSES, treat it as authoritative.** You may still fill `suggestion` with an advisory note. You MUST NOT claim residual loop operations that the deterministic result does not report, and you MUST NOT report FAIL for anything the deterministic result already covers. The ONLY exception is a concrete semantic defect that static analysis cannot see (e.g. a wrong column, a wrong join, or changed result semantics): report `status: FAIL` for that ONLY when you also supply an `issues` entry whose `evidence` quotes the offending code/diff/SQL. If you cannot produce such evidence, you MUST report PASS.
@@ -38,6 +38,9 @@ VERIFIER_PROMPT = """You are a code correctness verifier. Use the available tool
    - Did the optimizer change ONLY database interaction code?
    - Are there any logic regressions (e.g. missing imports, inverted conditions)?
    - Did the optimizer remove the original per-item queries from inside loops, or did it accidentally leave duplicate queries?
+   - Is Python `%` formatting applied to a template that still contains `%s`, or is f-string interpolation mixed with `%` formatting in one statement? (`TypeError: not enough arguments for format string`)
+   - Is any name referenced but never bound — especially a comprehension loop variable missing its `for ... in ...` clause? (`NameError`)
+   - Does any psycopg2 bulk write use `cursor.executemany` instead of `execute_batch`/`execute_values`?
    - Has EVERY target function been transformed?
 
 4. Call `check_syntax` to verify there are no syntax errors in the modified
@@ -86,8 +89,8 @@ directly, e.g.:
 ## Failure categories
 - `strategy_not_applied`: Optimization contracts not met, untransformed target functions, or residual loop queries. Strict-zero is enforced for per-row work: a `cursor.execute`/`executemany` executed once per row (or per iteration) inside a loop is a FAIL, but a single set-based batch query (`IN (...)`/`ANY(%s)`) issued once per group outside the per-row loop is acceptable. The suggestion MUST name the specific function(s), the residual op count, and whether Pattern 6 (composite-key batch) applies. Example:
   "Apply Pattern 6 to PostgresDriver.doNewOrder: pre-format col_name = 's_dist_%02d' % d_id, batch all (S_I_ID, S_W_ID) pairs with (S_I_ID, S_W_ID) IN ((%s,%s),...) before the loop. Required: 0 cursor.execute inside the loop. Residual: 1 op in doNewOrder."
-- `not_executable`: Crashes on startup due to code errors (not env issues)
-- `name_error`: Undefined variables, missing imports
+- `not_executable`: Crashes on startup due to code errors (not env issues) — includes the `%`/`%s` format collision (`TypeError`) and the catastrophic round-trip cost of `cursor.executemany` for bulk writes
+- `name_error`: Undefined variables, missing imports — includes a comprehension name referenced but never bound by its `for ... in ...` clause
 - `syntax_error`: Syntax errors detected by check_syntax
 - `NONE`: No code-level failure — verification PASSED (env issues like no DB
   server are NOT code failures)

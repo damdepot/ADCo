@@ -289,6 +289,28 @@ def test_replace_function_rejects_ast_identical_rewrite(tmp_path):
     assert (sandbox_dir / "app.py").read_text() == _ORIGINAL_LOOP_FN
 
 
+def test_replace_function_rejects_percent_format_arity_collision(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    placeholders = ','.join(['%s'] * len(user_ids))\n"
+        "    sql = (f'SELECT * FROM users WHERE id = %02d AND id IN ({placeholders})') % (user_ids,)\n"
+        "    cursor.execute(sql, user_ids)\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("ERROR")
+    assert "PERCENT_FORMAT_ARITY" in result
+    assert (sandbox_dir / "app.py").read_text() == _ORIGINAL_LOOP_FN
+
+
 _TPCC_DRIVER = (
     Path(__file__).resolve().parents[1]
     / "benchmarks"

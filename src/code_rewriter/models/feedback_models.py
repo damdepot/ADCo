@@ -28,6 +28,9 @@ _FIX_HINTS: dict[str, str] = {
     "UNKNOWN_QUERY_KEY": "Reuse an existing query key verbatim.",
     "ROW_INDEX_OUT_OF_RANGE": "Include the key column(s) in the SELECT or fix the row indices.",
     "IMPLICIT_CROSS_JOIN": "Replace the implicit comma join of 3+ tables with explicit JOIN ... ON (or a scalar subquery).",
+    "PERCENT_FORMAT_ARITY": "Never %-format a string that contains %s placeholders. Pre-format only the dynamic identifier into a variable, then build the SQL with an f-string and pass values as execute() params.",
+    "UNDEFINED_NAME": "Bind the name. In a comprehension always write `for <name> in <iterable>`; otherwise add the missing assignment or parameter.",
+    "SLOW_EXECUTEMANY": "Use psycopg2.extras.execute_batch (or execute_values) for bulk writes instead of cursor.executemany.",
 }
 
 
