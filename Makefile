@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 
 # Define shortcuts/tasks that do not generate output files
-.PHONY: knob-tune rewrite check run rewrite-only tune-only intent-analyze
+.PHONY: knob-tune check run rewrite-only tune-only intent-analyze
 
 # ── Codebase intent analyzer ──
 intent-analyze:
@@ -28,6 +28,8 @@ rewrite-only:
 		--model=gemini-3.5-flash-lite \
 		--mode=rewrite-only \
 		--sandbox-dir=$(SANDBOX_DIR) \
+		--db-type=$(DB_TYPE) \
+		--db-name=$(DB_NAME) \
 		--verbose
 
 tune-only:
@@ -51,13 +53,6 @@ knob-tune:
 		--db-name=$(DB_NAME) \
 		--cpu-cores=2 \
 		--memory=2 \
-		--verbose
-
-# ── Generate optimized code ──
-rewrite:
-	@echo "Generating optimized code..."
-	uv run python -m src.code_rewriter $(DIR) \
-		--model=gemini-3.5-flash-lite \
 		--verbose
 
 # ── Run correctness checker on the sandbox ──
