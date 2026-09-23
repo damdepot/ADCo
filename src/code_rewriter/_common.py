@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
@@ -53,3 +54,43 @@ def format_intent_lines(
     for t in intent_output.get("optimization_targets", []) or []:
         lines.append(f"- {t.get('file', '')}: {t.get('description', '')}")
     return "\n".join(lines)
+
+
+def extract_function_source_by_name(source: str, qualified: str) -> str:
+    """Extract the source of a function/method by (qualified) name.
+
+    Matches either the fully qualified name (``Class.method`` / ``outer.inner``)
+    or the bare function name. Returns "" if the source cannot be parsed or the
+    function is not found.
+    """
+    if not source or not qualified:
+        return ""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return ""
+
+    bare = qualified.rsplit(".", 1)[-1]
+
+    def _walk(node: ast.AST, prefix: str) -> str | None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                found = _walk(child, f"{prefix}{child.name}.")
+                if found is not None:
+                    return found
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                full = f"{prefix}{child.name}"
+                if full == qualified or child.name == bare:
+                    segment = ast.get_source_segment(source, child)
+                    if segment is not None:
+                        return segment
+                found = _walk(child, f"{full}.")
+                if found is not None:
+                    return found
+            else:
+                found = _walk(child, prefix)
+                if found is not None:
+                    return found
+        return None
+
+    return _walk(tree, "") or ""

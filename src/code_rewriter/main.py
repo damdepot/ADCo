@@ -20,7 +20,7 @@ from src.code_rewriter._common import _maybe_parse
 from src.code_rewriter.agent import create_root_agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
-from src.code_rewriter.tools.pipeline_analysis import build_contracts_from_intent, format_dependency_slice_map
+from src.code_rewriter.tools.pipeline_analysis import build_contracts_from_intent, build_target_context_map
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
@@ -57,7 +57,7 @@ def _write_output_result(output_path: str, state: dict[str, Any], model: str = "
             "file_selector_output": _maybe_parse(state.get("file_selector_output", {})),
             "intent_output": _maybe_parse(state.get("intent_output")),
             "intent_extractor_output": _maybe_parse(state.get("intent_extractor_output")),
-            "code_optimizer_output": _maybe_parse(state.get("code_optimizer_output")),
+            "optimizer_output": _maybe_parse(state.get("optimizer_output")),
             "verifier_output": _maybe_parse(state.get("verifier_output")),
             "deterministic_verification": _maybe_parse(state.get("deterministic_verification", {})),
         }
@@ -108,8 +108,7 @@ async def run_pipeline(
         initial_state["rewrite_contracts"] = [c.model_dump() for c in contracts]
         _log_event(f"Built {len(contracts)} rewrite contracts.", log_file=log_file_abs, verbose=verbose)
 
-        slice_map = format_dependency_slice_map(analyses, contracts, target_abs)
-        initial_state["pipeline_analysis_markdown"] = slice_map
+        initial_state["target_context_map"] = build_target_context_map(analyses, contracts, target_abs)
     except Exception as e:
         _log_event(f"Error building contracts: {e}", log_file=log_file_abs, verbose=verbose)
 

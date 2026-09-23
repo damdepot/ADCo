@@ -10,6 +10,11 @@ from .ast_models import (
     SourceLocation,
     SqlOperation,
 )
+from .feedback_models import (
+    RepairIssue,
+    build_repair_issues,
+    render_repair_request,
+)
 from .dependency_models import (
     CertaintyLevel,
     DependencyEdge,
@@ -60,4 +65,7 @@ __all__ = [
     "VerificationCheck",
     "TargetStatus",
     "VerificationResult",
+    "RepairIssue",
+    "build_repair_issues",
+    "render_repair_request",
 ]

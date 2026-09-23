@@ -14,7 +14,13 @@ from ..models import (
 from .ast_analyzer import analyze_source
 from ..models.ast_models import FileAnalysis, FunctionAnalysis
 from .dependency_graph import build_dependency_graph, DependencyGraph
-from .sql_analysis import row_index_violations, planner_unfriendly_sql
+from .sql_analysis import (
+    row_index_violations,
+    planner_unfriendly_sql,
+    multi_statement_sql,
+    duplicate_where_sql,
+    unknown_query_key_sql,
+)
 
 def _extract_function_ast_map(source: Optional[str]) -> Dict[str, ast.AST]:
     if not source:
@@ -126,7 +132,7 @@ def _resolve_region_node(ast_map: Dict[str, ast.AST], region: Optional[str]) -> 
             return node
     return None
 
-def verify_rewrite(original_source: str, optimized_source: str, contract: RewriteContract) -> VerificationResult:
+def verify_contract(original_source: str, optimized_source: str, contract: RewriteContract) -> VerificationResult:
     violations: List[VerificationViolation] = []
     checks: List[VerificationCheck] = []
     
@@ -356,7 +362,14 @@ def verify_rewrite(original_source: str, optimized_source: str, contract: Rewrit
         details=f"{len(dep_violations)} dependency violations"
     ))
 
-    # 9. Deterministic SQL checks (optimized source only; pre-existing patterns ignored)
+    # 9. Deterministic SQL checks (optimized source only; pre-existing patterns ignored).
+    # Scope every SQL check to the contract's target function(s) so a violation in one
+    # target cannot fail verification of an unrelated target in the same file.
+    def _in_target_regions(fn_name: str) -> bool:
+        if not target_regions:
+            return True
+        return fn_name in target_regions or fn_name.split(".")[-1] in target_regions
+
     opt_row = row_index_violations(optimized_source)
     orig_row = row_index_violations(original_source)
     orig_row_sigs = {
@@ -367,6 +380,8 @@ def verify_rewrite(original_source: str, optimized_source: str, contract: Rewrit
         signature = (site["function"], site["sql"], site["max_index"], site["line"])
         dedup_key = (site["function"], site["sql"], site["line"])
         if dedup_key in seen_row or signature in orig_row_sigs:
+            continue
+        if not _in_target_regions(site["function"]):
             continue
         seen_row.add(dedup_key)
         violations.append(VerificationViolation(
@@ -390,6 +405,8 @@ def verify_rewrite(original_source: str, optimized_source: str, contract: Rewrit
         dedup_key = (site["function"], site["sql"], site["line"])
         if dedup_key in seen_plan or dedup_key in orig_plan_keys:
             continue
+        if not _in_target_regions(site["function"]):
+            continue
         seen_plan.add(dedup_key)
         violations.append(VerificationViolation(
             code="PLANNER_UNFRIENDLY_SQL",
@@ -398,6 +415,71 @@ def verify_rewrite(original_source: str, optimized_source: str, contract: Rewrit
                 f"Function {site['function']} comma-cross-joins a derived table in FROM, "
                 "which can raise per-execution planning cost. Prefer a scalar subquery in "
                 "WHERE or an explicit JOIN instead."
+            ),
+        ))
+
+    opt_multi = multi_statement_sql(optimized_source)
+    orig_multi = multi_statement_sql(original_source)
+    orig_multi_keys = {(v["function"], v["sql"]) for v in orig_multi}
+    seen_multi = set()
+    for site in opt_multi:
+        dedup_key = (site["function"], site["sql"])
+        if dedup_key in seen_multi or dedup_key in orig_multi_keys:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_multi.add(dedup_key)
+        violations.append(VerificationViolation(
+            code="MULTI_STATEMENT_EXECUTE",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} passes {site['statements']} statements in a "
+                "single execute() call. One execute() executes one statement; drivers only "
+                "expose the last result set, so earlier statements are silently dropped or "
+                "raise. Split into separate execute() calls."
+            ),
+        ))
+
+    opt_dup_where = duplicate_where_sql(optimized_source)
+    orig_dup_where = duplicate_where_sql(original_source)
+    orig_dup_where_keys = {(v["function"], v["sql"]) for v in orig_dup_where}
+    seen_dup_where = set()
+    for site in opt_dup_where:
+        dedup_key = (site["function"], site["sql"])
+        if dedup_key in seen_dup_where or dedup_key in orig_dup_where_keys:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_dup_where.add(dedup_key)
+        violations.append(VerificationViolation(
+            code="DUPLICATE_WHERE",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} builds a statement with {site['where_count']} "
+                "top-level WHERE clauses (usually from concatenating a predicate onto a "
+                "template that already has a WHERE). This is invalid SQL and raises at "
+                "runtime; rewrite the existing WHERE predicate instead of appending a second one."
+            ),
+        ))
+
+    opt_unknown = unknown_query_key_sql(optimized_source)
+    orig_unknown = unknown_query_key_sql(original_source)
+    orig_unknown_keys = {(v["function"], v["key"]) for v in orig_unknown}
+    seen_unknown = set()
+    for site in opt_unknown:
+        dedup_key = (site["function"], site["key"])
+        if dedup_key in seen_unknown or dedup_key in orig_unknown_keys:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_unknown.add(dedup_key)
+        violations.append(VerificationViolation(
+            code="UNKNOWN_QUERY_KEY",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} executes query key '{site['key']}' which does "
+                "not exist in the resolved query dict — this raises KeyError at runtime. "
+                "Reuse an existing query key verbatim."
             ),
         ))
 

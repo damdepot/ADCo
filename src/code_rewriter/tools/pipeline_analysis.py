@@ -1,10 +1,12 @@
+import ast
 import os
 
 from .ast_analyzer import analyze_file
-from ..models.ast_models import FileAnalysis
+from .sql_resolver import collect_module_dicts, resolve
+from ..models.ast_models import FileAnalysis, FunctionAnalysis
 from ..models.rewrite_models import RewriteContract, RewriteTarget
 from .rewrite_contract import build_rewrite_contract
-from .rewrite_verifier import verify_rewrite, VerificationResult, TargetStatus, VerificationCheck, VerificationViolation
+from .contract_verifier import verify_contract, VerificationResult, TargetStatus, VerificationCheck, VerificationViolation
 from .dependency_graph import build_dependency_graph, slice_dependency_graph, format_dependency_slice_markdown
 
 EXCLUDED_SETUP_FUNCTION_PATTERNS = {
@@ -127,7 +129,7 @@ def build_contracts_from_intent(
                 
     return analyses, contracts
 
-def execute_deterministic_verification(
+def verify_all_contracts(
     target_dir: str, 
     sandbox_dir: str, 
     contracts: list[RewriteContract], 
@@ -199,7 +201,7 @@ def execute_deterministic_verification(
                 with open(opt_src, 'r', encoding='utf-8') as file:
                     opt_code = file.read()
                 
-                result = verify_rewrite(orig_code, opt_code, c)
+                result = verify_contract(orig_code, opt_code, c)
                 all_violations.extend(result.violations)
                 for check in result.checks:
                     if not any(existing.name == check.name and existing.status == check.status for existing in all_checks):
@@ -256,7 +258,8 @@ def execute_deterministic_verification(
         "SYNTAX_ERROR", "ORIGINAL_SYNTAX_ERROR", "TARGET_MISSING",
         "FUNCTION_SIGNATURE_CHANGED", "UNAUTHORIZED_CHANGE",
         "DB_OPERATION_REMOVED", "INVALID_REWRITE", "BREAKING_DEPENDENCY",
-        "MISSING_REWRITE", "STRATEGY_NOT_APPLIED", "UNTRANSFORMED_FUNCTION", "UNTRANSFORMED_TARGET"
+        "MISSING_REWRITE", "STRATEGY_NOT_APPLIED", "UNTRANSFORMED_FUNCTION", "UNTRANSFORMED_TARGET",
+        "MULTI_STATEMENT_EXECUTE", "DUPLICATE_WHERE", "UNKNOWN_QUERY_KEY"
     }
     has_critical = any(v.severity == "ERROR" and v.code in critical_codes for v in all_violations)
 
@@ -277,7 +280,7 @@ def execute_deterministic_verification(
         rewrite_coverage=rewrite_coverage
     )
 
-def verify_target(
+def verify_contract_target(
     target_dir: str,
     sandbox_dir: str,
     contract: RewriteContract,
@@ -324,7 +327,7 @@ def verify_target(
             rewrite_coverage=0.0,
         )
 
-    return verify_rewrite(orig_code, opt_code, contract)
+    return verify_contract(orig_code, opt_code, contract)
 
 
 def _build_dependency_slice_pairs(
@@ -382,27 +385,257 @@ def _build_dependency_slice_pairs(
     return pairs
 
 
-def format_dependency_slice_map(
+def format_function_analysis_summary(fn: FunctionAnalysis | None) -> str:
+    """Render a compact markdown summary of a single function analysis."""
+    if fn is None:
+        return ""
+
+    decorators = ", ".join(fn.decorators) if fn.decorators else "none"
+    params = ", ".join(fn.parameters)
+
+    lines = [
+        f"## Function Analysis: {fn.qualified_name}",
+        f"- Signature: def {fn.name}({params})",
+        f"- Source location: lines {fn.source_location.start_line}-{fn.source_location.end_line}",
+        f"- Decorators: {decorators}",
+        f"- Control flow: for_loops={fn.control_flow.for_loops}, while_loops={fn.control_flow.while_loops}",
+        f"- Return statements: {fn.return_count}",
+        f"- Database operations ({len(fn.database_operations)}):",
+    ]
+
+    for i, op in enumerate(fn.database_operations):
+        inside = "True" if op.inside_loop else "False"
+        lines.append(
+            f"  - [{i}] {op.operation_type} / {op.sql_operation} / "
+            f"inside_loop={inside} / line {op.source_location.start_line}"
+        )
+        lines.append(f"    SQL: {op.sql or '(dynamic)'}")
+
+    call_names = sorted({c.call_name for c in fn.calls})
+    lines.append(f"- Calls: {', '.join(call_names) if call_names else 'none'}")
+
+    return "\n".join(lines)
+
+
+def _find_function_analysis(
+    analysis: FileAnalysis | None, qualified: str
+) -> FunctionAnalysis | None:
+    if analysis is None or not qualified:
+        return None
+
+    candidates: list[FunctionAnalysis] = list(analysis.functions)
+    for cls in analysis.classes:
+        candidates.extend(cls.methods)
+
+    for fn in candidates:
+        if fn.qualified_name == qualified or fn.name == qualified:
+            return fn
+    for fn in candidates:
+        if fn.qualified_name.endswith(qualified):
+            return fn
+    return None
+
+
+def _extract_function_source(source: str, source_location) -> str:
+    if not source or source_location is None:
+        return ""
+    lines = source.splitlines()
+    start = source_location.start_line
+    end = source_location.end_line
+    if start < 1 or end < start or end > len(lines):
+        return ""
+    return "\n".join(lines[start - 1:end])
+
+
+_SQL_OPERATIONS = ("SELECT", "INSERT", "UPDATE", "DELETE")
+_EXECUTE_METHODS = ("execute", "executemany")
+
+
+def _const_str_key(node) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _operation_from_sql(sql: str) -> str:
+    if not isinstance(sql, str) or not sql.strip():
+        return "OTHER"
+    head = sql.strip().upper()
+    for name in _SQL_OPERATIONS:
+        if head.startswith(name):
+            return name
+    return "OTHER"
+
+
+def _find_function_node(tree: ast.Module, qualified: str):
+    """Return the AST node for a (qualified) function name, or ``None``."""
+    if not qualified:
+        return None
+    bare = qualified.rsplit(".", 1)[-1]
+
+    def _walk(node: ast.AST, prefix: str):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                found = _walk(child, f"{prefix}{child.name}.")
+                if found is not None:
+                    return found
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                full = f"{prefix}{child.name}"
+                if full == qualified or child.name == bare:
+                    return child
+                found = _walk(child, f"{full}.")
+                if found is not None:
+                    return found
+            else:
+                found = _walk(child, prefix)
+                if found is not None:
+                    return found
+        return None
+
+    return _walk(tree, "")
+
+
+def _discover_query_context(
+    source_code: str, fn: FunctionAnalysis | None, qualified: str
+) -> tuple[list[dict], dict | None]:
+    """Best-effort discovery of the target's query catalog and query dict.
+
+    Returns ``(query_catalog, query_dict)`` where ``query_dict`` is ``None``
+    when no ``name = MODULE_DICT["sub"]`` alias can be found in the function.
+    """
+    if not source_code or fn is None:
+        return [], None
+    try:
+        tree = ast.parse(source_code)
+    except (SyntaxError, ValueError):
+        return [], None
+
+    module_dicts = collect_module_dicts(tree)
+    func_node = _find_function_node(tree, qualified)
+    if func_node is None:
+        return [], None
+
+    local_vars: dict[str, dict] = {}
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Subscript):
+            continue
+        subscript = node.value
+        if not isinstance(subscript.value, ast.Name):
+            continue
+        base = module_dicts.get(subscript.value.id)
+        if not isinstance(base, dict):
+            continue
+        key = _const_str_key(subscript.slice)
+        if key is None:
+            continue
+        sub_dict = base.get(key)
+        if isinstance(sub_dict, dict):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    local_vars[target.id] = sub_dict
+
+    refs_by_sql: dict[str, list[dict]] = {}
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in _EXECUTE_METHODS or not node.args:
+            continue
+        arg0 = node.args[0]
+        if not isinstance(arg0, ast.Subscript):
+            continue
+        key = _const_str_key(arg0.slice)
+        if key is None:
+            continue
+        sql = resolve(arg0, local_vars, module_dicts)
+        if not isinstance(sql, str):
+            sql = ""
+        call = ast.get_source_segment(source_code, arg0) or ""
+        refs_by_sql.setdefault(sql, []).append({"key": key, "call": call, "sql": sql})
+
+    catalog: list[dict] = []
+    for op in fn.database_operations:
+        if not op.sql:
+            continue
+        candidates = refs_by_sql.get(op.sql)
+        ref = candidates.pop(0) if candidates else None
+        operation = op.sql_operation if op.sql_operation in _SQL_OPERATIONS else "OTHER"
+        catalog.append(
+            {
+                "key": ref["key"] if ref else "",
+                "call": ref["call"] if ref else "",
+                "sql": op.sql,
+                "operation": operation,
+            }
+        )
+
+    query_dict: dict | None = None
+    for sub_dict in local_vars.values():
+        if isinstance(sub_dict, dict):
+            query_dict = {k: v for k, v in sub_dict.items() if isinstance(v, str)}
+            break
+
+    return catalog, query_dict
+
+
+def build_target_context_map(
     analyses: dict[str, FileAnalysis] | FileAnalysis,
     contracts: list[RewriteContract],
     target_dir: str | None = None,
-) -> dict[str, str]:
-    """Return a mapping of target function name -> dependency slice markdown."""
-    return dict(_build_dependency_slice_pairs(analyses, contracts, target_dir))
+) -> dict[str, dict]:
+    """Build a per-target context map (analysis + source + dependency slice)."""
+    analyses_map: dict[str, FileAnalysis] = {}
+    if isinstance(analyses, dict):
+        analyses_map = analyses
+    elif isinstance(analyses, FileAnalysis):
+        analyses_map = {analyses.file_path or "": analyses}
 
+    slices = dict(_build_dependency_slice_pairs(analyses, contracts, target_dir))
 
-def format_pipeline_analysis_markdown(
-    analysis: dict[str, FileAnalysis] | FileAnalysis,
-    contracts: list[RewriteContract],
-    target_dir: str | None = None,
-) -> str:
-    """Format pipeline analysis and dependency slices for all contract targets into markdown.
+    out: dict[str, dict] = {}
+    for contract in contracts:
+        targets_to_check = contract.targets if contract.targets else ([contract.target] if contract.target else [])
+        for t in targets_to_check:
+            qfn = t.qualified_function or t.function
+            if not qfn:
+                continue
 
-    For each target in contracts:
-      - Builds DependencyGraph using build_dependency_graph(file_analysis, source_code).
-      - Slices the graph using slice_dependency_graph(graph, target_fn).
-      - Formats the slice using format_dependency_slice_markdown(slice_data, contract).
-      - Appends the dependency slice to the markdown analysis output.
-    """
-    pairs = _build_dependency_slice_pairs(analysis, contracts, target_dir)
-    return "\n\n".join(md for _key, md in pairs)
+            file_analysis = analyses_map.get(t.file)
+            if not file_analysis and t.file:
+                for k, v in analyses_map.items():
+                    if k.endswith(t.file) or t.file.endswith(k):
+                        file_analysis = v
+                        break
+
+            fn = _find_function_analysis(file_analysis, qfn)
+
+            source_code = ""
+            if target_dir and t.file:
+                abs_path = os.path.join(target_dir, t.file)
+                if os.path.exists(abs_path):
+                    try:
+                        with open(abs_path, "r", encoding="utf-8") as f:
+                            source_code = f.read()
+                    except Exception:
+                        pass
+            if not source_code and file_analysis and file_analysis.file_path and os.path.exists(file_analysis.file_path):
+                try:
+                    with open(file_analysis.file_path, "r", encoding="utf-8") as f:
+                        source_code = f.read()
+                except Exception:
+                    pass
+
+            query_catalog, query_dict = _discover_query_context(source_code, fn, qfn)
+
+            entry = {
+                "analysis_summary": format_function_analysis_summary(fn),
+                "function_source": _extract_function_source(
+                    source_code, fn.source_location if fn else None
+                ),
+                "dependency_slice": slices.get(qfn, ""),
+                "query_catalog": query_catalog,
+            }
+            if query_dict is not None:
+                entry["query_dict"] = query_dict
+            out[qfn] = entry
+
+    return out

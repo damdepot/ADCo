@@ -1,7 +1,6 @@
 import pytest
 from src.code_rewriter.models import RewriteContract, RewriteTarget
-from src.code_rewriter.tools.rewrite_verifier import verify_rewrite
-from src.code_rewriter.tools.ast_analyzer import analyze_source
+from src.code_rewriter.tools.contract_verifier import verify_contract
 
 def read_fixture(name):
     with open(f"tests/fixtures/code_rewriter/{name}.py", "r") as f:
@@ -29,7 +28,7 @@ def contract():
 
 def test_all_targets_transformed(original_source, contract):
     opt_source = read_fixture("partial_all_transformed")
-    result = verify_rewrite(original_source, opt_source, contract)
+    result = verify_contract(original_source, opt_source, contract)
     
     assert result.status == "PASS"
     assert result.expected_targets == 3
@@ -42,7 +41,7 @@ def test_all_targets_transformed(original_source, contract):
 
 def test_partial_rewrite_two_of_three(original_source, contract):
     opt_source = read_fixture("partial_two_transformed")
-    result = verify_rewrite(original_source, opt_source, contract)
+    result = verify_contract(original_source, opt_source, contract)
     
     assert result.status == "FAIL"
     assert result.expected_targets == 3
@@ -58,7 +57,7 @@ def test_partial_rewrite_two_of_three(original_source, contract):
 
 def test_no_targets_transformed(original_source, contract):
     opt_source = read_fixture("partial_none_transformed")
-    result = verify_rewrite(original_source, opt_source, contract)
+    result = verify_contract(original_source, opt_source, contract)
     
     assert result.status == "FAIL"
     assert result.expected_targets == 3
@@ -68,7 +67,7 @@ def test_no_targets_transformed(original_source, contract):
 
 def test_unauthorized_unrelated_change(original_source, contract):
     opt_source = read_fixture("partial_unauthorized")
-    result = verify_rewrite(original_source, opt_source, contract)
+    result = verify_contract(original_source, opt_source, contract)
     
     assert result.status == "FAIL"
     unauth_violation = next(v for v in result.violations if v.code == "UNAUTHORIZED_CHANGE")
@@ -84,7 +83,7 @@ def test_coverage_metrics_fields_present(original_source):
         strategy="BATCH",
         allowed_regions=["Repository.get_product"]
     )
-    result = verify_rewrite(original_source, opt_source, empty_contract)
+    result = verify_contract(original_source, opt_source, empty_contract)
     
     assert result.status == "PASS"
     assert result.expected_targets == 0
@@ -97,7 +96,7 @@ def test_coverage_metrics_fields_present(original_source):
 
 def test_target_coverage_per_function_details(original_source, contract):
     opt_source = read_fixture("partial_two_transformed")
-    result = verify_rewrite(original_source, opt_source, contract)
+    result = verify_contract(original_source, opt_source, contract)
     
     assert len(result.target_coverage) == 3
     
@@ -112,8 +111,8 @@ def test_target_coverage_per_function_details(original_source, contract):
 
 def test_coverage_determinism(original_source, contract):
     opt_source = read_fixture("partial_two_transformed")
-    result1 = verify_rewrite(original_source, opt_source, contract)
-    result2 = verify_rewrite(original_source, opt_source, contract)
+    result1 = verify_contract(original_source, opt_source, contract)
+    result2 = verify_contract(original_source, opt_source, contract)
     
     assert result1.model_dump() == result2.model_dump()
 

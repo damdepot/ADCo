@@ -1,9 +1,8 @@
-import pytest
 from pydantic import BaseModel
 
 from src.code_checker.agent import create_checker_agent
 from src.code_rewriter.sub_agents.verifier.agent import create_verifier_agent
-from src.code_rewriter.sub_agents.code_optimizer.agent import create_code_optimizer_agent
+from src.code_rewriter.sub_agents.optimizer.agent import create_optimizer_agent
 from src.intent_analyzer.sub_agents.file_selector.agent import create_file_selector_agent as create_intent_fs_agent
 from src.intent_analyzer.sub_agents.intent_extractor.agent import create_intent_extractor_agent as create_intent_ie_agent
 from src.knob_tuner.sub_agents.db_inspector.agent import create_db_inspector_agent
@@ -13,7 +12,7 @@ from src.knob_tuner.sub_agents.knob_checker.agent import create_knob_checker_age
 from src.knob_tuner.sub_agents.live_tuner.agent import create_live_tuner_agent
 
 from src.intent_analyzer.models import IntentAnalyzerResult
-from src.knob_tuner.models import KnobTunerResult, TunerOutputs
+from src.knob_tuner.models import KnobTunerResult
 from src.adco.models import AdcoPipelineResult
 
 
@@ -21,7 +20,7 @@ def test_subagent_output_schemas():
     agents = [
         create_checker_agent(),
         create_verifier_agent(),
-        create_code_optimizer_agent(),
+        create_optimizer_agent(),
         create_intent_fs_agent(),
         create_intent_ie_agent(),
         create_db_inspector_agent(),

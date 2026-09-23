@@ -10,7 +10,7 @@ from pathlib import Path
 from google.adk.tools import ToolContext
 
 from src.code_rewriter._common import _maybe_parse, format_intent_lines
-from src.code_rewriter.tools.pipeline_analysis import build_contracts_from_intent, format_dependency_slice_map
+from src.code_rewriter.tools.pipeline_analysis import build_contracts_from_intent, build_target_context_map
 
 
 @dataclass
@@ -178,7 +178,7 @@ def get_optimization_strategies(tool_context: ToolContext) -> str:
             )
             if contracts:
                 tool_context.state["rewrite_contracts"] = [c.model_dump() for c in contracts]
-                tool_context.state["pipeline_analysis_markdown"] = format_dependency_slice_map(
+                tool_context.state["target_context_map"] = build_target_context_map(
                     analyses, contracts, target_dir
                 )
         except Exception:

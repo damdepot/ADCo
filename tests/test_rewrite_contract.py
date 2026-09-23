@@ -6,7 +6,7 @@ from src.code_rewriter.models.ast_models import (
     SourceLocation,
     ClassAnalysis
 )
-from src.code_rewriter.models.rewrite_models import RewriteTarget, RewriteContract
+from src.code_rewriter.models.rewrite_models import RewriteTarget
 from src.code_rewriter.tools.rewrite_contract import build_rewrite_contract
 
 def test_build_rewrite_contract_valid_function_target():

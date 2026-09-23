@@ -16,25 +16,14 @@ import ast
 import re
 from typing import Any, Dict, List, Optional
 
-_SENTINEL = "\u0000"
-_FORMAT_SPEC_RE = re.compile(r"%(?:\d+)?[sdfr]")
+from .sql_resolver import SENTINEL, collect_module_dicts, resolve
+from .sql_resolver import _const_int, _const_str
+
 _QUALIFIED_STAR_RE = re.compile(r'^[\w"`]+(?:\.[\w"`]+)*\.\*$')
 _CROSS_JOIN_DERIVED_RE = re.compile(r"\bFROM\b[\s\S]*?,\s*\(\s*SELECT\b", re.IGNORECASE)
 _FETCH_METHODS = {"fetchall", "fetchone", "fetchmany"}
 _EXECUTE_METHODS = {"execute", "executemany"}
 _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
-
-
-def _const_str(node: ast.AST) -> Optional[str]:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    return None
-
-
-def _const_int(node: ast.AST) -> Optional[int]:
-    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
-        return node.value
-    return None
 
 
 def _is_call_attr(node: ast.AST, names: set) -> bool:
@@ -51,150 +40,6 @@ def _is_fetch_call(node: ast.AST) -> bool:
 
 def _is_execute_call(node: ast.AST) -> bool:
     return _is_call_attr(node, _EXECUTE_METHODS)
-
-
-def _literal_dict(node: ast.AST) -> Optional[Dict[str, Any]]:
-    if not isinstance(node, ast.Dict):
-        return None
-    out: Dict[str, Any] = {}
-    for key, value in zip(node.keys, node.values):
-        k = _const_str(key)
-        if k is None:
-            continue
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            out[k] = value.value
-        elif isinstance(value, ast.Dict):
-            sub = _literal_dict(value)
-            if sub is not None:
-                out[k] = sub
-    return out
-
-
-def _collect_module_dicts(tree: ast.Module) -> Dict[str, Any]:
-    result: Dict[str, Any] = {}
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    d = _literal_dict(node.value)
-                    if d is not None:
-                        result[target.id] = d
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
-            d = _literal_dict(node.value)
-            if d is not None:
-                result[node.target.id] = d
-    return result
-
-
-def _eval(node: Optional[ast.AST], local_vars: Dict[str, Any], module_dicts: Dict[str, Any]) -> Any:
-    if node is None:
-        return None
-    if isinstance(node, ast.Constant):
-        return node.value if isinstance(node.value, str) else None
-    if isinstance(node, ast.Name):
-        if node.id in local_vars:
-            return local_vars[node.id]
-        if node.id in module_dicts:
-            return module_dicts[node.id]
-        return None
-    if isinstance(node, ast.Subscript):
-        base = _eval(node.value, local_vars, module_dicts)
-        if isinstance(base, dict):
-            key = _const_str(node.slice)
-            if key is None:
-                return None
-            return base.get(key)
-        return None
-    if isinstance(node, ast.BinOp):
-        return _eval_binop(node, local_vars, module_dicts)
-    if isinstance(node, ast.Call):
-        return _eval_call(node, local_vars, module_dicts)
-    if isinstance(node, ast.JoinedStr):
-        return _eval_joined_str(node)
-    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        return [_eval(elt, local_vars, module_dicts) for elt in node.elts]
-    return None
-
-
-def _eval_binop(node: ast.BinOp, local_vars: Dict[str, Any], module_dicts: Dict[str, Any]) -> Any:
-    if isinstance(node.op, ast.Mod):
-        fmt = _eval(node.left, local_vars, module_dicts)
-        if not isinstance(fmt, str):
-            return None
-        count = len(_FORMAT_SPEC_RE.findall(fmt.replace("%%", "")))
-        try:
-            return fmt % ((0,) * count)
-        except (TypeError, ValueError):
-            return None
-    if isinstance(node.op, ast.Add):
-        left = _eval(node.left, local_vars, module_dicts)
-        right = _eval(node.right, local_vars, module_dicts)
-        if left is None and right is None:
-            return None
-        if left is not None and not isinstance(left, str):
-            return None
-        if right is not None and not isinstance(right, str):
-            return None
-        return (left if isinstance(left, str) else _SENTINEL) + (right if isinstance(right, str) else _SENTINEL)
-    if isinstance(node.op, ast.Mult):
-        left = _eval(node.left, local_vars, module_dicts)
-        right = _eval(node.right, local_vars, module_dicts)
-        li = _const_int(node.left)
-        ri = _const_int(node.right)
-        if isinstance(left, str) and ri is not None:
-            return left * ri
-        if isinstance(right, str) and li is not None:
-            return right * li
-        if isinstance(left, list) and ri is not None:
-            return left * ri
-        if isinstance(right, list) and li is not None:
-            return right * li
-        if isinstance(left, (str, list)) or isinstance(right, (str, list)):
-            return _SENTINEL
-        return None
-    return None
-
-
-def _eval_call(node: ast.Call, local_vars: Dict[str, Any], module_dicts: Dict[str, Any]) -> Any:
-    func = node.func
-    if isinstance(func, ast.Attribute) and func.attr == "replace" and len(node.args) >= 2:
-        receiver = _eval(func.value, local_vars, module_dicts)
-        needle = _eval(node.args[0], local_vars, module_dicts)
-        replacement = _eval(node.args[1], local_vars, module_dicts)
-        if not isinstance(receiver, str) or not isinstance(needle, str):
-            return None
-        repl = replacement if isinstance(replacement, str) else _SENTINEL
-        try:
-            return receiver.replace(needle, repl)
-        except Exception:
-            return None
-    if isinstance(func, ast.Attribute) and func.attr == "join" and len(node.args) == 1:
-        separator = _eval(func.value, local_vars, module_dicts)
-        if not isinstance(separator, str):
-            return None
-        seq = node.args[0]
-        if isinstance(seq, (ast.List, ast.Tuple, ast.Set)):
-            parts: List[str] = []
-            for elt in seq.elts:
-                resolved = _eval(elt, local_vars, module_dicts)
-                if not isinstance(resolved, str):
-                    return _SENTINEL
-                parts.append(resolved)
-            return separator.join(parts)
-        return _SENTINEL
-    if isinstance(func, ast.Name) and func.id == "len":
-        return _SENTINEL
-    return None
-
-
-def _eval_joined_str(node: ast.JoinedStr) -> str:
-    parts: List[str] = []
-    for value in node.values:
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            parts.append(value.value)
-        else:
-            parts.append("0")
-    return "".join(parts)
 
 
 def _scan_keyword(sql: str, keyword: str, start: int, depth_target: int) -> int:
@@ -271,6 +116,44 @@ def _split_top_level(text: str) -> List[str]:
     return items
 
 
+def _top_level_segments(sql: str) -> List[str]:
+    """Split *sql* on semicolons at paren-depth 0, ignoring quotes."""
+    segments: List[str] = []
+    current: List[str] = []
+    depth = 0
+    quote: Optional[str] = None
+    i = 0
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if quote is not None:
+            if c == quote:
+                if i + 1 < n and sql[i + 1] == quote:
+                    current.append(c)
+                    current.append(c)
+                    i += 2
+                    continue
+                quote = None
+            current.append(c)
+        elif c in ("'", '"', "`"):
+            quote = c
+            current.append(c)
+        elif c == "(":
+            depth += 1
+            current.append(c)
+        elif c == ")":
+            depth = max(0, depth - 1)
+            current.append(c)
+        elif c == ";" and depth == 0:
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(c)
+        i += 1
+    segments.append("".join(current))
+    return segments
+
+
 def find_select_column_count(sql: str) -> Optional[int]:
     """Return the number of columns in the first top-level ``SELECT`` list.
 
@@ -308,9 +191,11 @@ class _FunctionAnalyzer:
         self.row_bindings: Dict[str, str] = {}
         self.row_reads: Dict[str, List[tuple]] = {}
         self.sql_candidates: List[tuple] = []
+        self.execute_sqls: List[tuple] = []
+        self.unknown_query_keys: List[tuple] = []
 
     def eval(self, node: Optional[ast.AST]) -> Any:
-        return _eval(node, self.local_vars, self.module_dicts)
+        return resolve(node, self.local_vars, self.module_dicts)
 
     def analyze(self, body: List[ast.stmt]) -> None:
         self.process_body(body)
@@ -338,10 +223,17 @@ class _FunctionAnalyzer:
         elif isinstance(stmt, ast.Expr):
             call = stmt.value
             if _is_execute_call(call) and call.args:
+                arg0 = call.args[0]
+                if isinstance(arg0, ast.Subscript):
+                    base = self.eval(arg0.value)
+                    key = _const_str(arg0.slice)
+                    if isinstance(base, dict) and key is not None and key not in base:
+                        self.unknown_query_keys.append((key, stmt.lineno))
                 sql = self.eval(call.args[0])
                 self.last_sql = sql if isinstance(sql, str) else None
                 if isinstance(sql, str):
                     self._record_candidate(sql, stmt.lineno)
+                    self.execute_sqls.append((sql, stmt.lineno))
             self.collect_row_reads(stmt.value)
         elif isinstance(stmt, (ast.For, ast.AsyncFor)):
             self._process_for(stmt)
@@ -501,7 +393,7 @@ def row_index_violations(source: str) -> List[dict]:
         tree = ast.parse(source)
     except SyntaxError:
         return []
-    module_dicts = _collect_module_dicts(tree)
+    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
     for name, node in _iter_functions(tree):
@@ -538,7 +430,7 @@ def planner_unfriendly_sql(source: str) -> List[dict]:
         tree = ast.parse(source)
     except SyntaxError:
         return []
-    module_dicts = _collect_module_dicts(tree)
+    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
     for name, node in _iter_functions(tree):
@@ -552,4 +444,86 @@ def planner_unfriendly_sql(source: str) -> List[dict]:
                 continue
             seen.add(key)
             violations.append({"function": name, "sql": sql, "line": line})
+    return violations
+
+
+def multi_statement_sql(source: str) -> List[dict]:
+    """Resolved execute() SQL strings containing >1 top-level statement."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    module_dicts = collect_module_dicts(tree)
+    violations: List[dict] = []
+    seen = set()
+    for name, node in _iter_functions(tree):
+        analyzer = _FunctionAnalyzer(name, module_dicts)
+        analyzer.analyze(node.body)
+        for sql, line in analyzer.execute_sqls:
+            statements = sum(1 for seg in _top_level_segments(sql) if seg.strip())
+            if statements < 2:
+                continue
+            key = (name, sql)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(
+                {"function": name, "sql": sql, "line": line, "statements": statements}
+            )
+    return violations
+
+
+def unknown_query_key_sql(source: str) -> List[dict]:
+    """Resolved query-dict keys referenced by execute() that do not exist."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    module_dicts = collect_module_dicts(tree)
+    violations: List[dict] = []
+    seen = set()
+    for name, node in _iter_functions(tree):
+        analyzer = _FunctionAnalyzer(name, module_dicts)
+        analyzer.analyze(node.body)
+        for key, line in analyzer.unknown_query_keys:
+            dedup_key = (name, key, line)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            violations.append({"function": name, "key": key, "line": line})
+    return violations
+
+
+def duplicate_where_sql(source: str) -> List[dict]:
+    """Resolved SQL strings with 2+ top-level WHERE clauses."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    module_dicts = collect_module_dicts(tree)
+    violations: List[dict] = []
+    seen = set()
+    for name, node in _iter_functions(tree):
+        analyzer = _FunctionAnalyzer(name, module_dicts)
+        analyzer.analyze(node.body)
+        for sql, line in analyzer.execute_sqls:
+            if SENTINEL in sql:
+                continue
+            count = 0
+            pos = 0
+            while True:
+                found = _scan_keyword(sql, "WHERE", pos, 0)
+                if found < 0:
+                    break
+                count += 1
+                pos = found + len("WHERE")
+            if count < 2:
+                continue
+            key = (name, sql)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(
+                {"function": name, "sql": sql, "line": line, "where_count": count}
+            )
     return violations

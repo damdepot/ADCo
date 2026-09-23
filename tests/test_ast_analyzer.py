@@ -161,6 +161,27 @@ def f():
     assert db_ops[2].sql is None
     assert db_ops[2].sql_operation == "UNKNOWN"
 
+def test_sql_resolved_from_module_dict_subscript():
+    source = '''
+TXN_QUERIES = {
+    "DELIVERY": {
+        "getNewOrder": "SELECT NO_O_ID FROM NEW_ORDER WHERE NO_D_ID = %s"
+    }
+}
+
+class DeliveryService:
+    def deliver(self, w_id):
+        q = TXN_QUERIES["DELIVERY"]
+        self.cursor.execute(q["getNewOrder"], [w_id])
+'''
+    analysis = analyze_source(source, "delivery.py")
+    db_ops = analysis.database_operations
+    assert len(db_ops) == 1
+    op = db_ops[0]
+    assert op.sql == "SELECT NO_O_ID FROM NEW_ORDER WHERE NO_D_ID = %s"
+    assert op.sql_operation == "SELECT"
+
+
 def test_db_operation_inside_loop_and_param_deps():
     source = """
 def update_products():

@@ -1,8 +1,8 @@
-"""Pydantic output schema for the code optimizer agent."""
+"""Pydantic output schema for the optimizer agent."""
 from pydantic import BaseModel, Field
 
 
-class CodeOptimizerOutput(BaseModel):
+class OptimizerOutput(BaseModel):
     modified_files: list[str] = Field(
         default_factory=list,
         description="List of relative file paths that were modified",

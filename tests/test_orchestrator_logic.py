@@ -1,18 +1,24 @@
 """Tests for rewriter orchestration logic (no live agents)."""
 
+import asyncio
+import inspect
+
 import pytest
 from google.adk import Event
 from pydantic import ValidationError
 
 from src.code_rewriter.workflow import (
     MAX_ATTEMPTS_PER_TARGET,
+    _attempt_score,
+    _issue_signature,
     attempts_exhausted,
     finalize,
+    make_orchestrate,
     prepare,
 )
 from src.code_rewriter.models.rewrite_models import RewriteContract, RewriteTarget
 from src.code_rewriter.sub_agents.verifier.models import VerifierOutput
-from src.code_rewriter.tools.pipeline_analysis import execute_deterministic_verification
+from src.code_rewriter.tools.pipeline_analysis import verify_all_contracts
 
 
 class _FakeContext:
@@ -154,7 +160,7 @@ def test_vacuous_pass_rejected_when_non_contract_file_modified_only(tmp_path):
             targets=[RewriteTarget(file="repo.py", function="get_users")],
         )
     ]
-    result = execute_deterministic_verification(
+    result = verify_all_contracts(
         str(target_dir), str(sandbox_dir), contracts, ["unrelated.py"]
     )
     assert result.status == "FAIL"
@@ -182,3 +188,344 @@ def test_finalize_deterministic_pass_not_overridden_by_llm_fail():
     assert delta["verifier_output"]["status"] == "PASS"
     assert delta["deterministic_verification"]["status"] == "PASS"
     assert delta["verifier_output"]["suggestion"] == "double-check batching"
+
+
+class _FakeAsyncContext:
+    def __init__(self, state: dict | None = None) -> None:
+        self.state = state if state is not None else {}
+
+    async def run_node(self, node, node_input=None):
+        result = node(self, node_input)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+
+async def _drive(orchestrate, ctx):
+    events = []
+    async for event in orchestrate(ctx):
+        events.append(event)
+    return events
+
+
+def test_make_orchestrate_restores_best_attempt(tmp_path):
+    """The best-scoring attempt must win, not merely the last one."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    target_file = sandbox / "repo.py"
+    target_file.write_text("original\n")
+
+    markers = iter(["BEST", "WORSE", "WORSE"])
+
+    def optimizer(ctx, node_input=None):
+        target_file.write_text(next(markers) + "\n")
+
+    first_verdict = {
+        "status": "FAIL",
+        "violations": [{"code": "DEAD_LOCAL", "severity": "ERROR"}],
+    }
+    worse_verdict = {
+        "status": "FAIL",
+        "violations": [
+            {"code": "STRATEGY_NOT_APPLIED", "severity": "ERROR"},
+            {"code": "N_PLUS_ONE_QUERY", "severity": "ERROR"},
+        ],
+    }
+    all_verdicts = iter([first_verdict, worse_verdict, worse_verdict])
+
+    def verify(ctx, node_input=None):
+        return next(all_verdicts)
+
+    ctx = _FakeAsyncContext({
+        "sandbox": str(sandbox),
+        "rewrite_contracts": [
+            {"target": {"file": "repo.py", "qualified_function": "get_users"}}
+        ],
+    })
+    orchestrate = make_orchestrate(optimizer, verify)
+    events = asyncio.run(_drive(orchestrate, ctx))
+
+    assert target_file.read_text() == "BEST\n"
+    assert _attempt_score(first_verdict) < _attempt_score(worse_verdict)
+    results = events[-1].actions.state_delta["target_results"]
+    assert results[0]["status"] == "FAIL"
+    assert results[0]["verification"] == first_verdict
+
+
+def test_issue_signature_is_stable_and_sorted():
+    """Signature is order-independent, stable, and empty when there are none."""
+    assert _issue_signature(None) == ()
+    assert _issue_signature({"violations": []}) == ()
+    a = {
+        "violations": [
+            {"code": "B", "severity": "ERROR", "message": "second"},
+            {"code": "A", "severity": "WARNING", "message": "first"},
+        ]
+    }
+    b = {
+        "violations": [
+            {"code": "A", "severity": "WARNING", "message": "first"},
+            {"code": "B", "severity": "ERROR", "message": "second"},
+        ]
+    }
+    assert _issue_signature(a) == _issue_signature(b)
+    assert _issue_signature(a) == (
+        ("ERROR", "B", "second"),
+        ("WARNING", "A", "first"),
+    )
+
+
+def test_make_orchestrate_repairs_from_best(tmp_path):
+    """Each retry must repair the best attempt, and the best artifact wins."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    target_file = sandbox / "repo.py"
+    target_file.write_text("original\n")
+
+    markers = iter(["BEST", "MID", "LAST"])
+    observed: list[str] = []
+
+    def optimizer(ctx, node_input=None):
+        observed.append(target_file.read_text())
+        target_file.write_text(next(markers) + "\n")
+
+    best_verdict = {
+        "status": "FAIL",
+        "violations": [{"code": "A", "severity": "ERROR", "message": "a"}],
+    }
+    mid_verdict = {
+        "status": "FAIL",
+        "violations": [
+            {"code": "A", "severity": "ERROR", "message": "a"},
+            {"code": "B", "severity": "ERROR", "message": "b"},
+        ],
+    }
+    last_verdict = {
+        "status": "FAIL",
+        "violations": [
+            {"code": "A", "severity": "ERROR", "message": "a"},
+            {"code": "B", "severity": "ERROR", "message": "b"},
+            {"code": "C", "severity": "ERROR", "message": "c"},
+        ],
+    }
+    verdicts = iter([best_verdict, mid_verdict, last_verdict])
+
+    def verify(ctx, node_input=None):
+        return next(verdicts)
+
+    ctx = _FakeAsyncContext({
+        "sandbox": str(sandbox),
+        "rewrite_contracts": [
+            {"target": {"file": "repo.py", "qualified_function": "get_users"}}
+        ],
+    })
+    orchestrate = make_orchestrate(optimizer, verify, max_attempts=3)
+    events = asyncio.run(_drive(orchestrate, ctx))
+
+    # Attempt 2 and 3 must both observe the best attempt's artifact as their base.
+    assert observed == ["original\n", "BEST\n", "BEST\n"]
+    assert target_file.read_text() == "BEST\n"
+    results = events[-1].actions.state_delta["target_results"]
+    assert results[0]["status"] == "FAIL"
+    assert results[0]["verification"] == best_verdict
+
+
+def test_make_orchestrate_stops_on_repeated_signature(tmp_path):
+    """A repeated violation signature halts the loop (no-progress detection)."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    target_file = sandbox / "repo.py"
+    target_file.write_text("original\n")
+
+    optimizer_calls = {"n": 0}
+
+    def optimizer(ctx, node_input=None):
+        optimizer_calls["n"] += 1
+        target_file.write_text("attempt\n")
+
+    repeated_verdict = {
+        "status": "FAIL",
+        "violations": [{"code": "STRATEGY_NOT_APPLIED", "severity": "ERROR"}],
+    }
+
+    def verify(ctx, node_input=None):
+        return repeated_verdict
+
+    ctx = _FakeAsyncContext({
+        "sandbox": str(sandbox),
+        "rewrite_contracts": [
+            {"target": {"file": "repo.py", "qualified_function": "get_users"}}
+        ],
+    })
+    orchestrate = make_orchestrate(optimizer, verify)
+    events = asyncio.run(_drive(orchestrate, ctx))
+
+    assert optimizer_calls["n"] == 2
+    results = events[-1].actions.state_delta["target_results"]
+    assert results[0]["status"] == "FAIL"
+
+
+def test_make_orchestrate_max_attempts_is_five(tmp_path):
+    """Never-passing distinct failures exhaust the five-attempt budget."""
+    assert MAX_ATTEMPTS_PER_TARGET == 5
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    target_file = sandbox / "repo.py"
+    target_file.write_text("original\n")
+
+    optimizer_calls = {"n": 0}
+
+    def optimizer(ctx, node_input=None):
+        optimizer_calls["n"] += 1
+        target_file.write_text(f"attempt-{optimizer_calls['n']}\n")
+
+    verify_calls = {"n": 0}
+
+    def verify(ctx, node_input=None):
+        verify_calls["n"] += 1
+        return {
+            "status": "FAIL",
+            "violations": [
+                {
+                    "code": f"E{verify_calls['n']}",
+                    "severity": "ERROR",
+                    "message": str(verify_calls["n"]),
+                }
+            ],
+        }
+
+    ctx = _FakeAsyncContext({
+        "sandbox": str(sandbox),
+        "rewrite_contracts": [
+            {"target": {"file": "repo.py", "qualified_function": "get_users"}}
+        ],
+    })
+    orchestrate = make_orchestrate(optimizer, verify)
+    events = asyncio.run(_drive(orchestrate, ctx))
+
+    assert optimizer_calls["n"] == 5
+    results = events[-1].actions.state_delta["target_results"]
+    assert results[0]["status"] == "FAIL"
+
+
+def test_make_orchestrate_keeps_passing_attempt(tmp_path):
+    """A passing attempt is left in place; no best-attempt restore happens."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    target_file = sandbox / "repo.py"
+    target_file.write_text("original\n")
+
+    markers = iter(["PASSING", "WORSE", "WORSE"])
+
+    def optimizer(ctx, node_input=None):
+        target_file.write_text(next(markers) + "\n")
+
+    def verify(ctx, node_input=None):
+        return {"status": "PASS", "violations": []}
+
+    ctx = _FakeAsyncContext({
+        "sandbox": str(sandbox),
+        "rewrite_contracts": [
+            {"target": {"file": "repo.py", "qualified_function": "get_users"}}
+        ],
+    })
+    orchestrate = make_orchestrate(optimizer, verify)
+    events = asyncio.run(_drive(orchestrate, ctx))
+
+    assert target_file.read_text() == "PASSING\n"
+    results = events[-1].actions.state_delta["target_results"]
+    assert results[0]["status"] == "PASS"
+
+
+def test_make_orchestrate_llm_fail_with_evidence_retries(tmp_path):
+    """An evidence-backed LLM FAIL after deterministic PASS drives a retry."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    target_file = sandbox / "repo.py"
+    target_file.write_text("original\n")
+
+    optimizer_calls = {"n": 0}
+
+    def optimizer(ctx, node_input=None):
+        optimizer_calls["n"] += 1
+        target_file.write_text(f"attempt-{optimizer_calls['n']}\n")
+
+    def verify(ctx, node_input=None):
+        return {"status": "PASS", "violations": []}
+
+    llm_calls = {"n": 0}
+
+    def llm_verify(ctx, node_input=None):
+        llm_calls["n"] += 1
+        if llm_calls["n"] == 1:
+            return {
+                "status": "FAIL",
+                "issues": [
+                    {
+                        "code": "SEMANTIC_ISSUE",
+                        "severity": "ERROR",
+                        "message": "wrong join",
+                        "evidence": "line 42: JOIN ...",
+                    }
+                ],
+            }
+        return {"status": "PASS", "issues": []}
+
+    ctx = _FakeAsyncContext({
+        "sandbox": str(sandbox),
+        "rewrite_contracts": [
+            {"target": {"file": "repo.py", "qualified_function": "get_users"}}
+        ],
+    })
+    orchestrate = make_orchestrate(optimizer, verify, llm_verify, max_attempts=3)
+    events = asyncio.run(_drive(orchestrate, ctx))
+
+    # The merged evidence-backed FAIL must not pass on attempt 1: optimizer reruns.
+    assert optimizer_calls["n"] == 2
+    results = events[-1].actions.state_delta["target_results"]
+    assert results[0]["status"] == "PASS"
+
+
+def test_make_orchestrate_llm_fail_without_evidence_is_ignored(tmp_path):
+    """An unevidenced LLM FAIL must not block the deterministic PASS."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    target_file = sandbox / "repo.py"
+    target_file.write_text("original\n")
+
+    optimizer_calls = {"n": 0}
+
+    def optimizer(ctx, node_input=None):
+        optimizer_calls["n"] += 1
+        target_file.write_text("attempt\n")
+
+    def verify(ctx, node_input=None):
+        return {"status": "PASS", "violations": []}
+
+    def llm_verify(ctx, node_input=None):
+        return {
+            "status": "FAIL",
+            "issues": [
+                {
+                    "code": "SEMANTIC_ISSUE",
+                    "severity": "ERROR",
+                    "message": "unproven claim",
+                    "evidence": "",
+                }
+            ],
+        }
+
+    ctx = _FakeAsyncContext({
+        "sandbox": str(sandbox),
+        "rewrite_contracts": [
+            {"target": {"file": "repo.py", "qualified_function": "get_users"}}
+        ],
+    })
+    orchestrate = make_orchestrate(optimizer, verify, llm_verify, max_attempts=3)
+    events = asyncio.run(_drive(orchestrate, ctx))
+
+    assert optimizer_calls["n"] == 1
+    results = events[-1].actions.state_delta["target_results"]
+    assert results[0]["status"] == "PASS"
+

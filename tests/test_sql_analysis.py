@@ -1,7 +1,10 @@
 from src.code_rewriter.tools.sql_analysis import (
+    duplicate_where_sql,
     find_select_column_count,
+    multi_statement_sql,
     planner_unfriendly_sql,
     row_index_violations,
+    unknown_query_key_sql,
 )
 
 STOCK_SELECT_6 = (
@@ -85,3 +88,78 @@ def get_stock(cursor, item_id):
     return row[3]
 '''
     assert row_index_violations(source) == []
+
+
+def test_multi_statement_execute_flagged():
+    source = '''
+def load(cursor, x):
+    cursor.execute("SELECT a FROM t; SELECT b FROM u;", (x,))
+'''
+    violations = multi_statement_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["statements"] == 2
+    assert violations[0]["function"] == "load"
+
+    single = '''
+def load(cursor, x):
+    cursor.execute("SELECT a FROM t WHERE id = ?", (x,))
+'''
+    assert multi_statement_sql(single) == []
+
+    trailing = '''
+def load(cursor, x):
+    cursor.execute("SELECT a FROM t;", (x,))
+'''
+    assert multi_statement_sql(trailing) == []
+
+
+def test_duplicate_where_flagged():
+    source = '''
+def get_items(cursor, ids):
+    sql = "SELECT I_PRICE, I_NAME, I_DATA FROM ITEM WHERE I_ID = %s" + " WHERE i_id IN (%s)"
+    cursor.execute(sql, ids)
+'''
+    violations = duplicate_where_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["where_count"] == 2
+    assert violations[0]["function"] == "get_items"
+
+    subquery = '''
+def get_items(cursor, x):
+    cursor.execute("SELECT a FROM t WHERE a IN (SELECT b FROM u WHERE c = %s)", (x,))
+'''
+    assert duplicate_where_sql(subquery) == []
+
+
+def test_unknown_query_key_flagged():
+    source = '''
+TXN_QUERIES = {"DELIVERY": {"getNewOrder": "SELECT NO_O_ID FROM NEW_ORDER WHERE NO_D_ID = %s"}}
+
+def do_delivery(cursor, w_id):
+    q = TXN_QUERIES["DELIVERY"]
+    cursor.execute(q["getNewOrderAll"], [w_id])
+'''
+    violations = unknown_query_key_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["key"] == "getNewOrderAll"
+    assert violations[0]["function"] == "do_delivery"
+
+
+def test_unknown_query_key_ok_when_key_exists():
+    source = '''
+TXN_QUERIES = {"DELIVERY": {"getNewOrder": "SELECT NO_O_ID FROM NEW_ORDER WHERE NO_D_ID = %s"}}
+
+def do_delivery(cursor, w_id):
+    q = TXN_QUERIES["DELIVERY"]
+    cursor.execute(q["getNewOrder"], [w_id])
+'''
+    assert unknown_query_key_sql(source) == []
+
+
+def test_unknown_query_key_ignores_unresolvable_base():
+    source = '''
+def do_delivery(cursor, w_id):
+    d = {}
+    cursor.execute(d["missingKey"], [w_id])
+'''
+    assert unknown_query_key_sql(source) == []

@@ -1,6 +1,6 @@
 import ast
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from ..models.ast_models import (
     CallAnalysis,
@@ -13,9 +13,11 @@ from ..models.ast_models import (
     SourceLocation,
     SqlOperation,
 )
+from .sql_resolver import collect_module_dicts, resolve
 
 class _FileVisitor(ast.NodeVisitor):
-    def __init__(self):
+    def __init__(self, module_dicts: Optional[Dict[str, Any]] = None):
+        self.module_dicts: Dict[str, Any] = module_dicts if module_dicts is not None else {}
         self.imports: List[ImportAnalysis] = []
         self.classes: List[ClassAnalysis] = []
         self.functions: List[FunctionAnalysis] = []
@@ -33,6 +35,10 @@ class _FileVisitor(ast.NodeVisitor):
         # Track local string assignments per function scope
         self.module_strings: Dict[str, str] = {}
         self.function_strings: List[Dict[str, str]] = []
+
+        # Track resolved variable values per function scope
+        self.module_vars: Dict[str, Any] = {}
+        self.function_vars: List[Dict[str, Any]] = []
 
     def _get_location(self, node: ast.AST) -> SourceLocation:
         return SourceLocation(
@@ -129,22 +135,36 @@ class _FileVisitor(ast.NodeVisitor):
         self.function_stack.append(func_analysis)
         self.current_function = func_analysis
         self.function_strings.append({})
+        self.function_vars.append({})
         
         self.generic_visit(node)
         
+        self.function_vars.pop()
         self.function_strings.pop()
         self.function_stack.pop()
         self.current_function = self.function_stack[-1] if self.function_stack else None
 
     def visit_Assign(self, node: ast.Assign):
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target_name = node.targets[0].id
             if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
-                target_name = node.targets[0].id
                 if self.function_strings:
                     self.function_strings[-1][target_name] = node.value.value
                 else:
                     self.module_strings[target_name] = node.value.value
+            resolved_value = self._resolve_value(node.value)
+            if resolved_value is not None:
+                if self.function_vars:
+                    self.function_vars[-1][target_name] = resolved_value
+                else:
+                    self.module_vars[target_name] = resolved_value
         self.generic_visit(node)
+
+    def _resolve_value(self, node: ast.AST) -> Any:
+        merged: Dict[str, Any] = dict(self.module_vars)
+        if self.function_vars:
+            merged.update(self.function_vars[-1])
+        return resolve(node, merged, self.module_dicts)
 
     def visit_Return(self, node: ast.Return):
         if self.current_function:
@@ -241,6 +261,13 @@ class _FileVisitor(ast.NodeVisitor):
         return "UNKNOWN"
         
     def _extract_sql_string(self, arg: ast.AST) -> Optional[str]:
+        # f-strings resolve to placeholder text in the shared resolver, which is
+        # not a faithful SQL string; keep the historical behaviour of returning
+        # None for them here.
+        if not isinstance(arg, ast.JoinedStr):
+            resolved = self._resolve_value(arg)
+            if isinstance(resolved, str):
+                return resolved
         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
             return arg.value
         elif isinstance(arg, ast.Name):
@@ -332,7 +359,7 @@ def analyze_source(source: str, file_path: Optional[str] = None) -> FileAnalysis
         analysis.parse_error = str(e)
         return analysis
         
-    visitor = _FileVisitor()
+    visitor = _FileVisitor(module_dicts=collect_module_dicts(tree))
     visitor.visit(tree)
     
     analysis.imports = visitor.imports

@@ -1,11 +1,8 @@
-import os
-import pytest
 from src.code_rewriter.tools.pipeline_analysis import (
     build_contracts_from_intent,
-    execute_deterministic_verification,
-    format_pipeline_analysis_markdown,
-    format_dependency_slice_map,
-    verify_target,
+    verify_all_contracts,
+    build_target_context_map,
+    verify_contract_target,
 )
 from src.code_rewriter.models.rewrite_models import RewriteContract, RewriteTarget
 
@@ -32,7 +29,7 @@ def get_users(ids):
     assert contracts[0].target.file == "repo.py"
     assert contracts[0].target.function == "get_users"
 
-def test_execute_deterministic_verification_missing_rewrite(tmp_path):
+def test_verify_all_contracts_missing_rewrite(tmp_path):
     target_dir = tmp_path / "target"
     target_dir.mkdir()
     sandbox_dir = tmp_path / "sandbox"
@@ -49,7 +46,7 @@ def test_execute_deterministic_verification_missing_rewrite(tmp_path):
     ]
     
     # Empty modified files
-    result = execute_deterministic_verification(str(target_dir), str(sandbox_dir), contracts, [])
+    result = verify_all_contracts(str(target_dir), str(sandbox_dir), contracts, [])
     assert result.status == "FAIL"
     assert result.missing_targets == 1
     assert result.rewrite_coverage == 0.0
@@ -126,7 +123,7 @@ def get_products(ids):
     assert target_func_names == ["get_products"]
     assert contract.allowed_regions == ["get_products"]
 
-def test_execute_deterministic_verification_multi_file_scoped(tmp_path):
+def test_verify_all_contracts_multi_file_scoped(tmp_path):
     target_dir = tmp_path / "target"
     target_dir.mkdir()
     sandbox_dir = tmp_path / "sandbox"
@@ -163,7 +160,7 @@ def get_orders(ids):
     assert len(contracts) == 2
     
     # Only repo1.py was modified by the agent; repo2 target is unverified → FAIL
-    result = execute_deterministic_verification(
+    result = verify_all_contracts(
         str(target_dir), 
         str(sandbox_dir), 
         contracts, 
@@ -176,7 +173,7 @@ def get_orders(ids):
     assert result.rewrite_coverage == 0.5
 
 
-def test_format_pipeline_analysis_markdown(tmp_path):
+def test_build_target_context_map(tmp_path):
     target_dir = tmp_path / "target"
     target_dir.mkdir()
 
@@ -192,14 +189,79 @@ def test_format_pipeline_analysis_markdown(tmp_path):
         ]
     }
     analyses, contracts = build_contracts_from_intent(str(target_dir), intent_output)
-    md = format_pipeline_analysis_markdown(analyses, contracts, target_dir=str(target_dir))
-    assert "Dependency Slice: `get_users`" in md
-    assert "Database Operations" in md
-    assert "LOOP / N+1 RISK" in md
+    context_map = build_target_context_map(analyses, contracts, str(target_dir))
 
-    slice_map = format_dependency_slice_map(analyses, contracts, str(target_dir))
-    assert "get_users" in slice_map
-    assert slice_map["get_users"] == md
+    qfn = contracts[0].target.qualified_function or contracts[0].target.function
+    assert qfn in context_map
+    assert len(context_map) > 0
+    for value in context_map.values():
+        assert "Function Analysis" in value["analysis_summary"]
+        assert "inside_loop" in value["analysis_summary"]
+        assert "def get_users" in value["function_source"]
+        assert "Dependency Slice" in value["dependency_slice"]
+
+
+def test_build_target_context_map_query_catalog(tmp_path):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+
+    file_path = target_dir / "repo.py"
+    file_path.write_text('''
+TXN_QUERIES = {
+    "DELIVERY": {
+        "getNewOrder": "SELECT NO_O_ID FROM NEW_ORDER WHERE NO_D_ID = %s",
+        "updateOrder": "UPDATE NEW_ORDER SET NO_O_ID = %s WHERE NO_D_ID = %s",
+    },
+    "PAYMENT": {
+        "getCustomer": "SELECT C_ID FROM CUSTOMER WHERE C_ID = %s",
+    },
+}
+
+def process_orders(ids):
+    q = TXN_QUERIES["DELIVERY"]
+    for oid in ids:
+        cursor.execute(q["getNewOrder"], (oid,))
+        cursor.execute(q["updateOrder"], (oid, oid))
+''')
+
+    intent_output = {"optimization_targets": [{"file": "repo.py"}]}
+    analyses, contracts = build_contracts_from_intent(str(target_dir), intent_output)
+    context_map = build_target_context_map(analyses, contracts, str(target_dir))
+
+    ctx = context_map["process_orders"]
+    catalog = ctx["query_catalog"]
+    by_key = {entry["key"]: entry for entry in catalog}
+
+    assert by_key["getNewOrder"]["sql"] == (
+        "SELECT NO_O_ID FROM NEW_ORDER WHERE NO_D_ID = %s"
+    )
+    assert by_key["getNewOrder"]["operation"] == "SELECT"
+    assert by_key["getNewOrder"]["call"] == 'q["getNewOrder"]'
+    assert by_key["updateOrder"]["operation"] == "UPDATE"
+    assert by_key["updateOrder"]["sql"].startswith("UPDATE NEW_ORDER")
+
+    assert set(ctx["query_dict"]) == {"getNewOrder", "updateOrder"}
+    assert ctx["query_dict"]["getNewOrder"].startswith("SELECT")
+
+
+def test_build_target_context_map_omits_query_dict_when_undiscoverable(tmp_path):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+
+    file_path = target_dir / "repo.py"
+    file_path.write_text('''
+def get_users(ids):
+    for user_id in ids:
+        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+''')
+
+    intent_output = {"optimization_targets": [{"file": "repo.py"}]}
+    analyses, contracts = build_contracts_from_intent(str(target_dir), intent_output)
+    context_map = build_target_context_map(analyses, contracts, str(target_dir))
+
+    ctx = context_map["get_users"]
+    assert ctx["query_catalog"]  # inline SQL op still catalogued
+    assert "query_dict" not in ctx
 
 
 def test_build_contracts_per_target_pattern(tmp_path):
@@ -240,7 +302,7 @@ def sync_users(ids, names):
     assert seq_contract.allowed_regions == ["sync_users"]
 
 
-def test_verify_target_pass_and_missing(tmp_path):
+def test_verify_contract_target_pass_and_missing(tmp_path):
     target_dir = tmp_path / "target"
     target_dir.mkdir()
     sandbox_dir = tmp_path / "sandbox"
@@ -264,19 +326,19 @@ def get_users(ids):
     _analyses, contracts = build_contracts_from_intent(str(target_dir), intent_output)
     assert len(contracts) == 1
 
-    result = verify_target(str(target_dir), str(sandbox_dir), contracts[0])
+    result = verify_contract_target(str(target_dir), str(sandbox_dir), contracts[0])
     assert result.status == "PASS"
 
     missing_sandbox = tmp_path / "missing_sandbox"
     missing_sandbox.mkdir()
-    missing_result = verify_target(str(target_dir), str(missing_sandbox), contracts[0])
+    missing_result = verify_contract_target(str(target_dir), str(missing_sandbox), contracts[0])
     assert missing_result.status == "FAIL"
     assert any(v.code == "MISSING_REWRITE" for v in missing_result.violations)
     assert missing_result.missing_targets == 1
     assert missing_result.rewrite_coverage == 0.0
 
 
-def test_execute_deterministic_verification_warning_only_passes(tmp_path):
+def test_verify_all_contracts_warning_only_passes(tmp_path):
     target_dir = tmp_path / "target"
     target_dir.mkdir()
     sandbox_dir = tmp_path / "sandbox"
@@ -309,7 +371,7 @@ def get_users(ids):
         )
     ]
 
-    result = execute_deterministic_verification(
+    result = verify_all_contracts(
         str(target_dir),
         str(sandbox_dir),
         contracts,
