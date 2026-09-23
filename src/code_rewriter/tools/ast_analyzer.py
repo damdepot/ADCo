@@ -307,12 +307,15 @@ class _FileVisitor(ast.NodeVisitor):
             db_op_type = self._determine_db_op(call_name)
             if db_op_type != "UNKNOWN":
                 sql = None
+                sql_template = None
                 sql_op: SqlOperation = "UNKNOWN"
                 param_deps = []
                 
                 # Check arguments
                 if node.args:
                     sql = self._extract_sql_string(node.args[0])
+                    if isinstance(node.args[0], ast.BinOp) and isinstance(node.args[0].op, ast.Mod):
+                        sql_template = self._extract_sql_string(node.args[0].left)
                     if sql:
                         sql_op = self._determine_sql_op(sql)
                     
@@ -335,6 +338,7 @@ class _FileVisitor(ast.NodeVisitor):
                     operation_type=db_op_type,
                     sql_operation=sql_op,
                     sql=sql,
+                    sql_template=sql_template,
                     containing_function=containing_func,
                     inside_loop=len(self.loop_stack) > 0,
                     loop_variables=loop_vars,

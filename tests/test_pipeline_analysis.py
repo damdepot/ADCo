@@ -4,7 +4,19 @@ from src.code_rewriter.tools.pipeline_analysis import (
     build_target_context_map,
     verify_contract_target,
 )
+from src.code_rewriter.tools.ast_analyzer import analyze_file
 from src.code_rewriter.models.rewrite_models import RewriteContract, RewriteTarget
+
+from pathlib import Path
+
+TPCC_DRIVER = (
+    Path(__file__).resolve().parents[1]
+    / "benchmarks"
+    / "tools"
+    / "tpcc"
+    / "drivers"
+    / "postgresdriver.py"
+)
 
 def test_build_contracts_from_intent(tmp_path):
     target_dir = tmp_path / "target"
@@ -242,6 +254,35 @@ def process_orders(ids):
 
     assert set(ctx["query_dict"]) == {"getNewOrder", "updateOrder"}
     assert ctx["query_dict"]["getNewOrder"].startswith("SELECT")
+
+
+def test_build_target_context_map_dynamic_sql_template():
+    analysis = analyze_file(TPCC_DRIVER)
+    contract = RewriteContract(
+        rewrite_id="test-dynamic-template",
+        target=RewriteTarget(
+            file="postgresdriver.py",
+            qualified_function="PostgresDriver.doNewOrder",
+        ),
+        pattern="N_PLUS_ONE_QUERY",
+        strategy="COMBINING_QUERIES",
+        targets=[
+            RewriteTarget(
+                file="postgresdriver.py",
+                qualified_function="PostgresDriver.doNewOrder",
+            )
+        ],
+    )
+    context_map = build_target_context_map(
+        {"postgresdriver.py": analysis}, [contract], str(TPCC_DRIVER.parent)
+    )
+
+    ctx = context_map["PostgresDriver.doNewOrder"]
+    by_key = {entry["key"]: entry for entry in ctx["query_catalog"]}
+    stock_entry = by_key["getStockInfo"]
+
+    assert "S_DIST_%02d" in stock_entry["sql"]
+    assert "S_DIST_00" not in stock_entry["sql"]
 
 
 def test_build_target_context_map_omits_query_dict_when_undiscoverable(tmp_path):

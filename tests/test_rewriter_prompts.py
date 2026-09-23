@@ -56,6 +56,13 @@ def test_optimizer_prompt_has_sql_safety_rules():
     assert "number of parameter values" in text
 
 
+def test_optimizer_prompt_steers_to_composite_key_batching():
+    """Ensure the optimizer prompt forbids per-group query loops and names the composite-key form."""
+    text = OPTIMIZER_AGENT_PROMPT.lower()
+    assert "composite-key" in text
+    assert "one query per group" in text
+
+
 def test_verifier_prompt_requires_evidence():
     """Ensure the verifier prompt gates findings on verbatim evidence."""
     text = VERIFIER_PROMPT.lower()

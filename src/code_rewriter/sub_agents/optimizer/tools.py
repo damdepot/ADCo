@@ -16,9 +16,13 @@ from src.code_rewriter.models.feedback_models import (
     render_repair_request,
 )
 from src.code_rewriter.models.rewrite_models import RewriteContract
-from src.code_rewriter.tools.ast_replacer import replace_function_ast
+from src.code_rewriter.tools.ast_replacer import function_ast_dump, replace_function_ast
 from src.code_rewriter.tools.contract_verifier import verify_contract
 from src.code_rewriter.tools.pipeline_analysis import verify_all_contracts
+from src.code_rewriter.tools.transformation_risk import (
+    analyze_candidate,
+    analyze_transformation,
+)
 
 _ADCO_TAG_RE = re.compile(r"^[#-]{1,2}\s*ADCO_OPTIMIZED:.*\n?", re.MULTILINE)
 
@@ -61,6 +65,51 @@ def _coverage_feedback(tool_context: ToolContext) -> str:
         f"\nCoverage: transformed {result.transformed_targets}/{result.expected_targets}, "
         f"missing {result.missing_targets}, coverage={result.rewrite_coverage:.0%}"
     )
+
+
+def _transformation_risk(tool_context: ToolContext):
+    """Return the advisory transformation-risk report for the current target.
+
+    Returns ``None`` when the read/write map or target/sandbox paths are absent,
+    or when the comparison cannot be computed. Never raises.
+    """
+    read_write_map = tool_context.state.get("read_write_map")
+    if not read_write_map:
+        return None
+    contract = tool_context.state.get("current_contract")
+    target = tool_context.state.get("target", "")
+    sandbox = tool_context.state.get("sandbox", "")
+    if not contract or not target or not sandbox:
+        return None
+    try:
+        return analyze_transformation(target, sandbox, contract, read_write_map)
+    except Exception:
+        return None
+
+
+def _risk_advisory(tool_context: ToolContext) -> str:
+    """Compact advisory line appended to write-tool responses (never rejects)."""
+    report = _transformation_risk(tool_context)
+    if report is None:
+        return ""
+    flags = ", ".join(report.flags) if report.flags else "none"
+    return f"\nTransformation risk: {report.risk} ({flags})"
+
+
+def _render_transformation_risk(tool_context: ToolContext) -> str:
+    """Render the `## Transformation Risk` section, or "" when not computable."""
+    report = _transformation_risk(tool_context)
+    if report is None:
+        return ""
+    lines = [
+        "## Transformation Risk",
+        f"- Risk: {report.risk}",
+        f"- Flags: {', '.join(report.flags) if report.flags else 'none'}",
+    ]
+    for item in report.evidence:
+        lines.append(f"- {item}")
+    lines.append("Prefer a dependency-preserving shape when risk is HIGH.")
+    return "\n".join(lines)
 
 
 def _new_error_violations(before, after) -> list:
@@ -126,7 +175,79 @@ def _write_time_gate(
         f"ERROR: rejected — this change introduces {len(new_errors)} verification error(s):"
     ]
     lines.extend(f"- [{v.code}] {v.message}" for v in new_errors)
+    if any(v.code == "STRATEGY_NOT_APPLIED" for v in new_errors):
+        lines.append(
+            "For residual loop calls, compute the full key set and issue ONE set-based "
+            "statement; for multi-column keys use a composite-key batch such as "
+            "`(a, b) IN ((%s, %s), ...)` (or `a = ANY(%s) AND b IN (...)`). Do not loop "
+            "in Python and query once per group."
+        )
     lines.append("Fix these and call replace_function again.")
+    return "\n".join(lines)
+
+
+def _risk_block(
+    tool_context: ToolContext, path: str, candidate_source: str
+) -> str:
+    """Block a candidate that is a HIGH-risk transformation.
+
+    Returns an error string when the candidate must be rejected, else "".  Any
+    failure while analysing risk is treated as "no block" so only a genuine HIGH
+    classification can stop a write.
+    """
+    read_write_map = tool_context.state.get("read_write_map")
+    if not read_write_map:
+        return ""
+
+    contract_data = tool_context.state.get("current_contract")
+    if not isinstance(contract_data, dict) or not contract_data:
+        return ""
+
+    target = contract_data.get("target")
+    if not isinstance(target, dict):
+        return ""
+    function = target.get("qualified_function") or target.get("function") or ""
+    if not function:
+        return ""
+
+    target_dir = tool_context.state.get("target", "")
+    if not target_dir:
+        return ""
+    original_path = os.path.join(target_dir, path)
+    if not os.path.isfile(original_path):
+        return ""
+
+    try:
+        original_source = Path(original_path).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except Exception:
+        return ""
+
+    try:
+        risk = analyze_candidate(
+            original_source, candidate_source, function, read_write_map
+        )
+    except Exception:
+        return ""
+
+    if risk is None or risk.risk != "HIGH":
+        return ""
+
+    rejections = tool_context.state.setdefault("risk_rejections", [])
+    if function not in rejections:
+        rejections.append(function)
+
+    flags = ", ".join(risk.flags) if risk.flags else "none"
+    lines = [f"ERROR: rejected — HIGH transformation risk (blocked): {flags}."]
+    lines.append("Evidence:")
+    lines.extend(f"- {item}" for item in risk.evidence)
+    lines.append(
+        "Required: apply a dependency-preserving, lower-risk shape — e.g. keep the "
+        "dependent lookup as a scalar subquery (do NOT expand the aggregate's "
+        "top-level join), or keep the statements separate. Do not merge a "
+        "value-dependent lookup into a larger join."
+    )
     return "\n".join(lines)
 
 
@@ -168,9 +289,26 @@ def replace_function(
             f"hoist queries out of loops, and re-call replace_function."
         )
 
+    # Text can differ while the function's AST is unchanged (whitespace/comments/
+    # formatting only). The deterministic verifier compares ASTs, so reject such
+    # no-op rewrites here to keep the write gate and the verifier consistent.
+    original_dump = function_ast_dump(content, function_name)
+    candidate_dump = function_ast_dump(reconstructed, function_name)
+    if original_dump is not None and original_dump == candidate_dump:
+        return (
+            f"ERROR: replacement for '{function_name}' in {path} is structurally "
+            f"(AST) identical to the original — only formatting/comments changed. "
+            f"You must ACTUALLY change the database interaction code (queries, "
+            f"batching, loop structure) and re-call replace_function."
+        )
+
     rejection = _write_time_gate(tool_context, path, content, reconstructed)
     if rejection:
         return rejection
+
+    risk_block = _risk_block(tool_context, path, reconstructed)
+    if risk_block:
+        return risk_block
 
     sandbox_id = os.path.basename(sandbox) if sandbox else ""
     reconstructed = _add_tag(path, reconstructed, sandbox_id)
@@ -187,6 +325,7 @@ def replace_function(
     return (
         f"Successfully replaced function '{function_name}' in '{path}'"
         + _coverage_feedback(tool_context)
+        + _risk_advisory(tool_context)
     )
 
 
@@ -201,6 +340,10 @@ def _render_query_catalog(context_entry: dict) -> str:
     lines.append(
         "Use ONLY the exact query keys and SQL below. Never invent a query key "
         "or a column name."
+    )
+    lines.append(
+        "SQL shown for a dynamic template is UNFORMATTED; reuse it with the "
+        "runtime variable and never hardcode displayed dummy values."
     )
     for entry in catalog:
         if not isinstance(entry, dict):
@@ -362,6 +505,10 @@ def get_optimization_context(tool_context: ToolContext) -> str:
         sections.append(query_catalog)
 
     sections.append(_render_checklist(pattern))
+
+    transformation_risk = _render_transformation_risk(tool_context)
+    if transformation_risk:
+        sections.append(transformation_risk)
 
     dependency_slice = context_entry.get("dependency_slice") or ""
     if dependency_slice:

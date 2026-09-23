@@ -182,6 +182,31 @@ class DeliveryService:
     assert op.sql_operation == "SELECT"
 
 
+def test_sql_template_for_percent_formatted_query():
+    source = '''
+TXN_QUERIES = {
+    "NEW_ORDER": {
+        "getStockInfo": "SELECT S_QUANTITY, S_DATA, S_YTD, S_ORDER_CNT, S_REMOTE_CNT, S_DIST_%02d FROM STOCK WHERE S_I_ID = %%s AND S_W_ID = %%s"
+    }
+}
+
+class PostgresDriver:
+    def doNewOrder(self, d_id):
+        q = TXN_QUERIES["NEW_ORDER"]
+        self.cursor.execute(q["getStockInfo"] % (d_id), [1, 2])
+'''
+    analysis = analyze_source(source, "driver.py")
+    op = next(o for o in analysis.database_operations if o.call_name == "execute")
+
+    assert op.sql_template == (
+        "SELECT S_QUANTITY, S_DATA, S_YTD, S_ORDER_CNT, S_REMOTE_CNT, S_DIST_%02d "
+        "FROM STOCK WHERE S_I_ID = %%s AND S_W_ID = %%s"
+    )
+    assert "S_DIST_%02d" in op.sql_template
+    assert "%%s" in op.sql_template
+    assert "S_DIST_00" in op.sql
+
+
 def test_db_operation_inside_loop_and_param_deps():
     source = """
 def update_products():

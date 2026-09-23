@@ -410,7 +410,7 @@ def format_function_analysis_summary(fn: FunctionAnalysis | None) -> str:
             f"  - [{i}] {op.operation_type} / {op.sql_operation} / "
             f"inside_loop={inside} / line {op.source_location.start_line}"
         )
-        lines.append(f"    SQL: {op.sql or '(dynamic)'}")
+        lines.append(f"    SQL: {op.sql_template or op.sql or '(dynamic)'}")
 
     call_names = sorted({c.call_name for c in fn.calls})
     lines.append(f"- Calls: {', '.join(call_names) if call_names else 'none'}")
@@ -542,29 +542,31 @@ def _discover_query_context(
         if node.func.attr not in _EXECUTE_METHODS or not node.args:
             continue
         arg0 = node.args[0]
-        if not isinstance(arg0, ast.Subscript):
+        subscript = arg0.left if isinstance(arg0, ast.BinOp) and isinstance(arg0.op, ast.Mod) else arg0
+        if not isinstance(subscript, ast.Subscript):
             continue
-        key = _const_str_key(arg0.slice)
+        key = _const_str_key(subscript.slice)
         if key is None:
             continue
-        sql = resolve(arg0, local_vars, module_dicts)
+        sql = resolve(subscript, local_vars, module_dicts)
         if not isinstance(sql, str):
             sql = ""
-        call = ast.get_source_segment(source_code, arg0) or ""
+        call = ast.get_source_segment(source_code, subscript) or ""
         refs_by_sql.setdefault(sql, []).append({"key": key, "call": call, "sql": sql})
 
     catalog: list[dict] = []
     for op in fn.database_operations:
-        if not op.sql:
+        display_sql = op.sql_template or op.sql
+        if not display_sql:
             continue
-        candidates = refs_by_sql.get(op.sql)
+        candidates = refs_by_sql.get(display_sql)
         ref = candidates.pop(0) if candidates else None
         operation = op.sql_operation if op.sql_operation in _SQL_OPERATIONS else "OTHER"
         catalog.append(
             {
                 "key": ref["key"] if ref else "",
                 "call": ref["call"] if ref else "",
-                "sql": op.sql,
+                "sql": display_sql,
                 "operation": operation,
             }
         )

@@ -361,5 +361,99 @@ def get_stock(cursor, item_ids):
     assert any(v.code == "IMPLICIT_CROSS_JOIN" for v in result.violations)
 
 
+def test_set_based_batch_execute_in_grouping_loop_passes():
+    orig = """
+def process_items(cursor, keys):
+    result = {}
+    for a, b in keys:
+        cursor.execute("SELECT V FROM T WHERE (A, B) = (%s, %s)", (a, b))
+        result[(a, b)] = cursor.fetchone()[0]
+    return result
+"""
+    opt = """
+def process_items(cursor, keys):
+    result = {}
+    groups = {}
+    for a, b in keys:
+        if a not in groups:
+            groups[a] = []
+        groups[a].append(b)
+    for a, bs in groups.items():
+        cursor.execute("SELECT A, B, V FROM T WHERE A = %s AND B IN (%s)", (a, bs))
+        rows = cursor.fetchall()
+        for row in rows:
+            result[(row[0], row[1])] = row[2]
+    cursor.executemany("INSERT INTO T2 (A, B, V) VALUES (%s, %s, %s)", list(result.items()))
+    return result
+"""
+    contract = RewriteContract(
+        rewrite_id="test_set_based_batch",
+        target=RewriteTarget(file="t.py", function="process_items"),
+        targets=[RewriteTarget(file="t.py", function="process_items")],
+        pattern="N+1 Query",
+        strategy="Query Batching",
+        allowed_regions=["process_items"],
+    )
+    result = verify_contract(orig, opt, contract)
+    assert result.status == "PASS", [v.model_dump() for v in result.violations]
 
+
+def test_per_row_execute_in_loop_still_fails():
+    orig = """
+def process_items(cursor, item_ids):
+    result = {}
+    for item_id in item_ids:
+        cursor.execute("SELECT I_NAME FROM ITEM WHERE I_ID = %s", (item_id,))
+        result[item_id] = cursor.fetchone()[0]
+    return result
+"""
+    opt = """
+def process_items(cursor, item_ids):
+    result = {}
+    for item_id in item_ids:
+        cursor.execute("SELECT I_NAME FROM ITEM WHERE I_ID = %s", (item_id,))
+        result[item_id] = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM ITEM", ())
+    return result
+"""
+    contract = RewriteContract(
+        rewrite_id="test_per_row_loop",
+        target=RewriteTarget(file="t.py", function="process_items"),
+        pattern="N+1 Query",
+        strategy="Query Batching",
+        allowed_regions=["process_items"],
+    )
+    result = verify_contract(orig, opt, contract)
+    assert result.status == "FAIL"
+    assert any(v.code in ("STRATEGY_NOT_APPLIED", "MISSING_REWRITE") for v in result.violations)
+
+
+def test_fetch_inside_loop_is_ignored():
+    orig = """
+def get_items(cursor, item_ids):
+    result = {}
+    for item_id in item_ids:
+        cursor.execute("SELECT I_NAME FROM ITEM WHERE I_ID = %s", (item_id,))
+        result[item_id] = cursor.fetchone()[0]
+    return result
+"""
+    opt = """
+def get_items(cursor, item_ids):
+    cursor.execute("SELECT I_ID, I_NAME FROM ITEM WHERE I_ID = ANY(%s)", (item_ids,))
+    result = {}
+    for item_id in item_ids:
+        rows = cursor.fetchall()
+        result[item_id] = rows
+    return result
+"""
+    contract = RewriteContract(
+        rewrite_id="test_fetch_loop",
+        target=RewriteTarget(file="t.py", function="get_items"),
+        targets=[RewriteTarget(file="t.py", function="get_items")],
+        pattern="N+1 Query",
+        strategy="Query Batching",
+        allowed_regions=["get_items"],
+    )
+    result = verify_contract(orig, opt, contract)
+    assert result.status == "PASS", [v.model_dump() for v in result.violations]
 

@@ -87,6 +87,12 @@ def test_render_repair_request_empty():
     assert "(no issues)" in rendered
 
 
+def test_render_repair_request_steers_to_composite_key_batching():
+    rendered = render_repair_request(build_repair_issues(_verification()))
+    lowered = rendered.lower()
+    assert "composite-key" in lowered or "in ((" in lowered
+
+
 def test_repair_issue_defaults():
     issue = RepairIssue(code="X", severity="ERROR", message="m")
     assert issue.file == ""

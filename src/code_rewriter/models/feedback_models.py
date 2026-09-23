@@ -13,8 +13,11 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 _LOOP_BATCH_HINT = (
-    "Remove every DB call from the loop; hoist a batch IN/ANY read before it "
-    "and batch writes with executemany after it."
+    "Remove every DB call from the loop. Hoist ONE set-based batch read per "
+    "table before the loop and batch writes with executemany after it. Do NOT "
+    "emulate batching with a Python loop that issues one query per group: for a "
+    "multi-column key use a single composite-key statement (e.g. "
+    "`WHERE (a, b) IN ((%s, %s), ...)` or `a = ANY(%s) AND b IN (...)`)."
 )
 
 _FIX_HINTS: dict[str, str] = {

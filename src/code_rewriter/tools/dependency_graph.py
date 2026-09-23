@@ -145,6 +145,7 @@ def build_dependency_graph(analysis: FileAnalysis, source_code: Optional[str] = 
                     "operation_type": db_op.operation_type,
                     "sql_operation": db_op.sql_operation,
                     "sql": db_op.sql,
+                    "sql_template": db_op.sql_template,
                     "inside_loop": db_op.inside_loop,
                     "loop_variables": db_op.loop_variables,
                     "parameter_dependencies": db_op.parameter_dependencies,
@@ -383,6 +384,7 @@ def slice_dependency_graph(
                 "operation_type": node.metadata.get("operation_type"),
                 "sql_operation": node.metadata.get("sql_operation"),
                 "sql": node.metadata.get("sql"),
+                "sql_template": node.metadata.get("sql_template"),
                 "inside_loop": node.metadata.get("inside_loop", False),
                 "loop_variables": node.metadata.get("loop_variables", []),
                 "parameter_dependencies": node.metadata.get("parameter_dependencies", []),
@@ -390,8 +392,9 @@ def slice_dependency_graph(
                 "code_snippet": node.code_snippet,
             }
             db_ops.append(op_dict)
-            if node.metadata.get("sql"):
-                referenced_queries[node.id] = node.metadata["sql"]
+            referenced_sql = node.metadata.get("sql_template") or node.metadata.get("sql")
+            if referenced_sql:
+                referenced_queries[node.id] = referenced_sql
 
     # Gather state attributes
     state_attributes: List[str] = []
@@ -495,6 +498,7 @@ def format_dependency_slice_markdown(slice_data: DependencySlice, contract: Opti
             op_type = op.get("operation_type", "UNKNOWN")
             sql_op = op.get("sql_operation", "UNKNOWN")
             sql = op.get("sql")
+            sql_template = op.get("sql_template")
 
             lines.extend([
                 f"### Operation {idx}: `{call_name}` ({op_type})",
@@ -507,7 +511,21 @@ def format_dependency_slice_markdown(slice_data: DependencySlice, contract: Opti
             param_deps = op.get("parameter_dependencies", [])
             if param_deps:
                 lines.append(f"- **Parameter Dependencies**: {', '.join(f'`{p}`' for p in param_deps)}")
-            if sql:
+            if sql_template:
+                lines.extend([
+                    "- **SQL Template** (unformatted — reuse with the runtime variable, never hardcode the displayed value):",
+                    "```sql",
+                    sql_template.strip(),
+                    "```",
+                ])
+                if sql and sql != sql_template:
+                    lines.extend([
+                        "- **Resolved (format-substituted) SQL**:",
+                        "```sql",
+                        sql.strip(),
+                        "```",
+                    ])
+            elif sql:
                 lines.extend([
                     "- **SQL Statement**:",
                     "```sql",

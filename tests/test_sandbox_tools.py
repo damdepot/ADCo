@@ -262,6 +262,155 @@ def test_replace_function_accepts_clean_batching_rewrite(tmp_path):
     assert "ANY(%s)" in (sandbox_dir / "app.py").read_text()
 
 
+def test_replace_function_rejects_ast_identical_rewrite(tmp_path):
+    """Text-only changes (comments/whitespace/quotes) keep the AST identical and
+    must be rejected, matching the deterministic verifier's AST comparison."""
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    # reformatted only -- no real change\n"
+        "    results = []\n"
+        "\n"
+        "    for uid in user_ids:\n"
+        '        cursor.execute("SELECT * FROM users WHERE id = %s", (uid,))\n'
+        "        results.append(cursor.fetchone())\n"
+        "    return results\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("ERROR")
+    assert "structurally" in result
+    assert (sandbox_dir / "app.py").read_text() == _ORIGINAL_LOOP_FN
+
+
+_TPCC_DRIVER = (
+    Path(__file__).resolve().parents[1]
+    / "benchmarks"
+    / "tools"
+    / "tpcc"
+    / "drivers"
+    / "postgresdriver.py"
+)
+
+
+# The real TPC-C doStockLevel (two sequential, value-dependent reads) rewritten
+# into a single 3-relation JOIN: the canonical HIGH-risk transformation.
+_HIGH_RISK_STOCK_LEVEL = (
+    "def doStockLevel(self, params):\n"
+    "    w_id = params[\"w_id\"]\n"
+    "    d_id = params[\"d_id\"]\n"
+    "    threshold = params[\"threshold\"]\n"
+    "    self.cursor.execute(\n"
+    "        \"SELECT COUNT(DISTINCT OL_I_ID) FROM ORDER_LINE \"\n"
+    "        \"JOIN STOCK ON ORDER_LINE.OL_I_ID = STOCK.S_I_ID \"\n"
+    "        \"JOIN DISTRICT ON STOCK.S_W_ID = DISTRICT.D_W_ID \"\n"
+    "        \"WHERE OL_W_ID = %s AND OL_D_ID = %s AND OL_O_ID < %s\",\n"
+    "        [w_id, d_id, threshold],\n"
+    "    )\n"
+    "    result = self.cursor.fetchone()\n"
+    "    self.conn.commit()\n"
+    "    return int(result[0])\n"
+)
+
+
+# A dependency-preserving variant: the same two statements (and their value
+# dependency) are kept separate, so the risk stays LOW.
+_LOW_RISK_STOCK_LEVEL = (
+    "def doStockLevel(self, params):\n"
+    "    q = TXN_QUERIES[\"STOCK_LEVEL\"]\n"
+    "    w_id = params[\"w_id\"]\n"
+    "    d_id = params[\"d_id\"]\n"
+    "    threshold = params[\"threshold\"]\n"
+    "    self.cursor.execute(q[\"getOId\"], [w_id, d_id])\n"
+    "    result = self.cursor.fetchone()\n"
+    "    if not result:\n"
+    "        raise RuntimeError(\"missing order\")\n"
+    "    o_id = result[0]\n"
+    "    self.cursor.execute(\n"
+    "        q[\"getStockCount\"], [w_id, d_id, o_id, (o_id - 20), w_id, threshold]\n"
+    "    )\n"
+    "    result = self.cursor.fetchone()\n"
+    "    self.conn.commit()\n"
+    "    return int(result[0])\n"
+)
+
+
+def _stock_level_contract():
+    return {
+        "rewrite_id": "stock_level",
+        "target": {
+            "file": "postgresdriver.py",
+            "function": "doStockLevel",
+            "qualified_function": "PostgresDriver.doStockLevel",
+        },
+        "targets": [
+            {
+                "file": "postgresdriver.py",
+                "function": "doStockLevel",
+                "qualified_function": "PostgresDriver.doStockLevel",
+            }
+        ],
+        "pattern": "N_PLUS_ONE_QUERY",
+        "strategy": "combine dependent reads",
+        "allowed_regions": ["PostgresDriver.doStockLevel"],
+        "must_preserve": ["return_type", "function_signature"],
+    }
+
+
+def _stock_level_setup(tmp_path):
+    from src.code_rewriter.tools.ast_analyzer import analyze_file
+    from src.code_rewriter.tools.db_interaction import build_read_write_map
+
+    original = _TPCC_DRIVER.read_text(encoding="utf-8")
+    target_dir = tmp_path / "target"
+    sandbox_dir = tmp_path / "sandbox"
+    target_dir.mkdir()
+    sandbox_dir.mkdir()
+    (target_dir / "postgresdriver.py").write_text(original, encoding="utf-8")
+    (sandbox_dir / "postgresdriver.py").write_text(original, encoding="utf-8")
+    state = {
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _stock_level_contract(),
+        "read_write_map": build_read_write_map(analyze_file(_TPCC_DRIVER)),
+    }
+    return sandbox_dir, original, state
+
+
+def test_replace_function_blocks_high_risk_stock_level(tmp_path):
+    sandbox_dir, original, state = _stock_level_setup(tmp_path)
+    tc = MockToolContext(state)
+
+    result = co_replace_function(
+        "postgresdriver.py", "PostgresDriver.doStockLevel", _HIGH_RISK_STOCK_LEVEL, tc
+    )
+
+    assert result.startswith("ERROR")
+    assert "HIGH transformation risk" in result
+    assert "DEPENDENT_QUERY_FUSION" in result
+    assert (sandbox_dir / "postgresdriver.py").read_text(encoding="utf-8") == original
+    assert "PostgresDriver.doStockLevel" in tc.state["risk_rejections"]
+
+
+def test_replace_function_accepts_low_risk_stock_level(tmp_path):
+    sandbox_dir, original, state = _stock_level_setup(tmp_path)
+    tc = MockToolContext(state)
+
+    result = co_replace_function(
+        "postgresdriver.py", "PostgresDriver.doStockLevel", _LOW_RISK_STOCK_LEVEL, tc
+    )
+
+    assert result.startswith("Successfully replaced")
+    assert (sandbox_dir / "postgresdriver.py").read_text(encoding="utf-8") != original
+    assert not tc.state.get("risk_rejections")
+
+
 # ---------------------------------------------------------------------------
 # verifier.tools
 # ---------------------------------------------------------------------------

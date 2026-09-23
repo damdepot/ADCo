@@ -1,4 +1,5 @@
 import ast
+import re
 from typing import Dict, List, Optional
 
 from ..models import (
@@ -12,7 +13,7 @@ from ..models import (
     DependencyType,
 )
 from .ast_analyzer import analyze_source
-from ..models.ast_models import FileAnalysis, FunctionAnalysis
+from ..models.ast_models import FileAnalysis, FunctionAnalysis, DatabaseOperation
 from .dependency_graph import build_dependency_graph, DependencyGraph
 from .sql_analysis import (
     row_index_violations,
@@ -47,6 +48,35 @@ def _is_n1(contract: RewriteContract) -> bool:
     pattern_upper = (contract.pattern or "").upper()
     strategy_upper = (contract.strategy or "").upper()
     return "N+1" in pattern_upper or "N_PLUS_ONE" in pattern_upper or "N_PLUS_ONE" in strategy_upper or "BATCH" in strategy_upper or "COMBINING" in strategy_upper
+
+_BATCH_SQL_RE = re.compile(r"\bIN\s*\(|=\s*ANY\s*\(|=\s*ALL\s*\(", re.IGNORECASE)
+_LOOP_QUERY_OPS = {"EXECUTE", "EXECUTEMANY"}
+
+
+def _is_set_based(sql: Optional[str]) -> bool:
+    """True when *sql* filters on a collection (multi-row), e.g. IN (...) / = ANY(...)."""
+    return bool(sql and _BATCH_SQL_RE.search(sql))
+
+
+def _residual_loop_ops(ops: List[DatabaseOperation]) -> List[DatabaseOperation]:
+    """Return DB ops inside loops that are genuine per-row N+1 work.
+
+    ``FETCH`` operations (fetchone/fetchmany/fetchall) are ignored, and a
+    set-based ``EXECUTE``/``EXECUTEMANY`` (one statement over a collection, e.g.
+    ``IN (...)`` / ``= ANY(...)``) executed once per group is not a per-row
+    round-trip. Dynamic SQL that cannot be classified (no sql/sql_template)
+    stays conservative and is still counted.
+    """
+    residual: List[DatabaseOperation] = []
+    for op in ops:
+        if not op.inside_loop:
+            continue
+        if op.operation_type not in _LOOP_QUERY_OPS:
+            continue
+        if _is_set_based(op.sql_template or op.sql):
+            continue
+        residual.append(op)
+    return residual
 
 def _target_names(target: ast.AST) -> List[str]:
     """Resolve the assigned name(s) from an assignment/unpacking target."""
@@ -300,8 +330,8 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
         target_orig_funcs = [f for f in _get_all_functions(orig_ast) if (f.qualified_name in target_regions or f.name in target_regions)]
         target_opt_funcs = [f for f in _get_all_functions(opt_ast) if (f.qualified_name in target_regions or f.name in target_regions)]
 
-        orig_target_loops = [op for f in target_orig_funcs for op in f.database_operations if op.inside_loop]
-        opt_target_loops = [op for f in target_opt_funcs for op in f.database_operations if op.inside_loop]
+        orig_target_loops = _residual_loop_ops([op for f in target_orig_funcs for op in f.database_operations])
+        opt_target_loops = _residual_loop_ops([op for f in target_opt_funcs for op in f.database_operations])
         opt_target_all = [op for f in target_opt_funcs for op in f.database_operations]
 
         if orig_target_loops:
@@ -609,8 +639,8 @@ def check_rewrite_coverage(
             ))
             continue
 
-        orig_loops = [op for op in orig_f.database_operations if op.inside_loop]
-        opt_loops = [op for op in opt_f.database_operations if op.inside_loop]
+        orig_loops = _residual_loop_ops(orig_f.database_operations)
+        opt_loops = _residual_loop_ops(opt_f.database_operations)
         opt_non_loops = [op for op in opt_f.database_operations if not op.inside_loop]
         
         if is_n1 and orig_loops and opt_loops:

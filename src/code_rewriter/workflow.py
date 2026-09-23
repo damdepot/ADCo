@@ -17,18 +17,20 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any, Union
 
 from google.adk import Context, Event, Workflow
 from google.adk.models import BaseLlm
 from google.adk.workflow import FunctionNode
 
-from src.code_rewriter._common import _maybe_parse
+from src.code_rewriter._common import _maybe_parse, extract_function_source_by_name
 from src.code_rewriter.models.rewrite_models import RewriteContract
 from src.code_rewriter.sub_agents.optimizer.agent import create_optimizer_agent
 from src.code_rewriter.sub_agents.verifier.agent import create_verifier_agent
 from src.code_rewriter.tools import copy_to_sandbox, get_optimization_strategies
 from src.code_rewriter.tools.pipeline_analysis import verify_contract_target
+from src.code_rewriter.tools.transformation_risk import analyze_transformation
 
 MAX_ATTEMPTS_PER_TARGET = 5
 
@@ -62,6 +64,35 @@ def _issue_signature(verdict: Any) -> tuple:
 def attempts_exhausted(attempts: int) -> bool:
     """Return True once *attempts* reaches the per-target retry budget."""
     return attempts >= MAX_ATTEMPTS_PER_TARGET
+
+
+def _function_unchanged(
+    target_dir: str, sandbox_dir: str, rel_file: str, function: str
+) -> bool:
+    """True when the target function in the sandbox is byte-identical to the original.
+
+    Any missing file or parse/extraction failure is treated as ``False`` so the
+    RESTRICTED fallback only fires when the original function is provably intact.
+    """
+    if not target_dir or not sandbox_dir or not rel_file or not function:
+        return False
+    try:
+        original_source = Path(os.path.join(target_dir, rel_file)).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        sandbox_source = Path(os.path.join(sandbox_dir, rel_file)).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except Exception:
+        return False
+    try:
+        original_fn = extract_function_source_by_name(original_source, function)
+        sandbox_fn = extract_function_source_by_name(sandbox_source, function)
+    except Exception:
+        return False
+    if not original_fn or not sandbox_fn:
+        return False
+    return original_fn == sandbox_fn
 
 
 def copy_node(ctx: Context, node_input: Any = None) -> Event:
@@ -244,11 +275,33 @@ def make_orchestrate(
                     except OSError:
                         pass
 
+            if passed:
+                status = "PASS"
+            else:
+                risk_rejected = qfn in (ctx.state.get("risk_rejections") or [])
+                if risk_rejected and _function_unchanged(
+                    ctx.state.get("target", ""), sandbox, rel_file, qfn
+                ):
+                    # The HIGH-risk rewrite was blocked and no lower-risk attempt
+                    # was found, so the original function is preserved. This is an
+                    # acceptable outcome (RESTRICTED), not a pipeline failure.
+                    status = "RESTRICTED"
+                    verdict = {
+                        "status": "RESTRICTED",
+                        "summary": (
+                            "HIGH-risk transformation blocked; original function preserved."
+                        ),
+                        "violations": [],
+                        "target_coverage": [],
+                    }
+                else:
+                    status = "FAIL"
+
             results.append(
                 {
                     "file": target.get("file", ""),
                     "function": qfn,
-                    "status": "PASS" if passed else "FAIL",
+                    "status": status,
                     "verification": verdict,
                 }
             )
@@ -266,7 +319,8 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
     results = ctx.state.get("target_results", []) or []
     n_total = len(results)
     n_pass = sum(1 for r in results if r.get("status") == "PASS")
-    all_pass = all(r.get("status") == "PASS" for r in results)
+    n_restricted = sum(1 for r in results if r.get("status") == "RESTRICTED")
+    all_ok = all(r.get("status") in ("PASS", "RESTRICTED") for r in results)
 
     errors = [
         v
@@ -281,22 +335,36 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         if v.get("severity") == "WARNING"
     ]
 
+    summary = f"{n_pass}/{n_total} target functions transformed."
+    if n_restricted:
+        summary += (
+            f" {n_restricted} restricted (HIGH-risk transformation blocked; "
+            "original preserved)."
+        )
+
     det = {
-        "status": "PASS" if all_pass else "FAIL",
-        "summary": f"{n_pass}/{n_total} target functions transformed.",
+        "status": "PASS" if all_ok else "FAIL",
+        "summary": summary,
         "expected_targets": n_total,
         "transformed_targets": n_pass,
-        "missing_targets": n_total - n_pass,
+        "restricted_targets": n_restricted,
+        "missing_targets": n_total - n_pass - n_restricted,
         "rewrite_coverage": (n_pass / n_total) if n_total else 1.0,
         "target_coverage": [
             {
                 "file": r.get("file", ""),
                 "function": r.get("function", ""),
                 "status": (
-                    "TRANSFORMED" if r.get("status") == "PASS" else "MISSING_REWRITE"
+                    "TRANSFORMED"
+                    if r.get("status") == "PASS"
+                    else "RESTRICTED"
+                    if r.get("status") == "RESTRICTED"
+                    else "MISSING_REWRITE"
                 ),
                 "details": (
-                    (r.get("verification") or {}).get("summary", "")
+                    "HIGH-risk transformation blocked; original function preserved."
+                    if r.get("status") == "RESTRICTED"
+                    else (r.get("verification") or {}).get("summary", "")
                     if r.get("status") != "PASS"
                     else "Target function transformed."
                 ),
@@ -308,7 +376,28 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
 
     llm = _maybe_parse(ctx.state.get("verifier_output"))
 
-    if not all_pass:
+    transformation_risk: list[dict[str, Any]] = []
+    try:
+        read_write_map = ctx.state.get("read_write_map") or {}
+        target_dir = ctx.state.get("target", "")
+        sandbox_dir = ctx.state.get("sandbox", "")
+        for contract in ctx.state.get("rewrite_contracts", []) or []:
+            report = analyze_transformation(
+                target_dir, sandbox_dir, contract, read_write_map
+            )
+            if report is not None:
+                transformation_risk.append(report.model_dump())
+    except Exception:
+        transformation_risk = []
+
+    restricted_lines = [
+        f"[RESTRICTED] {r.get('file')}::{r.get('function')} — "
+        "HIGH-risk transformation blocked"
+        for r in results
+        if r.get("status") == "RESTRICTED"
+    ]
+
+    if not all_ok:
         vo = {
             "status": "FAIL",
             "category": (
@@ -320,7 +409,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
             "detail": "; ".join(
                 f"{r.get('file')}::{r.get('function')}"
                 for r in results
-                if r.get("status") != "PASS"
+                if r.get("status") not in ("PASS", "RESTRICTED")
             ),
             "suggestion": llm.get("suggestion", "")
             or (
@@ -330,23 +419,30 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         }
     else:
         # Deterministic verification is authoritative: every target transformed
-        # means PASS. The advisory LLM review may add a suggestion, but it must
-        # not flip a deterministic PASS into a FAIL (observed hallucinated
-        # "residual loop ops" on already-batched code). Advisory warnings are
-        # surfaced in `detail`; they never change `status`.
+        # (or safely restricted to its original) means PASS. The advisory LLM
+        # review may add a suggestion, but it must not flip a deterministic PASS
+        # into a FAIL (observed hallucinated "residual loop ops" on already-
+        # batched code). Advisory warnings are surfaced in `detail`; they never
+        # change `status`.
+        detail_parts = [
+            f"[{w.get('code')}] {w.get('message')}" for w in warnings
+        ]
+        detail_parts.extend(restricted_lines)
         vo = {
             "status": "PASS",
             "category": "NONE",
             "reason": det["summary"],
-            "detail": "; ".join(
-                f"[{w.get('code')}] {w.get('message')}" for w in warnings
-            ),
+            "detail": "; ".join(detail_parts),
             "suggestion": llm.get("suggestion", ""),
         }
 
     return Event(
         output=vo,
-        state={"verifier_output": vo, "deterministic_verification": det},
+        state={
+            "verifier_output": vo,
+            "deterministic_verification": det,
+            "transformation_risk": transformation_risk,
+        },
     )
 
 

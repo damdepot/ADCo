@@ -19,7 +19,11 @@ def _maybe_parse(value: object) -> dict:
             return {}
     if hasattr(value, "model_dump"):
         return value.model_dump()
-    return value if isinstance(value, dict) else {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_maybe_parse(item) for item in value]
+    return {}
 
 
 def make_buffer_callback(buffer_time: float = 0.0):

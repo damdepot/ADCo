@@ -10,6 +10,11 @@ from .ast_models import (
     SourceLocation,
     SqlOperation,
 )
+from .db_interaction_models import (
+    FunctionDbModel,
+    SqlModel,
+    StatementModel,
+)
 from .feedback_models import (
     RepairIssue,
     build_repair_issues,
@@ -27,6 +32,9 @@ from .dependency_models import (
 from .rewrite_models import (
     RewriteContract,
     RewriteTarget,
+)
+from .transformation_risk_models import (
+    RiskReport,
 )
 from .verification_models import (
     CheckStatus,
@@ -49,6 +57,9 @@ __all__ = [
     "FunctionAnalysis",
     "ClassAnalysis",
     "FileAnalysis",
+    "SqlModel",
+    "StatementModel",
+    "FunctionDbModel",
     "DependencyType",
     "CertaintyLevel",
     "NodeKind",
@@ -58,6 +69,7 @@ __all__ = [
     "DependencySlice",
     "RewriteTarget",
     "RewriteContract",
+    "RiskReport",
     "VerificationStatus",
     "ViolationSeverity",
     "CheckStatus",

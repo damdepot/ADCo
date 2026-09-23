@@ -40,6 +40,24 @@ class _FunctionFinder(ast.NodeVisitor):
         self.scope_stack.pop()
 
 
+def function_ast_dump(source_code: str, target_name: str) -> Optional[str]:
+    """Return a normalized AST dump of a function, or ``None`` if not found.
+
+    Used to compare the *structure* of a function before and after a rewrite:
+    textual-only changes (whitespace, comments, formatting) produce the same
+    dump and therefore are not real rewrites. This mirrors the AST comparison
+    performed by the deterministic verifier.
+    """
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return None
+    target = _find_target_function(tree, target_name)
+    if target is None:
+        return None
+    return ast.dump(target[2])
+
+
 def _find_target_function(
     tree: ast.AST, target_name: str
 ) -> Optional[Tuple[str, str, Union[ast.FunctionDef, ast.AsyncFunctionDef]]]:

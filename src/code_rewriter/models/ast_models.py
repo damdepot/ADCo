@@ -37,6 +37,7 @@ class DatabaseOperation(BaseModel):
     operation_type: DbOperationType = Field(description="The categorized type of the database operation")
     sql_operation: SqlOperation = Field(description="The type of SQL statement being executed")
     sql: Optional[str] = Field(default=None, description="The statically determinable SQL string, if available")
+    sql_template: Optional[str] = Field(default=None, description="The unformatted SQL template when the executed SQL was produced by %-formatting a template that contains runtime identifiers/placeholders (e.g. 'S_DIST_%02d', '%%s'). Display this to the optimizer; `sql` is the best-effort resolved/substituted string.")
     containing_function: Optional[str] = Field(default=None, description="The fully qualified name of the function containing this operation")
     inside_loop: bool = Field(default=False, description="Whether this operation is performed inside a loop")
     loop_variables: List[str] = Field(default_factory=list, description="Variables bound by the enclosing loops")

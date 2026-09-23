@@ -487,6 +487,131 @@ def test_make_orchestrate_llm_fail_with_evidence_retries(tmp_path):
     assert results[0]["status"] == "PASS"
 
 
+def _restricted_run(tmp_path, risk_rejections):
+    """Drive make_orchestrate with an optimizer that writes nothing."""
+    target_dir = tmp_path / "target"
+    sandbox = tmp_path / "sandbox"
+    target_dir.mkdir()
+    sandbox.mkdir()
+    code = "def get_users(ids):\n    return [fetch(x) for x in ids]\n"
+    (target_dir / "repo.py").write_text(code)
+    (sandbox / "repo.py").write_text(code)
+
+    def optimizer(ctx, node_input=None):
+        pass
+
+    def verify(ctx, node_input=None):
+        return {
+            "status": "FAIL",
+            "violations": [
+                {"code": "MISSING_REWRITE", "severity": "ERROR", "message": "unchanged"}
+            ],
+        }
+
+    state = {
+        "target": str(target_dir),
+        "sandbox": str(sandbox),
+        "rewrite_contracts": [
+            {"target": {"file": "repo.py", "qualified_function": "get_users"}}
+        ],
+    }
+    if risk_rejections is not None:
+        state["risk_rejections"] = risk_rejections
+    ctx = _FakeAsyncContext(state)
+    orchestrate = make_orchestrate(optimizer, verify, max_attempts=2)
+    events = asyncio.run(_drive(orchestrate, ctx))
+    return ctx, events
+
+
+def test_make_orchestrate_restricted_when_high_risk_blocked(tmp_path):
+    """A blocked HIGH-risk target whose original survives becomes RESTRICTED."""
+    ctx, events = _restricted_run(tmp_path, ["get_users"])
+    results = events[-1].actions.state_delta["target_results"]
+    assert results[0]["status"] == "RESTRICTED"
+    assert results[0]["verification"]["status"] == "RESTRICTED"
+
+    ctx.state["target_results"] = results
+    event = finalize(ctx)
+    det = event.actions.state_delta["deterministic_verification"]
+    assert det["status"] == "PASS"
+    assert det["restricted_targets"] == 1
+    assert det["transformed_targets"] == 0
+    vo = event.actions.state_delta["verifier_output"]
+    assert vo["status"] == "PASS"
+    assert "[RESTRICTED] repo.py::get_users" in vo["detail"]
+
+
+def test_make_orchestrate_unrejected_failure_stays_fail(tmp_path):
+    """Without a recorded risk rejection an unchanged target is an ordinary FAIL."""
+    _, events = _restricted_run(tmp_path, None)
+    results = events[-1].actions.state_delta["target_results"]
+    assert results[0]["status"] == "FAIL"
+
+
+def test_make_orchestrate_rejected_but_modified_stays_fail(tmp_path):
+    """RESTRICTED requires the original to be intact; a kept rewrite stays FAIL."""
+    target_dir = tmp_path / "target"
+    sandbox = tmp_path / "sandbox"
+    target_dir.mkdir()
+    sandbox.mkdir()
+    code = "def get_users(ids):\n    return [fetch(x) for x in ids]\n"
+    (target_dir / "repo.py").write_text(code)
+    (sandbox / "repo.py").write_text("def get_users(ids):\n    return fetch_all(ids)\n")
+
+    def optimizer(ctx, node_input=None):
+        pass
+
+    def verify(ctx, node_input=None):
+        return {
+            "status": "FAIL",
+            "violations": [
+                {"code": "MISSING_REWRITE", "severity": "ERROR", "message": "bad"}
+            ],
+        }
+
+    ctx = _FakeAsyncContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox),
+        "rewrite_contracts": [
+            {"target": {"file": "repo.py", "qualified_function": "get_users"}}
+        ],
+        "risk_rejections": ["get_users"],
+    })
+    orchestrate = make_orchestrate(optimizer, verify, max_attempts=1)
+    events = asyncio.run(_drive(orchestrate, ctx))
+    results = events[-1].actions.state_delta["target_results"]
+    assert results[0]["status"] == "FAIL"
+
+
+def test_finalize_ordinary_fail_still_fails():
+    """A RESTRICTED-aware finalize must not accept an ordinary FAIL."""
+    ctx = _FakeContext({
+        "target_results": [
+            {
+                "file": "repo.py",
+                "function": "get_users",
+                "status": "FAIL",
+                "verification": {
+                    "status": "FAIL",
+                    "summary": "residual loop",
+                    "violations": [
+                        {
+                            "code": "STRATEGY_NOT_APPLIED",
+                            "severity": "ERROR",
+                            "message": "loop remains",
+                        }
+                    ],
+                },
+            }
+        ],
+        "verifier_output": {"status": "PASS", "category": "NONE"},
+    })
+    event = finalize(ctx)
+    delta = event.actions.state_delta
+    assert delta["deterministic_verification"]["status"] == "FAIL"
+    assert delta["deterministic_verification"]["restricted_targets"] == 0
+
+
 def test_make_orchestrate_llm_fail_without_evidence_is_ignored(tmp_path):
     """An unevidenced LLM FAIL must not block the deterministic PASS."""
     sandbox = tmp_path / "sandbox"

@@ -84,7 +84,7 @@ directly, e.g.:
    comprehension matching the original row-to-dict mapping."
 
 ## Failure categories
-- `strategy_not_applied`: Optimization contracts not met, untransformed target functions, or residual loop queries. Strict-zero is enforced: even a single remaining `cursor.execute` inside a loop is a FAIL. The suggestion MUST name the specific function(s), the residual op count, and whether Pattern 6 (composite-key batch) applies. Example:
+- `strategy_not_applied`: Optimization contracts not met, untransformed target functions, or residual loop queries. Strict-zero is enforced for per-row work: a `cursor.execute`/`executemany` executed once per row (or per iteration) inside a loop is a FAIL, but a single set-based batch query (`IN (...)`/`ANY(%s)`) issued once per group outside the per-row loop is acceptable. The suggestion MUST name the specific function(s), the residual op count, and whether Pattern 6 (composite-key batch) applies. Example:
   "Apply Pattern 6 to PostgresDriver.doNewOrder: pre-format col_name = 's_dist_%02d' % d_id, batch all (S_I_ID, S_W_ID) pairs with (S_I_ID, S_W_ID) IN ((%s,%s),...) before the loop. Required: 0 cursor.execute inside the loop. Residual: 1 op in doNewOrder."
 - `not_executable`: Crashes on startup due to code errors (not env issues)
 - `name_error`: Undefined variables, missing imports
