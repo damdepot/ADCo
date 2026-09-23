@@ -17,6 +17,7 @@ from .dependency_graph import build_dependency_graph, DependencyGraph
 from .sql_analysis import (
     row_index_violations,
     planner_unfriendly_sql,
+    implicit_join_sql,
     multi_statement_sql,
     duplicate_where_sql,
     unknown_query_key_sql,
@@ -415,6 +416,30 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
                 f"Function {site['function']} comma-cross-joins a derived table in FROM, "
                 "which can raise per-execution planning cost. Prefer a scalar subquery in "
                 "WHERE or an explicit JOIN instead."
+            ),
+        ))
+
+    opt_implicit = implicit_join_sql(optimized_source)
+    orig_implicit = implicit_join_sql(original_source)
+    orig_implicit_keys = {(v["function"], v["sql"]) for v in orig_implicit}
+    seen_implicit = set()
+    for site in opt_implicit:
+        dedup_key = (site["function"], site["sql"])
+        if dedup_key in seen_implicit or dedup_key in orig_implicit_keys:
+            continue
+        if not _in_target_regions(site["function"]):
+            continue
+        seen_implicit.add(dedup_key)
+        snippet = " ".join(site["sql"].split())
+        if len(snippet) > 160:
+            snippet = snippet[:157] + "..."
+        violations.append(VerificationViolation(
+            code="IMPLICIT_CROSS_JOIN",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} comma-joins {site['relations']} relations in FROM "
+                f"({snippet}); implicit cross joins make the planner enumerate join orders. "
+                "Use explicit JOIN ... ON (or a scalar subquery) instead."
             ),
         ))
 

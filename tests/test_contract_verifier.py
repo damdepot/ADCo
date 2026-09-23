@@ -334,5 +334,32 @@ def do_delivery(cursor, item_ids):
     assert any(v.code == "UNKNOWN_QUERY_KEY" for v in result.violations)
 
 
+def test_verify_rejects_implicit_cross_join():
+    orig = """
+def get_stock(cursor, item_ids):
+    result = {}
+    for item_id in item_ids:
+        cursor.execute("SELECT S_QUANTITY FROM STOCK WHERE S_I_ID = %s", (item_id,))
+        result[item_id] = cursor.fetchone()[0]
+    return result
+"""
+    opt = """
+def get_stock(cursor, item_ids):
+    sql = "SELECT COUNT(DISTINCT OL_I_ID) FROM ORDER_LINE, STOCK, DISTRICT WHERE OL_W_ID = D_W_ID AND S_I_ID = OL_I_ID"
+    cursor.execute(sql, (item_ids,))
+    return {row[0]: row[1] for row in cursor.fetchall()}
+"""
+    contract = RewriteContract(
+        rewrite_id="test_implicit_join",
+        target=RewriteTarget(file="t.py", function="get_stock"),
+        pattern="N+1 Query",
+        strategy="Query Batching",
+        allowed_regions=["get_stock"],
+    )
+    result = verify_contract(orig, opt, contract)
+    assert result.status == "FAIL"
+    assert any(v.code == "IMPLICIT_CROSS_JOIN" for v in result.violations)
+
+
 
 

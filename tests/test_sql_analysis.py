@@ -1,6 +1,7 @@
 from src.code_rewriter.tools.sql_analysis import (
     duplicate_where_sql,
     find_select_column_count,
+    implicit_join_sql,
     multi_statement_sql,
     planner_unfriendly_sql,
     row_index_violations,
@@ -163,3 +164,51 @@ def do_delivery(cursor, w_id):
     cursor.execute(d["missingKey"], [w_id])
 '''
     assert unknown_query_key_sql(source) == []
+
+
+def test_implicit_join_three_relations_flagged():
+    source = '''
+def stock_level(cursor, w_id, d_id):
+    cursor.execute(
+        "SELECT COUNT(DISTINCT OL_I_ID) FROM ORDER_LINE, STOCK, DISTRICT "
+        "WHERE OL_W_ID = D_W_ID AND S_I_ID = OL_I_ID",
+        (w_id, d_id),
+    )
+'''
+    violations = implicit_join_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["function"] == "stock_level"
+    assert violations[0]["relations"] == 3
+
+
+def test_implicit_join_two_relations_not_flagged():
+    source = '''
+def lookup(cursor, x):
+    cursor.execute("SELECT a FROM t, u WHERE t.id = u.id", (x,))
+'''
+    assert implicit_join_sql(source) == []
+
+
+def test_explicit_join_not_flagged():
+    source = '''
+def lookup(cursor, x):
+    cursor.execute("SELECT a FROM t JOIN u ON t.id = u.id JOIN v ON u.id = v.id", (x,))
+'''
+    assert implicit_join_sql(source) == []
+
+
+def test_derived_table_two_relations_not_flagged():
+    source = '''
+def lookup(cursor, x):
+    cursor.execute("SELECT a FROM (SELECT a, b FROM t) d, u WHERE d.a = u.a", (x,))
+'''
+    assert implicit_join_sql(source) == []
+
+
+def test_subquery_comma_inside_parens_not_flagged():
+    source = '''
+def lookup(cursor, x):
+    cursor.execute("SELECT a FROM t WHERE a IN (SELECT b FROM u, v WHERE u.id = v.id)", (x,))
+'''
+    assert implicit_join_sql(source) == []
+

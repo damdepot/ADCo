@@ -24,6 +24,11 @@ _CROSS_JOIN_DERIVED_RE = re.compile(r"\bFROM\b[\s\S]*?,\s*\(\s*SELECT\b", re.IGN
 _FETCH_METHODS = {"fetchall", "fetchone", "fetchmany"}
 _EXECUTE_METHODS = {"execute", "executemany"}
 _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+_IMPLICIT_JOIN_MIN_RELATIONS = 3
+_FROM_CLAUSE_END_KEYWORDS = (
+    "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "EXCEPT", "INTERSECT",
+    "WINDOW", "QUALIFY", "RETURNING", "FETCH", "FOR",
+)
 
 
 def _is_call_attr(node: ast.AST, names: set) -> bool:
@@ -152,6 +157,36 @@ def _top_level_segments(sql: str) -> List[str]:
         i += 1
     segments.append("".join(current))
     return segments
+
+
+def _scan_top_level_semicolon(sql: str, start: int) -> int:
+    """Return the index of the first ``;`` at paren-depth 0, or -1."""
+    depth = 0
+    quote: Optional[str] = None
+    i = start
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if quote is not None:
+            if c == quote:
+                if i + 1 < n and sql[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if c in ("'", '"', "`"):
+            quote = c
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == ";" and depth == 0:
+            return i
+        i += 1
+    return -1
 
 
 def find_select_column_count(sql: str) -> Optional[int]:
@@ -444,6 +479,46 @@ def planner_unfriendly_sql(source: str) -> List[dict]:
                 continue
             seen.add(key)
             violations.append({"function": name, "sql": sql, "line": line})
+    return violations
+
+
+def implicit_join_sql(source: str) -> List[dict]:
+    """Resolved SQL whose top-level FROM list comma-joins 3+ relations."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    module_dicts = collect_module_dicts(tree)
+    violations: List[dict] = []
+    seen = set()
+    for name, node in _iter_functions(tree):
+        analyzer = _FunctionAnalyzer(name, module_dicts)
+        analyzer.analyze(node.body)
+        for sql, line in analyzer.execute_sqls:
+            if SENTINEL in sql:
+                continue
+            from_pos = _scan_keyword(sql, "FROM", 0, 0)
+            if from_pos < 0:
+                continue
+            end = len(sql)
+            for keyword in _FROM_CLAUSE_END_KEYWORDS:
+                pos = _scan_keyword(sql, keyword, from_pos + 4, 0)
+                if pos >= 0 and pos < end:
+                    end = pos
+            semicolon = _scan_top_level_semicolon(sql, from_pos + 4)
+            if semicolon >= 0 and semicolon < end:
+                end = semicolon
+            from_clause = sql[from_pos + 4 : end]
+            relations = len([item for item in _split_top_level(from_clause) if item.strip()])
+            if relations < _IMPLICIT_JOIN_MIN_RELATIONS:
+                continue
+            key = (name, sql)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(
+                {"function": name, "sql": sql, "line": line, "relations": relations}
+            )
     return violations
 
 

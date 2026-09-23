@@ -27,6 +27,7 @@ The `replace_function` tool will REJECT your output if it is identical to the or
 - When batching/combining, REBUILD the whole statement. Never concatenate a fragment onto a template that already contains a `WHERE` clause (that yields `... WHERE a = %s WHERE b IN (...)`). Strip/replace the original `WHERE` clause or write the full statement explicitly.
 - The number of placeholders (`%s` or `?`) in the SQL MUST exactly equal the number of parameter values passed. A mismatch raises `IndexError: list index out of range` at runtime.
 - Keep combined queries planner-friendly: prefer a simple `JOIN` or scalar subqueries in `WHERE`; do NOT cross-join a derived table in `FROM` (e.g. `FROM t, (SELECT ...) d WHERE ...`). Such forms can blow up query planning time per execution and make the "optimized" code slower. When in doubt, keep the query shape close to the original.
+- Avoid implicit comma joins over 3+ tables (`FROM a, b, c WHERE ...`); use explicit `JOIN ... ON` (or a scalar subquery) instead — otherwise the planner enumerates cross-product join orders and the "optimized" query can be far slower.
 
 ## Quality rules
 

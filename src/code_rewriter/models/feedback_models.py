@@ -24,6 +24,7 @@ _FIX_HINTS: dict[str, str] = {
     "MULTI_STATEMENT_EXECUTE": "One execute() per statement.",
     "UNKNOWN_QUERY_KEY": "Reuse an existing query key verbatim.",
     "ROW_INDEX_OUT_OF_RANGE": "Include the key column(s) in the SELECT or fix the row indices.",
+    "IMPLICIT_CROSS_JOIN": "Replace the implicit comma join of 3+ tables with explicit JOIN ... ON (or a scalar subquery).",
 }
 
 
