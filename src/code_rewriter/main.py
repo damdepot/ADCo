@@ -61,6 +61,7 @@ def _write_output_result(output_path: str, state: dict[str, Any], model: str = "
             "optimizer_output": _maybe_parse(state.get("optimizer_output")),
             "verifier_output": _maybe_parse(state.get("verifier_output")),
             "deterministic_verification": _maybe_parse(state.get("deterministic_verification", {})),
+            "optimizer_attempts": state.get("optimizer_attempts", []),
             "transformation_risk": _maybe_parse(state.get("transformation_risk", [])),
         }
     }

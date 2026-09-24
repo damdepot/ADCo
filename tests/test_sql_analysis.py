@@ -263,6 +263,38 @@ def f(cursor, x):
     assert placeholder_param_mismatch_sql(source) == []
 
 
+def test_placeholder_param_fstring_variable_not_flagged():
+    source = '''
+def doStockLevel(self, params):
+    sub_query = "SELECT O_ID FROM ORDER WHERE O_W_ID = %s AND O_D_ID = %s"
+    combined_sql = f"""
+        SELECT COUNT(DISTINCT(OL_I_ID)) FROM ORDER_LINE, STOCK
+        WHERE OL_W_ID = %s
+          AND OL_D_ID = %s
+          AND OL_O_ID < ({sub_query})
+          AND OL_O_ID >= (({sub_query}) - 20)
+          AND S_W_ID = %s
+          AND S_QUANTITY < %s
+    """
+    self.cursor.execute(
+        combined_sql, [1, 2, 3, 4, 5, 6, 7, 8]
+    )
+'''
+    assert placeholder_param_mismatch_sql(source) == []
+
+
+def test_placeholder_param_variable_constant_still_flagged():
+    source = '''
+def f(cursor, x):
+    sql = "SELECT a FROM t WHERE a = %s AND b = %s"
+    cursor.execute(sql, (x,))
+'''
+    violations = placeholder_param_mismatch_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["placeholders"] == 2
+    assert violations[0]["params"] == 1
+
+
 def test_placeholder_param_mismatch_syntax_error():
     assert placeholder_param_mismatch_sql("def f(:") == []
 

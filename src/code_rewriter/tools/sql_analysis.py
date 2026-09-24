@@ -320,6 +320,7 @@ class _FunctionAnalyzer:
         self.function_name = function_name
         self.module_dicts = module_dicts
         self.local_vars: Dict[str, Any] = {}
+        self.exact_vars: Dict[str, bool] = {}
         self.last_sql: Optional[str] = None
         self.row_bindings: Dict[str, str] = {}
         self.row_reads: Dict[str, List[tuple]] = {}
@@ -331,6 +332,23 @@ class _FunctionAnalyzer:
 
     def eval(self, node: Optional[ast.AST]) -> Any:
         return resolve(node, self.local_vars, self.module_dicts)
+
+    def is_exact(self, node: Optional[ast.AST]) -> bool:
+        """Whether a SQL expression is a pure constant with no interpolation.
+
+        A ``Name`` is resolved through its assignment provenance so that an
+        f-string/``.replace``/``.join`` bound to a variable is still treated as
+        interpolated (its non-constant fields are invisible in the resolved
+        string, so the placeholder count would be unreliable).
+        """
+        if node is None:
+            return True
+        if isinstance(node, ast.Name):
+            return self.exact_vars.get(node.id, False)
+        for child in ast.walk(node):
+            if isinstance(child, (ast.JoinedStr, ast.Call)):
+                return False
+        return True
 
     def analyze(self, body: List[ast.stmt]) -> None:
         self.process_body(body)
@@ -352,6 +370,8 @@ class _FunctionAnalyzer:
                         self.local_vars[stmt.target.id] = self.last_sql
                     else:
                         self.local_vars[stmt.target.id] = resolved
+                        if isinstance(resolved, str):
+                            self.exact_vars[stmt.target.id] = self.is_exact(stmt.value)
                 self.collect_row_reads(stmt.value)
         elif isinstance(stmt, ast.AugAssign):
             self.collect_row_reads(stmt.value)
@@ -413,6 +433,8 @@ class _FunctionAnalyzer:
         for target in stmt.targets:
             if isinstance(target, ast.Name):
                 self.local_vars[target.id] = self.last_sql if is_fetch else resolved
+                if isinstance(resolved, str) and not is_fetch:
+                    self.exact_vars[target.id] = self.is_exact(value)
         self.collect_row_reads(value)
         self._process_row_unpack(stmt)
 
@@ -723,13 +745,6 @@ def _placeholder_count(sql: str) -> tuple:
     )
 
 
-def _sql_placeholder_exact(node: ast.AST) -> bool:
-    for child in ast.walk(node):
-        if isinstance(child, (ast.JoinedStr, ast.Call)):
-            return False
-    return True
-
-
 def _static_params_count(node: Optional[ast.AST]) -> Optional[int]:
     if node is None:
         return 0
@@ -759,7 +774,7 @@ def placeholder_param_mismatch_sql(source: str) -> List[dict]:
                 continue
             if not isinstance(sql, str) or SENTINEL in sql:
                 continue
-            if not _sql_placeholder_exact(sql_node):
+            if not analyzer.is_exact(sql_node):
                 continue
             positional, named = _placeholder_count(sql)
             if named:

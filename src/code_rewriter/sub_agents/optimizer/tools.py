@@ -1,8 +1,10 @@
 """Tools for the optimizer agent — optimization context and surgical function replacement."""
 
 import difflib
+import hashlib
 import os
 import re
+import textwrap
 from pathlib import Path
 from google.adk.tools import ToolContext
 
@@ -12,7 +14,10 @@ from src.code_rewriter._common import (
     format_intent_lines,
 )
 from src.code_rewriter.models.feedback_models import (
+    OptimizerAttempt,
     build_repair_issues,
+    record_optimizer_attempt,
+    render_optimizer_attempts,
     render_repair_request,
 )
 from src.code_rewriter.models.rewrite_models import RewriteContract
@@ -31,6 +36,115 @@ _EXT_TO_COMMENT = {
     ".py": "#",
     ".sql": "--",
 }
+
+_NO_PROGRESS_LIMIT = 3
+
+
+def _bare_function(name: str) -> str:
+    return (name or "").strip().rsplit(".", 1)[-1]
+
+
+def _candidate_diff(content: str, function_name: str, new_function_code: str) -> str:
+    """Render a unified diff between the current function and the candidate."""
+    current = extract_function_source_by_name(content, function_name)
+    if not current:
+        return ""
+    diff = difflib.unified_diff(
+        current.splitlines(),
+        new_function_code.splitlines(),
+        fromfile="current",
+        tofile="candidate",
+        lineterm="",
+    )
+    return "\n".join(diff)
+
+
+def _record_attempt(
+    tool_context: ToolContext,
+    path: str,
+    function_name: str,
+    outcome: str,
+    codes: list,
+    message: str,
+    candidate_key: str,
+    diff: str,
+) -> None:
+    """Persist one optimizer attempt for the target function."""
+    attempt = OptimizerAttempt(
+        file=path,
+        function=function_name,
+        outcome=outcome,
+        codes=list(codes),
+        message=message,
+        attempt=tool_context.state.get("attempt_count"),
+        candidate_key=candidate_key,
+        diff=diff,
+    )
+    record_optimizer_attempt(tool_context.state, attempt)
+
+
+def _prior_reject_count(
+    tool_context: ToolContext, path: str, function_name: str, candidate_key: str
+) -> int:
+    """Count prior REJECTED attempts matching this exact candidate."""
+    entries = tool_context.state.get("optimizer_attempts")
+    if not isinstance(entries, list):
+        return 0
+    bare = _bare_function(function_name)
+    count = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("outcome") != "REJECTED":
+            continue
+        if entry.get("file") != path:
+            continue
+        entry_bare = entry.get("bare_function") or _bare_function(
+            entry.get("function")
+        )
+        if entry_bare != bare:
+            continue
+        if entry.get("candidate_key") != candidate_key:
+            continue
+        count += 1
+    return count
+
+
+def _reject(
+    tool_context: ToolContext,
+    path: str,
+    function_name: str,
+    codes: list,
+    message: str,
+    candidate_key: str,
+    diff: str,
+) -> str:
+    """Record a rejected attempt and build the feedback message."""
+    count = _prior_reject_count(tool_context, path, function_name, candidate_key)
+    _record_attempt(
+        tool_context, path, function_name, "REJECTED", codes, message, candidate_key, diff
+    )
+    parts = [message]
+    if count >= 1:
+        parts.append(
+            f"\n\nThis exact candidate has already been rejected {count} time(s). "
+            f"Do NOT resubmit it — you MUST change the code so it addresses: "
+            f"{', '.join(codes) or 'the reported error'}."
+        )
+    if count + 1 >= _NO_PROGRESS_LIMIT:
+        parts.append(
+            "\n\nNO PROGRESS: you have repeatedly resubmitted an identical candidate. "
+            "Produce a materially DIFFERENT implementation, or stop calling "
+            "replace_function and return status=FAIL."
+        )
+        tool_context.state["optimizer_no_progress"] = {
+            "file": path,
+            "function": function_name,
+        }
+    history = render_optimizer_attempts(tool_context.state, path, function_name)
+    if history:
+        parts.append("\n\n" + history)
+    return "".join(parts)
 
 
 def _add_tag(path: str, content: str, sandbox_id: str) -> str:
@@ -134,43 +248,45 @@ def _new_error_violations(before, after) -> list:
 
 def _write_time_gate(
     tool_context: ToolContext, path: str, current_source: str, candidate_source: str
-) -> str:
+) -> tuple[list[str], str]:
     """Reject a candidate that introduces NEW verification errors (shift-left).
 
-    Returns an error string when the candidate must be rejected, else "".
+    Returns ``(codes, error)`` when the candidate must be rejected, else
+    ``([], "")``.
     """
     contract_data = tool_context.state.get("current_contract")
     if not isinstance(contract_data, dict) or not contract_data:
-        return ""
+        return ([], "")
 
     target_dir = tool_context.state.get("target", "")
     if not target_dir:
-        return ""
+        return ([], "")
 
     original_path = os.path.join(target_dir, path)
     if not os.path.isfile(original_path):
-        return ""
+        return ([], "")
 
     try:
         original_source = Path(original_path).read_text(encoding="utf-8", errors="replace")
     except Exception:
-        return ""
+        return ([], "")
 
     try:
         contract = RewriteContract(**contract_data)
     except Exception:
-        return ""
+        return ([], "")
 
     try:
         before = verify_contract(original_source, current_source, contract)
         after = verify_contract(original_source, candidate_source, contract)
     except Exception:
-        return ""
+        return ([], "")
 
     new_errors = _new_error_violations(before, after)
     if not new_errors:
-        return ""
+        return ([], "")
 
+    codes = list(dict.fromkeys(v.code for v in new_errors))
     lines = [
         f"ERROR: rejected — this change introduces {len(new_errors)} verification error(s):"
     ]
@@ -183,56 +299,56 @@ def _write_time_gate(
             "in Python and query once per group."
         )
     lines.append("Fix these and call replace_function again.")
-    return "\n".join(lines)
+    return (codes, "\n".join(lines))
 
 
 def _risk_block(
     tool_context: ToolContext, path: str, candidate_source: str
-) -> str:
+) -> tuple[list[str], str]:
     """Block a candidate that is a HIGH-risk transformation.
 
-    Returns an error string when the candidate must be rejected, else "".  Any
-    failure while analysing risk is treated as "no block" so only a genuine HIGH
-    classification can stop a write.
+    Returns ``(codes, error)`` when the candidate must be rejected, else
+    ``([], "")``.  Any failure while analysing risk is treated as "no block" so
+    only a genuine HIGH classification can stop a write.
     """
     read_write_map = tool_context.state.get("read_write_map")
     if not read_write_map:
-        return ""
+        return ([], "")
 
     contract_data = tool_context.state.get("current_contract")
     if not isinstance(contract_data, dict) or not contract_data:
-        return ""
+        return ([], "")
 
     target = contract_data.get("target")
     if not isinstance(target, dict):
-        return ""
+        return ([], "")
     function = target.get("qualified_function") or target.get("function") or ""
     if not function:
-        return ""
+        return ([], "")
 
     target_dir = tool_context.state.get("target", "")
     if not target_dir:
-        return ""
+        return ([], "")
     original_path = os.path.join(target_dir, path)
     if not os.path.isfile(original_path):
-        return ""
+        return ([], "")
 
     try:
         original_source = Path(original_path).read_text(
             encoding="utf-8", errors="replace"
         )
     except Exception:
-        return ""
+        return ([], "")
 
     try:
         risk = analyze_candidate(
             original_source, candidate_source, function, read_write_map
         )
     except Exception:
-        return ""
+        return ([], "")
 
     if risk is None or risk.risk != "HIGH":
-        return ""
+        return ([], "")
 
     rejections = tool_context.state.setdefault("risk_rejections", [])
     if function not in rejections:
@@ -248,7 +364,7 @@ def _risk_block(
         "top-level join), or keep the statements separate. Do not merge a "
         "value-dependent lookup into a larger join."
     )
-    return "\n".join(lines)
+    return (["HIGH_TRANSFORMATION_RISK"], "\n".join(lines))
 
 
 def replace_function(
@@ -281,34 +397,59 @@ def replace_function(
     if not success:
         return f"ERROR: Failed to replace function '{function_name}': {err}"
 
+    original_dump = function_ast_dump(content, function_name)
+    candidate_dump = function_ast_dump(reconstructed, function_name)
+    candidate_key = candidate_dump or (
+        "sha256:" + hashlib.sha256(new_function_code.encode("utf-8")).hexdigest()
+    )
+    diff = _candidate_diff(content, function_name, new_function_code)
+
     reconstructed_untagged = _ADCO_TAG_RE.sub("", reconstructed)
     if reconstructed_untagged == _ADCO_TAG_RE.sub("", content):
-        return (
-            f"ERROR: replacement for '{function_name}' in {path} is identical to the original. "
-            f"You must ACTUALLY OPTIMIZE the database interaction code — apply batching, "
-            f"hoist queries out of loops, and re-call replace_function."
+        return _reject(
+            tool_context,
+            path,
+            function_name,
+            ["IDENTICAL_REWRITE"],
+            (
+                f"ERROR: replacement for '{function_name}' in {path} is identical to the original. "
+                f"You must ACTUALLY OPTIMIZE the database interaction code — apply batching, "
+                f"hoist queries out of loops, and re-call replace_function."
+            ),
+            candidate_key,
+            diff,
         )
 
     # Text can differ while the function's AST is unchanged (whitespace/comments/
     # formatting only). The deterministic verifier compares ASTs, so reject such
     # no-op rewrites here to keep the write gate and the verifier consistent.
-    original_dump = function_ast_dump(content, function_name)
-    candidate_dump = function_ast_dump(reconstructed, function_name)
     if original_dump is not None and original_dump == candidate_dump:
-        return (
-            f"ERROR: replacement for '{function_name}' in {path} is structurally "
-            f"(AST) identical to the original — only formatting/comments changed. "
-            f"You must ACTUALLY change the database interaction code (queries, "
-            f"batching, loop structure) and re-call replace_function."
+        return _reject(
+            tool_context,
+            path,
+            function_name,
+            ["AST_IDENTICAL"],
+            (
+                f"ERROR: replacement for '{function_name}' in {path} is structurally "
+                f"(AST) identical to the original — only formatting/comments changed. "
+                f"You must ACTUALLY change the database interaction code (queries, "
+                f"batching, loop structure) and re-call replace_function."
+            ),
+            candidate_key,
+            diff,
         )
 
-    rejection = _write_time_gate(tool_context, path, content, reconstructed)
+    codes, rejection = _write_time_gate(tool_context, path, content, reconstructed)
     if rejection:
-        return rejection
+        return _reject(
+            tool_context, path, function_name, codes, rejection, candidate_key, diff
+        )
 
-    risk_block = _risk_block(tool_context, path, reconstructed)
+    codes, risk_block = _risk_block(tool_context, path, reconstructed)
     if risk_block:
-        return risk_block
+        return _reject(
+            tool_context, path, function_name, codes, risk_block, candidate_key, diff
+        )
 
     sandbox_id = os.path.basename(sandbox) if sandbox else ""
     reconstructed = _add_tag(path, reconstructed, sandbox_id)
@@ -321,6 +462,10 @@ def replace_function(
     modified_files = tool_context.state.setdefault("modified_files", [])
     if path not in modified_files:
         modified_files.append(path)
+
+    _record_attempt(
+        tool_context, path, function_name, "APPLIED", [], "applied", candidate_key, diff
+    )
 
     return (
         f"Successfully replaced function '{function_name}' in '{path}'"
@@ -384,8 +529,25 @@ def _render_previous_attempt(
 
     sections = ["## Your Previous Attempt\n```python\n" + previous + "\n```"]
 
+    baseline = original_source or ""
+    target = state.get("target", "")
+    if target and file:
+        try:
+            target_source = Path(os.path.join(target, file)).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except Exception:
+            target_source = ""
+        extracted_original = (
+            extract_function_source_by_name(target_source, qualified)
+            if target_source
+            else ""
+        )
+        if extracted_original:
+            baseline = extracted_original
+
     diff = difflib.unified_diff(
-        (original_source or "").splitlines(),
+        baseline.splitlines(),
         previous.splitlines(),
         fromfile="original",
         tofile="sandbox",
@@ -394,6 +556,46 @@ def _render_previous_attempt(
     diff_text = "\n".join(diff) or "(no changes)"
     sections.append("## Diff vs Original\n```diff\n" + diff_text + "\n```")
     return sections
+
+
+def _no_rewrite_directive(
+    state: dict, file: str, qualified: str, original_source: str
+) -> str:
+    """Emit a hard directive when a prior attempt left the target unchanged."""
+    if (state.get("attempt_count") or 0) <= 1:
+        return ""
+    sandbox = state.get("sandbox", "")
+    if not sandbox or not file:
+        return ""
+    full = os.path.join(sandbox, file)
+    if not os.path.isfile(full):
+        return ""
+    try:
+        sandbox_source = Path(full).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    previous = extract_function_source_by_name(sandbox_source, qualified)
+    if not previous:
+        return ""
+    bare = qualified.rsplit(".", 1)[-1]
+    previous_dump = function_ast_dump(sandbox_source, bare)
+    original_dump = function_ast_dump(textwrap.dedent(original_source or ""), bare)
+    if (
+        previous_dump is None
+        or original_dump is None
+        or previous_dump != original_dump
+    ):
+        return ""
+    return (
+        "## CRITICAL: No rewrite applied\n"
+        f"The sandbox function `{qualified}` is IDENTICAL to the original — your "
+        "previous run did not successfully call `replace_function`. Returning a "
+        "summary alone is NOT acceptable. You MUST call "
+        "`replace_function(file, qualified_function, new_function_code)` with a "
+        "complete, materially different implementation and keep calling it until it "
+        "returns `Successfully replaced`. If a rewrite is genuinely impossible, make "
+        "your best valid attempt rather than finishing with no tool call."
+    )
 
 
 def _resolve_target_context(
@@ -499,6 +701,18 @@ def get_optimization_context(tool_context: ToolContext) -> str:
             tool_context.state, file, display_function, function_source
         )
     )
+
+    no_rewrite = _no_rewrite_directive(
+        tool_context.state, file, display_function, function_source
+    )
+    if no_rewrite:
+        sections.append(no_rewrite)
+
+    attempt_history = render_optimizer_attempts(
+        tool_context.state, file, display_function
+    )
+    if attempt_history:
+        sections.append(attempt_history)
 
     query_catalog = _render_query_catalog(context_entry)
     if query_catalog:
