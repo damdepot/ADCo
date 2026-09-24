@@ -1,10 +1,10 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
-op=$1
-container=$2
-service=$3
+op="${1:-}"
+container="${2:-}"
+service="${3:-}"
 
 exp_path="$(cd "$(dirname "$0")/../.." && pwd)"
 compose_file="${exp_path}/docker-compose.yml"
@@ -36,6 +36,29 @@ elif [ "$op" == "Up" ]; then
         $COMPOSE -p adco-experiments -f "${compose_file}" up db-init
     fi
 
+elif [ "$op" == "WaitFor" ]; then
+    echo '-------------------<< Waiting for docker production database to become ready >>-------------------'
+    deadline=$(( SECONDS + 60 ))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        # Empty output means the container has no healthcheck defined.
+        health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "${container}" 2>/dev/null || true)"
+        if [ "${health}" == "healthy" ]; then
+            echo "Container '${container}' is healthy."
+            exit 0
+        fi
+        if [ -z "${health}" ]; then
+            # No healthcheck: fall back to probing the Postgres server directly.
+            if docker exec "${container}" pg_isready -U postgres >/dev/null 2>&1; then
+                echo "Container '${container}' is accepting connections."
+                exit 0
+            fi
+        fi
+        sleep 2
+    done
+    echo "ERROR: timed out after 60s waiting for container '${container}' to become ready." >&2
+    exit 1
+
 else     
-    echo "Invalid operation: $op. Supported operations are: Restart, Down, Up."
+    echo "Invalid operation: $op. Supported operations are: Restart, Down, Up, WaitFor." >&2
+    exit 2
 fi

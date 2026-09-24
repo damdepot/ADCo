@@ -1,7 +1,13 @@
 #!/bin/bash
+set -euo pipefail
 
-dir=$1
-file_name=$2
+dir="${1:-}"
+file_name="${2:-}"
+
+if [ -z "$dir" ] || [ -z "$file_name" ]; then
+    echo "Usage: $(basename "$0") <dir> <file_name>" >&2
+    exit 2
+fi
 
 dbms="postgres"
 warehouses=2

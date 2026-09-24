@@ -1,8 +1,14 @@
 #!/bin/bash
+set -euo pipefail
 
-dir_name=$1
-db_type=$2
-db_name=$3
+dir_name="${1:-}"
+db_type="${2:-}"
+db_name="${3:-}"
+
+if [ -z "$dir_name" ] || [ -z "$db_type" ] || [ -z "$db_name" ]; then
+    echo "Usage: $(basename "$0") <dir_name> <db_type> <db_name>" >&2
+    exit 2
+fi
 
 dbms="postgres"
 
