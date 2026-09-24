@@ -93,7 +93,6 @@ def _parse_knob_kb(kb_path: str | None = None, target_engine: str | None = None)
     current_strategy: dict[str, str] = {}
 
     def _flush() -> None:
-        nonlocal current_strategy
         if current_strategy and "name" in current_strategy and current_strategy.get("definition"):
             engine_val = current_strategy.get("engine", "").strip().lower()
             if target_engine and target_engine.lower() not in engine_val:
@@ -285,7 +284,7 @@ def plan_knob_tuning(
 def get_knob_strategies(tool_context: ToolContext) -> str:
     """Select applicable knob tuning strategies based on workload, specs, and feedback.
 
-    Reads session state (db_type, workload, memory_gb, cpu_cores, knob_checker_output)
+    Reads session state (db_type, workload, memory_gb, cpu_cores, feedback)
     and stores the strategy summary text back to state as `knob_strategies`.
     """
     db_type = tool_context.state.get("db_type", "postgres")
@@ -295,7 +294,7 @@ def get_knob_strategies(tool_context: ToolContext) -> str:
     workload = tool_context.state.get("workload") or tool_context.state.get("workload_info") or tool_context.state.get("intent_analyzer_output") or ""
     memory_gb = float(tool_context.state.get("memory_gb", 1.0))
     cpu_cores = int(tool_context.state.get("cpu_cores", 1))
-    feedback = tool_context.state.get("knob_checker_output") or tool_context.state.get("feedback") or ""
+    feedback = tool_context.state.get("feedback") or ""
     
     _, summary = plan_knob_tuning(
         db_type=db_type,

@@ -7,7 +7,7 @@ import subprocess
 import time
 import uuid
 
-from typing import Sequence
+from src.knob_tuner.contracts import ResourceBudget
 
 from .db_connector import DBConfig, run_safe_query
 
@@ -284,11 +284,78 @@ def cleanup_orphan_containers() -> int:
         return 0
 
 
+def verify_container_resources(
+    container_name: str, budget: ResourceBudget
+) -> tuple[bool, str]:
+    """Verify a running container's CPU and memory limits match the budget.
+
+    Args:
+        container_name: Name or ID of the Docker container to inspect.
+        budget: The resource budget the container was expected to receive.
+
+    Returns:
+        Tuple of (matches: bool, message: str). Never raises; any subprocess or
+        parse failure is reported as ``(False, <error message>)``.
+    """
+    expected_nano_cpus = int(budget.cpu_cores * 1_000_000_000)
+    expected_memory = int(budget.memory_gb * 1024**3)
+
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}",
+                container_name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as e:
+        return False, f"Failed to inspect container '{container_name}': {e}"
+
+    if proc.returncode != 0:
+        err_msg = proc.stderr.strip() or proc.stdout.strip()
+        return False, f"Failed to inspect container '{container_name}': {err_msg}"
+
+    output = proc.stdout.strip()
+    try:
+        parts = output.split()
+        actual_nano_cpus = int(parts[0])
+        actual_memory = int(parts[1])
+    except (IndexError, ValueError) as e:
+        return False, (
+            f"Malformed docker inspect output for container '{container_name}': "
+            f"'{output}' ({e})"
+        )
+
+    mismatches: list[str] = []
+    if actual_nano_cpus != expected_nano_cpus:
+        mismatches.append(
+            f"cpus actual={actual_nano_cpus} expected={expected_nano_cpus}"
+        )
+    if actual_memory != expected_memory:
+        mismatches.append(
+            f"memory actual={actual_memory} expected={expected_memory}"
+        )
+
+    if mismatches:
+        return False, (
+            f"Container '{container_name}' resource mismatch: " + "; ".join(mismatches)
+        )
+
+    return True, (
+        f"Container '{container_name}' resources verified "
+        f"(cpus={budget.to_docker_cpus()}, memory={budget.to_docker_memory()})"
+    )
+
+
 def start_staging_db(
     db_type: str = "postgres",
     db_version: str | None = None,
-    cpus: float = 2.0,
-    memory: str = "2g",
+    budget: ResourceBudget | None = None,
     database: str = "testdb",
     timeout: int = 60,
 ) -> tuple[str, DBConfig]:
@@ -297,8 +364,8 @@ def start_staging_db(
     Args:
         db_type: Database type ('postgres', 'postgresql', 'mysql').
         db_version: Optional database version string or banner.
-        cpus: CPU limit (e.g. 2.0).
-        memory: Memory limit (e.g. '2g').
+        budget: Explicit resource budget for the container. Required; there is
+            no hidden default.
         database: Database name to create and initialize.
         timeout: Maximum seconds to wait for database readiness.
 
@@ -306,8 +373,9 @@ def start_staging_db(
         Tuple of (container_name: str, config: DBConfig).
 
     Raises:
-        ValueError: If db_type is unsupported.
-        RuntimeError: If container fails to start or port mapping cannot be resolved.
+        ValueError: If db_type is unsupported or no budget is provided.
+        RuntimeError: If container fails to start, resource limits do not match
+            the budget, or port mapping cannot be resolved.
         TimeoutError: If database fails to become ready within timeout.
     """
     raw_db_type = db_type.strip().lower()
@@ -319,6 +387,9 @@ def start_staging_db(
         raise ValueError(
             f"Unsupported db_type '{db_type}'. Supported types: 'postgres', 'mysql'."
         )
+
+    if budget is None:
+        raise ValueError("ResourceBudget is required to start the staging database")
 
     image = resolve_docker_image(engine, db_version)
     container_id_suffix = uuid.uuid4().hex[:8]
@@ -382,9 +453,9 @@ def start_staging_db(
         container_name,
         "--label",
         "managed-by=adco-knob-tuner",
-        f"--cpus={cpus}",
-        f"--memory={memory}",
-        f"--memory-swap={memory}",
+        f"--cpus={budget.to_docker_cpus()}",
+        f"--memory={budget.to_docker_memory()}",
+        f"--memory-swap={budget.to_docker_memory()}",
         "-p",
         f"127.0.0.1::{internal_port}",
     ]
@@ -427,6 +498,12 @@ def start_staging_db(
             raise RuntimeError(f"Failed to start staging DB container '{container_name}': {err_msg}")
 
     register_active_container(container_name)
+
+    # Verify the container actually received the requested resource limits
+    resources_ok, resources_msg = verify_container_resources(container_name, budget)
+    if not resources_ok:
+        stop_staging_db(container_name)
+        raise RuntimeError(resources_msg)
 
     # Inspect assigned host port
     try:
@@ -620,8 +697,7 @@ def recreate_docker_db(
     db_type: str = "postgres",
     db_version: str | None = None,
     database: str = "testdb",
-    cpus: float = 2.0,
-    memory: str = "2g",
+    budget: ResourceBudget | None = None,
     timeout: int = 60,
 ) -> tuple[bool, str, object]:
     """Stop, remove, and recreate a staging Docker container, returning the new config.
@@ -635,13 +711,16 @@ def recreate_docker_db(
         db_type: Database type ('postgres' or 'mysql').
         db_version: Optional database version string.
         database: Database name to recreate.
-        cpus: CPU limit for the new container.
-        memory: Memory limit for the new container (e.g. '2g').
+        budget: Explicit resource budget for the new container. Required; there
+            is no hidden default.
         timeout: Maximum seconds to wait for the new container to become ready.
 
     Returns:
         Tuple of (success: bool, new_container_name_or_error: str, new_cfg_or_None).
     """
+    if budget is None:
+        raise ValueError("ResourceBudget is required to recreate the staging database")
+
     stop_staging_db(container_name)
 
     try:
@@ -649,8 +728,7 @@ def recreate_docker_db(
             db_type=db_type,
             db_version=db_version,
             database=database,
-            cpus=cpus,
-            memory=memory,
+            budget=budget,
             timeout=timeout,
         )
         return True, new_container_name, new_cfg

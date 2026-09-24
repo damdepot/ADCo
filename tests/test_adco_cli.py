@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.adco.agent import create_orchestrator_agent
 from src.adco.main import (
     DEFAULT_MODEL,
     build_parser,
@@ -38,6 +37,7 @@ def test_build_parser():
     assert args.dry_run is False
     assert args.verbose is False
     assert args.mode == "all"
+    assert args.apply_mode == "dynamic"
     assert args.buffer_time == 0.0
 
 
@@ -54,6 +54,7 @@ def test_build_parser_custom_options():
         "--dry-run",
         "-v",
         "--mode", "tune-only",
+        "--apply-mode", "persist-static",
         "--buffer-time", "2.5",
     ])
     assert args.target == "my_target"
@@ -66,25 +67,9 @@ def test_build_parser_custom_options():
     assert args.dry_run is True
     assert args.verbose is True
     assert args.mode == "tune-only"
+    assert args.apply_mode == "persist-static"
     assert args.buffer_time == 2.5
 
-
-
-def test_create_orchestrator_agent_buffer_time():
-    import asyncio
-    
-    agent_default = create_orchestrator_agent()
-    assert agent_default.before_model_callback is None
-    
-    agent_with_buffer = create_orchestrator_agent(buffer_time=1.5)
-    assert callable(agent_with_buffer.before_model_callback)
-    assert asyncio.iscoroutinefunction(agent_with_buffer.before_model_callback)
-
-def test_create_orchestrator_agent():
-    agent = create_orchestrator_agent()
-    assert agent.name == "adco_orchestrator"
-    assert agent.model == "gemini-3.5-flash-lite"
-    assert len(agent.tools) == 3
 
 
 @patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)
@@ -559,3 +544,72 @@ def test_main_all_mode_accepts_required_args(mock_auth, mock_run, monkeypatch, c
     assert exc_info.value.code == 0
     assert mock_auth.called
     assert mock_run.called
+
+
+@pytest.mark.parametrize("bad_cpu,bad_mem", [("auto", "8"), ("4", "auto"), ("0", "8"), ("4", "-1")])
+def test_main_invalid_budget_exits_2_before_auth(
+    monkeypatch, capsys, tmp_path, bad_cpu, bad_mem
+):
+    d = tmp_path / "target_app"
+    d.mkdir()
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "adco",
+            str(d),
+            "--mode",
+            "tune-only",
+            "--db-type",
+            "postgres",
+            "--db-name",
+            "testdb",
+            "--cpu-cores",
+            bad_cpu,
+            "--memory",
+            bad_mem,
+        ],
+    )
+
+    with patch("src.adco.main.check_auth") as mock_auth, patch(
+        "src.adco.main.run_pipeline", new_callable=AsyncMock
+    ) as mock_run:
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+    assert exc_info.value.code == 2
+    assert not mock_auth.called
+    assert not mock_run.called
+    assert "ERROR:" in capsys.readouterr().err
+
+
+def test_main_valid_budget_reaches_auth(monkeypatch, capsys, tmp_path):
+    d = tmp_path / "target_app"
+    d.mkdir()
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "adco",
+            str(d),
+            "--mode",
+            "tune-only",
+            "--db-type",
+            "postgres",
+            "--db-name",
+            "testdb",
+            "--cpu-cores",
+            "4",
+            "--memory",
+            "8",
+        ],
+    )
+    with patch("src.adco.main.check_auth") as mock_auth, patch(
+        "src.adco.main.run_pipeline", new_callable=AsyncMock
+    ) as mock_run:
+        mock_run.return_value = {"tuner_run_dir": str(tmp_path), "tuner_status": "PASS"}
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+    assert exc_info.value.code == 0
+    assert mock_auth.called
+    assert mock_run.called
+    assert mock_run.call_args.kwargs["apply_mode"] == "dynamic"

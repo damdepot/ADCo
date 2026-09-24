@@ -18,7 +18,11 @@ from src.intent_analyzer.tools.db_engine import (
     filter_targets_by_db_type,
 )
 from src.code_rewriter.main import run_pipeline as rewriter_pipeline, _maybe_parse
-from src.knob_tuner.main import run_pipeline as tuner_pipeline
+from src.knob_tuner.main import (
+    _derive_status as _tuner_status,
+    _parse_budget,
+    run_pipeline as tuner_pipeline,
+)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
@@ -97,6 +101,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Database memory limit in GB (required for 'all' and 'tune-only' modes)",
     )
     p.add_argument(
+        "--apply-mode",
+        choices=["none", "dynamic", "persist-static"],
+        default="dynamic",
+        help=(
+            "How validated knobs are applied live: 'dynamic' applies reloadable "
+            "knobs; 'persist-static' also persists restart-required knobs for a "
+            "manual restart (default: dynamic)"
+        ),
+    )
+    p.add_argument(
         "--knob-path",
         default="out/adco/knobs",
         help="Directory to save generated knob configuration files",
@@ -147,6 +161,7 @@ async def run_pipeline(
     dry_run: bool = False,
     verbose: bool = False,
     buffer_time: float = 0.0,
+    apply_mode: str = "dynamic",
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
 
@@ -257,10 +272,14 @@ async def run_pipeline(
             db_name=db_name,
             extra_initial_state=tuner_extra_state,
             buffer_time=buffer_time,
+            apply_mode=apply_mode,
         )
     else:
         if verbose:
             print("Skipping knob tuning phase as mode is 'rewrite-only'.")
+
+    tuner_run_dir = tuner_state.get("run_dir") if isinstance(tuner_state, dict) else None
+    tuner_status = _tuner_status(tuner_state) if isinstance(tuner_state, dict) else "UNKNOWN"
 
     # ── Combined output ────────────────────────────────────
     combined: dict[str, Any] = {
@@ -269,6 +288,8 @@ async def run_pipeline(
         "target": target_abs,
         "sandbox": sandbox,
         "model": model,
+        "tuner_run_dir": tuner_run_dir,
+        "tuner_status": tuner_status,
         "intent_analyzer": _maybe_parse(
             open(intent_output_path).read() if os.path.exists(intent_output_path) else "{}"
         ),
@@ -310,10 +331,18 @@ def main() -> None:
         )
         sys.exit(2)
 
+    # Validate the resource contract before any side effect (auth, Docker, LLM).
+    if mode in ("all", "tune-only"):
+        try:
+            _parse_budget(args.cpu_cores, args.memory)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(2)
+
     check_auth()
 
     try:
-        asyncio.run(
+        result = asyncio.run(
             run_pipeline(
                 target=target,
                 model=args.model,
@@ -334,6 +363,7 @@ def main() -> None:
                 dry_run=args.dry_run,
                 verbose=args.verbose,
                 buffer_time=getattr(args, "buffer_time", 0.0),
+                apply_mode=args.apply_mode,
             )
         )
     except Exception as exc:
@@ -341,4 +371,9 @@ def main() -> None:
         sys.exit(1)
 
     print("\n=== ADCo Pipeline COMPLETED ===")
+    tuner_run_dir = result.get("tuner_run_dir")
+    tuner_status = result.get("tuner_status")
+    if tuner_run_dir or tuner_status:
+        print(f"Tuner run directory: {tuner_run_dir}")
+        print(f"Tuner status:        {tuner_status}")
     sys.exit(0)

@@ -17,7 +17,6 @@ from .file_tools import (
 )
 from .kb_planner import (
     KnobStrategyDef,
-    _parse_knob_kb,
     get_knob_strategies,
     plan_knob_tuning,
 )
@@ -33,6 +32,7 @@ from .docker_tools import (
     stop_staging_db,
     restart_docker_db,
     recreate_docker_db,
+    verify_container_resources,
 )
 
 __all__ = [
@@ -50,7 +50,6 @@ __all__ = [
     "get_knob_strategies",
     "plan_knob_tuning",
     "KnobStrategyDef",
-    "_parse_knob_kb",
     "run_sysbench_benchmark",
     "is_docker_available",
     "resolve_docker_image",
@@ -58,5 +57,6 @@ __all__ = [
     "get_container_host_port",
     "stop_staging_db",
     "cleanup_orphan_containers",
+    "verify_container_resources",
 ]
 

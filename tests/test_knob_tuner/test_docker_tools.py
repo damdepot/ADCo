@@ -5,6 +5,7 @@ import subprocess
 from unittest.mock import MagicMock, call, patch
 import pytest
 
+from src.knob_tuner.contracts import ResourceBudget
 from src.knob_tuner.tools.db_connector import DBConfig
 from src.knob_tuner.tools.docker_tools import (
     cleanup_orphan_containers,
@@ -13,7 +14,16 @@ from src.knob_tuner.tools.docker_tools import (
     start_staging_db,
     stop_staging_db,
     get_container_host_port,
+    verify_container_resources,
 )
+
+
+def budget(cpu_cores: int = 2, memory_gb: float = 2) -> ResourceBudget:
+    """Convenience constructor for test resource budgets."""
+    return ResourceBudget(cpu_cores=cpu_cores, memory_gb=memory_gb)
+
+
+VERIFY_OK = (True, "resources verified")
 
 
 # =====================================================================
@@ -214,12 +224,12 @@ def test_start_staging_db_postgres_success(tmp_path):
     exec_res = MagicMock(returncode=0, stdout="127.0.0.1:5432 - accepting connections\n", stderr="")
 
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"?column?": 1}]) as mock_query:
 
         cname, cfg = start_staging_db(
             db_type="postgres",
-            cpus=2.0,
-            memory="2g",
+            budget=budget(2, 2),
             database="bench_pg",
             timeout=30,
         )
@@ -243,7 +253,7 @@ def test_start_staging_db_postgres_success(tmp_path):
         assert "--name" in run_call_args
         assert "--label" in run_call_args
         assert "managed-by=adco-knob-tuner" in run_call_args
-        assert "--cpus=2.0" in run_call_args
+        assert "--cpus=2" in run_call_args
         assert "--memory=2g" in run_call_args
         assert "--memory-swap=2g" in run_call_args
         assert "-p" in run_call_args
@@ -265,9 +275,10 @@ def test_start_staging_db_postgresql_alias_success():
     exec_res = MagicMock(returncode=0, stdout="accepting connections\n", stderr="")
 
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]), \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"?column?": 1}]):
 
-        cname, cfg = start_staging_db(db_type="postgresql")
+        cname, cfg = start_staging_db(db_type="postgresql", budget=budget())
         assert cname.startswith("adco-staging-postgres-")
         assert cfg.port == 49153
         assert cfg.db_type == "postgres"
@@ -279,12 +290,12 @@ def test_start_staging_db_mysql_success():
     exec_res = MagicMock(returncode=0, stdout="mysqld is alive\n", stderr="")
 
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
         cname, cfg = start_staging_db(
             db_type="mysql",
-            cpus=1.5,
-            memory="1g",
+            budget=budget(1, 1),
             database="mysql_bench",
             timeout=30,
         )
@@ -313,22 +324,23 @@ def test_start_staging_db_run_failure():
     run_res = MagicMock(returncode=1, stdout="", stderr="Error: port is already allocated")
     with patch("subprocess.run", return_value=run_res):
         with pytest.raises(RuntimeError, match="Failed to start staging DB container"):
-            start_staging_db(db_type="postgres")
+            start_staging_db(db_type="postgres", budget=budget())
 
 
 def test_start_staging_db_run_exception():
     with patch("subprocess.run", side_effect=Exception("Docker daemon died")):
         with pytest.raises(RuntimeError, match="Failed to execute docker run"):
-            start_staging_db(db_type="postgres")
+            start_staging_db(db_type="postgres", budget=budget())
 
 
 def test_start_staging_db_port_failure():
     run_res = MagicMock(returncode=0, stdout="cid\n", stderr="")
     port_res = MagicMock(returncode=1, stdout="", stderr="Error inspecting port")
     with patch("subprocess.run", side_effect=[run_res, port_res]), \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop:
         with pytest.raises(RuntimeError, match="Failed to get port mapping"):
-            start_staging_db(db_type="postgres")
+            start_staging_db(db_type="postgres", budget=budget())
         mock_stop.assert_called_once()
 
 
@@ -336,9 +348,10 @@ def test_start_staging_db_port_unparseable():
     run_res = MagicMock(returncode=0, stdout="cid\n", stderr="")
     port_res = MagicMock(returncode=0, stdout="invalid_port_output\n", stderr="")
     with patch("subprocess.run", side_effect=[run_res, port_res]), \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop:
         with pytest.raises(RuntimeError, match="Failed to parse mapped host port"):
-            start_staging_db(db_type="postgres")
+            start_staging_db(db_type="postgres", budget=budget())
         mock_stop.assert_called_once()
 
 
@@ -350,12 +363,13 @@ def test_start_staging_db_readiness_timeout():
 
     # Time simulation: simulate timeout expiring quickly
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res, exec_res, exec_res, logs_res]), \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("time.time", side_effect=[100.0, 100.0, 101.0, 102.0, 110.0]), \
          patch("time.sleep"), \
          patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop:
 
         with pytest.raises(TimeoutError, match="did not become ready within 5s") as exc_info:
-            start_staging_db(db_type="postgres", timeout=5)
+            start_staging_db(db_type="postgres", budget=budget(), timeout=5)
 
         assert "FATAL: database not ready" in str(exc_info.value)
         mock_stop.assert_called_once()
@@ -372,12 +386,13 @@ def test_start_staging_db_readiness_timeout_with_container_logs():
     )
 
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res, logs_res]), \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("time.time", side_effect=[100.0, 100.0, 140.0]), \
          patch("time.sleep"), \
          patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop:
 
         with pytest.raises(TimeoutError) as exc_info:
-            start_staging_db(db_type="postgres", timeout=30)
+            start_staging_db(db_type="postgres", budget=budget(), timeout=30)
 
         err_text = str(exc_info.value)
         assert "did not become ready within 30s" in err_text
@@ -393,12 +408,13 @@ def test_start_staging_db_readiness_timeout_log_fetch_exception():
     exec_res = MagicMock(returncode=1, stdout="", stderr="connection refused")
 
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res, Exception("docker logs failed")]), \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("time.time", side_effect=[100.0, 100.0, 140.0]), \
          patch("time.sleep"), \
          patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop:
 
         with pytest.raises(TimeoutError) as exc_info:
-            start_staging_db(db_type="postgres", timeout=30)
+            start_staging_db(db_type="postgres", budget=budget(), timeout=30)
 
         err_text = str(exc_info.value)
         assert "did not become ready within 30s" in err_text
@@ -414,10 +430,11 @@ def test_start_staging_db_query_verification_retry_then_success():
 
     # First query attempt fails (cfg and fallback_cfg), second succeeds (cfg)
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res1, exec_res2]), \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("time.sleep"), \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", side_effect=[Exception("Refused"), Exception("Refused"), [{"1": 1}]]):
 
-        cname, cfg = start_staging_db(db_type="postgres", timeout=10)
+        cname, cfg = start_staging_db(db_type="postgres", budget=budget(), timeout=10)
         assert cname.startswith("adco-staging-postgres-")
         assert cfg.port == 54321
 
@@ -521,9 +538,10 @@ def test_start_staging_db_postgres_with_version():
     exec_res = MagicMock(returncode=0, stdout="accepting connections\n", stderr="")
 
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
-        cname, cfg = start_staging_db(db_type="postgres", db_version="16")
+        cname, cfg = start_staging_db(db_type="postgres", db_version="16", budget=budget())
         assert cname.startswith("adco-staging-postgres-")
         assert cfg.port == 54321
 
@@ -538,9 +556,10 @@ def test_start_staging_db_postgres_with_banner():
 
     banner = "PostgreSQL 16.3 on x86_64-pc-linux-gnu, compiled by gcc"
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
-        cname, cfg = start_staging_db(db_type="postgres", db_version=banner)
+        cname, cfg = start_staging_db(db_type="postgres", db_version=banner, budget=budget())
         assert cname.startswith("adco-staging-postgres-")
 
         run_call_args = mock_run.call_args_list[0][0][0]
@@ -553,9 +572,10 @@ def test_start_staging_db_mysql_with_version():
     exec_res = MagicMock(returncode=0, stdout="mysqld is alive\n", stderr="")
 
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
-        cname, cfg = start_staging_db(db_type="mysql", db_version="8.0")
+        cname, cfg = start_staging_db(db_type="mysql", db_version="8.0", budget=budget())
         assert cname.startswith("adco-staging-mysql-")
 
         run_call_args = mock_run.call_args_list[0][0][0]
@@ -569,9 +589,10 @@ def test_start_staging_db_mysql_with_banner():
 
     banner = "8.0.35-0ubuntu0.22.04.1"
     with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
-        cname, cfg = start_staging_db(db_type="mysql", db_version=banner)
+        cname, cfg = start_staging_db(db_type="mysql", db_version=banner, budget=budget())
         assert cname.startswith("adco-staging-mysql-")
 
         run_call_args = mock_run.call_args_list[0][0][0]
@@ -612,20 +633,30 @@ def test_recreate_docker_db_success():
     with patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop, \
          patch("src.knob_tuner.tools.docker_tools.start_staging_db", return_value=("new-container", new_cfg)) as mock_start:
         from src.knob_tuner.tools.docker_tools import recreate_docker_db
-        ok, cname, cfg = recreate_docker_db("old-container")
+        b = budget(4, 8)
+        ok, cname, cfg = recreate_docker_db("old-container", budget=b)
         assert ok is True
         assert cname == "new-container"
         assert cfg == new_cfg
         mock_stop.assert_called_once_with("old-container")
+        assert mock_start.call_args.kwargs["budget"] is b
 
 def test_recreate_docker_db_failure():
     with patch("src.knob_tuner.tools.docker_tools.stop_staging_db"), \
          patch("src.knob_tuner.tools.docker_tools.start_staging_db", side_effect=Exception("Failed to start")):
         from src.knob_tuner.tools.docker_tools import recreate_docker_db
-        ok, err, cfg = recreate_docker_db("old-container")
+        ok, err, cfg = recreate_docker_db("old-container", budget=budget())
         assert ok is False
         assert "Failed to start" in err
         assert cfg is None
+
+
+def test_recreate_docker_db_requires_budget():
+    with patch("src.knob_tuner.tools.docker_tools.start_staging_db") as mock_start:
+        from src.knob_tuner.tools.docker_tools import recreate_docker_db
+        with pytest.raises(ValueError, match="ResourceBudget is required to recreate"):
+            recreate_docker_db("old-container")
+        mock_start.assert_not_called()
 
 # =====================================================================
 # get_container_host_port tests
@@ -683,14 +714,150 @@ def test_start_staging_db_with_custom_network():
 
     with patch("src.knob_tuner.tools.docker_tools.get_current_docker_network", return_value="my_compose_net"), \
          patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="172.18.0.5\n"), exec_res]) as mock_run, \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
          patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
 
-        cname, cfg = start_staging_db(db_type="postgres")
+        cname, cfg = start_staging_db(db_type="postgres", budget=budget())
         assert cfg.host == cname
         assert cfg.port == 5432
         # Verify --network my_compose_net was passed to docker run
         run_cmd = mock_run.call_args_list[0][0][0]
         assert "--network" in run_cmd
         assert run_cmd[run_cmd.index("--network") + 1] == "my_compose_net"
+
+
+# =====================================================================
+# ResourceBudget enforcement tests
+# =====================================================================
+
+
+def test_start_staging_db_requires_budget():
+    with patch("subprocess.run") as mock_run:
+        with pytest.raises(ValueError, match="ResourceBudget is required to start"):
+            start_staging_db(db_type="postgres")
+        mock_run.assert_not_called()
+
+
+def test_start_staging_db_uses_budget_for_limits():
+    run_res = MagicMock(returncode=0, stdout="cid\n", stderr="")
+    port_res = MagicMock(returncode=0, stdout="127.0.0.1:54321\n", stderr="")
+    exec_res = MagicMock(returncode=0, stdout="accepting connections", stderr="")
+
+    b = budget(4, 8)
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
+         patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
+
+        start_staging_db(db_type="postgres", budget=b)
+
+        run_cmd = mock_run.call_args_list[0][0][0]
+        assert "--cpus=4" in run_cmd
+        assert "--memory=8g" in run_cmd
+        assert "--memory-swap=8g" in run_cmd
+
+
+def test_start_staging_db_stops_container_when_verification_fails():
+    run_res = MagicMock(returncode=0, stdout="cid\n", stderr="")
+    with patch("subprocess.run", side_effect=[run_res]), \
+         patch(
+             "src.knob_tuner.tools.docker_tools.verify_container_resources",
+             return_value=(False, "Container 'x' resource mismatch: cpus actual=1 expected=2"),
+         ), \
+         patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop:
+
+        with pytest.raises(RuntimeError, match="resource mismatch"):
+            start_staging_db(db_type="postgres", budget=budget())
+        mock_stop.assert_called_once()
+
+
+# =====================================================================
+# verify_container_resources tests
+# =====================================================================
+
+
+def test_verify_container_resources_match():
+    b = budget(4, 8)
+    inspect_res = MagicMock(
+        returncode=0, stdout="4000000000 8589934592\n", stderr=""
+    )
+    with patch("subprocess.run", return_value=inspect_res) as mock_run:
+        ok, msg = verify_container_resources("my-container", b)
+        assert ok is True
+        assert "verified" in msg
+        mock_run.assert_called_once_with(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}",
+                "my-container",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+
+def test_verify_container_resources_cpu_mismatch():
+    b = budget(4, 8)
+    inspect_res = MagicMock(
+        returncode=0, stdout="2000000000 8589934592\n", stderr=""
+    )
+    with patch("subprocess.run", return_value=inspect_res):
+        ok, msg = verify_container_resources("my-container", b)
+        assert ok is False
+        assert "cpus actual=2000000000 expected=4000000000" in msg
+        assert "memory" not in msg
+
+
+def test_verify_container_resources_memory_mismatch():
+    b = budget(4, 8)
+    inspect_res = MagicMock(
+        returncode=0, stdout="4000000000 1073741824\n", stderr=""
+    )
+    with patch("subprocess.run", return_value=inspect_res):
+        ok, msg = verify_container_resources("my-container", b)
+        assert ok is False
+        assert "memory actual=1073741824 expected=8589934592" in msg
+        assert "cpus" not in msg
+
+
+def test_verify_container_resources_both_mismatch():
+    b = budget(2, 2)
+    inspect_res = MagicMock(returncode=0, stdout="0 0\n", stderr="")
+    with patch("subprocess.run", return_value=inspect_res):
+        ok, msg = verify_container_resources("my-container", b)
+        assert ok is False
+        assert "cpus actual=0 expected=2000000000" in msg
+        assert "memory actual=0 expected=2147483648" in msg
+
+
+def test_verify_container_resources_malformed_output():
+    b = budget(4, 8)
+    inspect_res = MagicMock(returncode=0, stdout="not-a-number\n", stderr="")
+    with patch("subprocess.run", return_value=inspect_res):
+        ok, msg = verify_container_resources("my-container", b)
+        assert ok is False
+        assert "Malformed docker inspect output" in msg
+
+
+def test_verify_container_resources_inspect_failure():
+    b = budget(4, 8)
+    inspect_res = MagicMock(
+        returncode=1, stdout="", stderr="Error: No such container: my-container"
+    )
+    with patch("subprocess.run", return_value=inspect_res):
+        ok, msg = verify_container_resources("my-container", b)
+        assert ok is False
+        assert "Failed to inspect container" in msg
+        assert "No such container" in msg
+
+
+def test_verify_container_resources_subprocess_exception():
+    b = budget(4, 8)
+    with patch("subprocess.run", side_effect=Exception("Docker daemon died")):
+        ok, msg = verify_container_resources("my-container", b)
+        assert ok is False
+        assert "Docker daemon died" in msg
 
 
