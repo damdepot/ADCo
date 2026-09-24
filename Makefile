@@ -18,6 +18,7 @@ run:
 		--model=gemini-3.5-flash-lite \
 		--db-type=$(DB_TYPE) \
 		--db-name=$(DB_NAME) \
+		--sandbox-dir=$(SANDBOX_DIR) \
 		--cpu-cores=2 \
 		--memory=2 \
 		--verbose
