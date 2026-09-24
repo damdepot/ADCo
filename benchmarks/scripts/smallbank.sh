@@ -3,8 +3,8 @@
 dir=$1
 
 dbms="postgres"
-accounts=1000000
-transactions=100000
+accounts=10000
+transactions=1000
 exp_path="$(cd "$(dirname "$0")/../.." && pwd)"
 workload_path="${exp_path}/benchmarks/tools/smallbank"
 log_fname="${exp_path}/results/$dir"
@@ -20,7 +20,7 @@ fi
 
 CMD="python main.py test \
                     --driver ${dbms} \
-                    --threads 4 \
+                    --threads 2 \
                     --accounts ${accounts} \
                     --transactions ${transactions} \
                     --output-path ${log_fname}"

@@ -1,84 +1,71 @@
-x-mysql-base: &mysql-base
-  image: mysql:8.4
-  platform: linux/amd64
-  restart: always
-  environment:
-    MYSQL_ROOT_PASSWORD: mysql_root_password
-    MYSQL_DATABASE: adco_db
-  command: --mysql-native-password=ON
-
-x-postgres-base: &postgres-base
-  image: postgres:17
-  platform: linux/amd64
-  restart: always
-  environment:
-    POSTGRES_USER: postgres
-    POSTGRES_PASSWORD: postgres
-    POSTGRES_DB: adco_db
-
 services:
-  mysql-baseline:
-    profiles: ["mysql"]
-    <<: *mysql-base
-    container_name: adco-mysql-baseline
-    ports:
-      - "3308:3306"
-    volumes:
-      - mysql_baseline_data:/var/lib/mysql
-      - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2g
-
-  mysql-production:
-    profiles: ["mysql"]
-    <<: *mysql-base
-    container_name: adco-mysql-production
-    ports:
-      - "3306:3306"
-    volumes:
-      - mysql_production_data:/var/lib/mysql
-      - ./db/init/mysql:/docker-entrypoint-initdb.d:ro
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2g
-
-  postgres-baseline:
-    profiles: ["postgres"]
-    <<: *postgres-base
-    container_name: adco-postgres-baseline
-    ports:
-      - "5434:5432"
-    volumes:
-      - postgres_baseline_data:/var/lib/postgresql/data
-      - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2g
-
-  postgres-production:
-    profiles: ["postgres"]
-    <<: *postgres-base
-    container_name: adco-postgres-production
+  pgdb:
+    image: postgres:17
+    container_name: adcoexp-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
     ports:
       - "5432:5432"
-    volumes:
-      - postgres_production_data:/var/lib/postgresql/data
-      - ./db/init/postgres:/docker-entrypoint-initdb.d:ro
+    platform: linux/amd64
     deploy:
       resources:
         limits:
           cpus: "2"
-          memory: 2g
+          memory: 8g
+    shm_size: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
-volumes:
-  mysql_baseline_data:
-  mysql_production_data:
-  postgres_baseline_data:
-  postgres_production_data:
+  db-init:
+    image: postgres:17
+    container_name: adcoexp-db-init
+    restart: "no"
+    platform: linux/amd64
+    environment:
+      PGHOST: pgdb
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    depends_on:
+      pgdb:
+        condition: service_healthy
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        psql -v ON_ERROR_STOP=1 <<-EOSQL
+          SELECT 'CREATE DATABASE agenttune' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'agenttune')\gexec
+          SELECT 'CREATE DATABASE gptuner' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'gptuner')\gexec
+          SELECT 'CREATE DATABASE smallbank' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'smallbank')\gexec
+          SELECT 'CREATE DATABASE tpcc' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'tpcc')\gexec
+          SELECT 'CREATE DATABASE adcodb' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'adcodb')\gexec
+          SELECT 'CREATE DATABASE baselinedb' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'baselinedb')\gexec
+        EOSQL
+
+  adcoexp:
+    build: .
+    image: adcoexp-image
+    container_name: adcoexp
+    restart: unless-stopped
+    volumes:
+      - .:/app # root-level download and experiment scripts
+      - /var/run/docker.sock:/var/run/docker.sock 
+    depends_on:
+      pgdb:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+
+networks:
+  default:
+    driver: bridge
+    driver_opts:
+      com.docker.network.enable_ipv4: "true"
+      com.docker.network.enable_ipv6: "false"

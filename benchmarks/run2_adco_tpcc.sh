@@ -1,8 +1,6 @@
 #!/bin/bash
 
 CMDRunTPCC="./benchmarks/scripts/tpcc.sh"
-CMDRunACo="./benchmarks/scripts/aco.sh"
-CMDRunDCo="./benchmarks/scripts/dco.sh"
 CMDRunADCo="./benchmarks/scripts/adco.sh"
 CMDDocker="./benchmarks/scripts/docker.sh"
 
@@ -16,23 +14,9 @@ $CMDDocker Up ${db_container} ${db_service}
 sleep 5s
 echo "----------------->> Baseline <<-----------------"
 $CMDRunTPCC baseline baseline.csv
-
-echo "----------------->> ACo <<-----------------"
-$CMDRunACo tpcc postgres tpcc
-$CMDRunTPCC tpcc_aco aco.csv
-
 echo "----------------->> DCo <<-----------------"
-$CMDRunDCo tpcc postgres tpcc
-$CMDDocker Restart ${db_container}
-sleep 3s
-$CMDRunTPCC baseline dco.csv
-
-echo "----------------->> Refreshing Docker <<-----------------"
-$CMDDocker Down ${db_container}
-$CMDDocker Up ${db_container} ${db_service}
-sleep 5s
-echo "----------------->> ADCo <<-----------------"
 $CMDRunADCo tpcc postgres tpcc
 $CMDDocker Restart ${db_container}
 sleep 3s
+echo "----------------->> Optimized <<-----------------"
 $CMDRunTPCC tpcc_adco adco.csv
