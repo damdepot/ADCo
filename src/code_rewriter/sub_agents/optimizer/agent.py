@@ -13,8 +13,8 @@ from src.code_rewriter.sub_agents.optimizer.models import OptimizerOutput
 
 
 def create_optimizer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite", buffer_time: float = 0.0) -> LlmAgent:
-    # ponytail: one orchestrator attempt = one model call; no node-level RetryConfig
-    # so max_attempts=3 does not stack with the root 5-attempt budget / HTTP retries.
+    # ponytail: one orchestrator attempt = one model call; no node-level RetryConfig,
+    # HTTP retries live on the model in main.py.
     return LlmAgent(
         name="optimizer",
         model=model,

@@ -38,6 +38,7 @@ from ..models.db_interaction_models import (
     StatementModel,
 )
 from .sql_resolver import resolve
+from .._common import target_names
 
 _FETCH_METHODS = {"fetchone", "fetchall", "fetchmany"}
 _EXECUTE_METHODS = {"execute", "executemany"}
@@ -235,17 +236,6 @@ def _call_attr(node: ast.AST) -> Optional[str]:
     return None
 
 
-def _target_names(target: ast.AST) -> List[str]:
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names: List[str] = []
-        for elt in target.elts:
-            names.extend(_target_names(elt))
-        return names
-    return []
-
-
 def _param_names(arg: ast.AST) -> List[str]:
     names: List[str] = []
     if isinstance(arg, ast.Name):
@@ -332,7 +322,7 @@ class _ModelBuilder:
     def _process_for(self, stmt: Any) -> None:
         producer = self._producer_for_value(stmt.iter)
         if producer is not None:
-            for name in _target_names(stmt.target):
+            for name in target_names(stmt.target):
                 self.derived_from[name] = producer
         self.loop_depth += 1
         self._process_body(stmt.body)

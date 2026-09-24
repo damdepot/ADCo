@@ -70,6 +70,7 @@ def test_verifier_output_accepts_evidence_backed_issues():
 # ---------------------------------------------------------------------------
 
 from src.code_rewriter.sub_agents.optimizer.tools import (
+    _render_previous_attempt,
     get_optimization_context as co_get_optimization_context,
     replace_function as co_replace_function,
 )
@@ -163,6 +164,133 @@ def test_optimizer_get_optimization_context_single_target():
     assert "MISSING_REWRITE" in result
     assert "Strict-zero violation" in result
     assert "/tmp/sb" in result
+
+
+def _optimizer_context_state(attempts):
+    return {
+        "intent_extractor_output": {
+            "connection": "pool", "queries": "crud", "transactions": "manual",
+            "n_plus_one": "yes", "concurrency": "seq", "orm": "raw",
+            "optimization_targets": [
+                {"file": "driver.py", "description": "batch new order queries"},
+            ],
+            "notes": "n/a",
+        },
+        "strategies": "QUERY_BATCHING",
+        "sandbox": "/tmp/sb",
+        "current_contract": {
+            "rewrite_id": "r1",
+            "target": {
+                "file": "driver.py",
+                "function": "doNewOrder",
+                "qualified_function": "Db.doNewOrder",
+            },
+            "targets": [{"file": "driver.py", "function": "Db.doNewOrder"}],
+            "pattern": "N_PLUS_ONE_QUERY",
+            "strategy": "QUERY_BATCHING",
+            "allowed_regions": ["Db.doNewOrder"],
+            "must_preserve": ["function_signature"],
+            "must_not_change": ["return_type"],
+        },
+        "target_context_map": {
+            "Db.doNewOrder": {
+                "analysis_summary": "## Function Analysis: Db.doNewOrder\n- Signature: def doNewOrder(self, warehouse_id)",
+                "function_source": "def doNewOrder(self, warehouse_id):\n    cursor.execute('SELECT 1')\n",
+                "dependency_slice": "# Dependency Slice: `doNewOrder`",
+            },
+        },
+        "optimizer_attempts": attempts,
+    }
+
+
+def test_get_optimization_context_includes_prior_attempts():
+    tc = MockToolContext(_optimizer_context_state([
+        {
+            "file": "driver.py",
+            "function": "Db.doNewOrder",
+            "bare_function": "doNewOrder",
+            "outcome": "REJECTED",
+            "codes": ["DUPLICATE_WHERE"],
+            "message": "boom",
+            "attempt": 1,
+            "candidate_key": "k",
+            "diff": "- old\n+ new",
+        }
+    ]))
+
+    result = co_get_optimization_context(tc)
+
+    assert "## Prior Optimizer Attempts" in result
+    assert "boom" in result
+
+    no_match = MockToolContext(_optimizer_context_state([]))
+    assert "## Prior Optimizer Attempts" not in co_get_optimization_context(no_match)
+
+
+_NO_REWRITE_FN = "def doNewOrder(self, warehouse_id):\n    cursor.execute('SELECT 1')\n"
+
+
+def _optimizer_context_state_with_sandbox(
+    tmp_path, sandbox_function_source, attempt_count
+):
+    state = _optimizer_context_state([])
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    (sandbox / "driver.py").write_text(sandbox_function_source)
+    state["sandbox"] = str(sandbox)
+    state["attempt_count"] = attempt_count
+    return state
+
+
+def test_get_optimization_context_no_rewrite_directive_when_unchanged(tmp_path):
+    state = _optimizer_context_state_with_sandbox(tmp_path, _NO_REWRITE_FN, 2)
+
+    result = co_get_optimization_context(MockToolContext(state))
+
+    assert "## CRITICAL: No rewrite applied" in result
+
+
+def test_get_optimization_context_no_directive_on_first_attempt(tmp_path):
+    state = _optimizer_context_state_with_sandbox(tmp_path, _NO_REWRITE_FN, 1)
+
+    result = co_get_optimization_context(MockToolContext(state))
+
+    assert "## CRITICAL: No rewrite applied" not in result
+
+
+def test_get_optimization_context_no_directive_when_modified(tmp_path):
+    modified = (
+        "def doNewOrder(self, warehouse_id):\n"
+        "    cursor.execute('SELECT * FROM orders')\n"
+    )
+    state = _optimizer_context_state_with_sandbox(tmp_path, modified, 2)
+
+    result = co_get_optimization_context(MockToolContext(state))
+
+    assert "## CRITICAL: No rewrite applied" not in result
+
+
+def test_render_previous_attempt_diff_ignores_indentation(tmp_path):
+    from src.code_rewriter._common import extract_function_source_by_name
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    method_source = (
+        "class Db:\n"
+        "    def doNewOrder(self, warehouse_id):\n"
+        "        cursor.execute('SELECT 1')\n"
+    )
+    (sandbox / "driver.py").write_text(method_source)
+    original_source = extract_function_source_by_name(method_source, "Db.doNewOrder")
+
+    rendered = "\n".join(
+        _render_previous_attempt(
+            {"sandbox": str(sandbox)}, "driver.py", "Db.doNewOrder", original_source
+        )
+    )
+
+    assert "## Diff vs Original" in rendered
+    assert "(no changes)" in rendered
 
 
 def _write_gate_contract():
@@ -260,6 +388,101 @@ def test_replace_function_accepts_clean_batching_rewrite(tmp_path):
 
     assert result.startswith("Successfully replaced")
     assert "ANY(%s)" in (sandbox_dir / "app.py").read_text()
+
+
+def test_replace_function_records_rejected_attempt(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s) WHERE name = %s', (user_ids, 'x'))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("ERROR")
+    entries = tc.state["optimizer_attempts"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["outcome"] == "REJECTED"
+    assert "DUPLICATE_WHERE" in entry["codes"]
+    assert entry["candidate_key"]
+
+
+def test_replace_function_duplicate_rejection_warns_and_sets_no_progress(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s) WHERE name = %s', (user_ids, 'x'))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    co_replace_function("app.py", "get_user_data", candidate, tc)
+    second = co_replace_function("app.py", "get_user_data", candidate, tc)
+    third = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert "already been rejected" in second
+    assert "NO PROGRESS" in third
+    assert tc.state["optimizer_no_progress"] == {
+        "file": "app.py",
+        "function": "get_user_data",
+    }
+
+
+def test_replace_function_whitespace_variant_counts_as_duplicate(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s) WHERE name = %s', (user_ids, 'x'))\n"
+        "    return cursor.fetchall()\n"
+    )
+    variant = (
+        "def get_user_data(user_ids):\n"
+        "\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s) WHERE name = %s', (user_ids, 'x'))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    co_replace_function("app.py", "get_user_data", candidate, tc)
+    second = co_replace_function("app.py", "get_user_data", variant, tc)
+
+    assert "already been rejected" in second
+
+
+def test_replace_function_records_applied_attempt(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s)', (user_ids,))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("Successfully replaced")
+    entries = tc.state["optimizer_attempts"]
+    assert len(entries) == 1
+    assert entries[0]["outcome"] == "APPLIED"
 
 
 def test_replace_function_rejects_ast_identical_rewrite(tmp_path):

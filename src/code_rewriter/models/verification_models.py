@@ -20,8 +20,13 @@ class VerificationCheck(BaseModel):
 class TargetStatus(BaseModel):
     file: str = Field(description="The file containing the target")
     function: str = Field(description="The function name")
-    status: Literal["TRANSFORMED", "MISSING_REWRITE", "INVALID_REWRITE", "UNVERIFIABLE"] = Field(
-        description="Outcome for this specific target"
+    status: Literal[
+        "TRANSFORMED", "MISSING_REWRITE", "INVALID_REWRITE", "UNVERIFIABLE", "RESTRICTED"
+    ] = Field(
+        description=(
+            "Outcome for this specific target: TRANSFORMED, MISSING_REWRITE, "
+            "INVALID_REWRITE, UNVERIFIABLE, or RESTRICTED"
+        )
     )
     details: str = Field(default="", description="Explanation of the outcome")
 

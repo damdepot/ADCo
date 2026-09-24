@@ -105,6 +105,16 @@ def test_finalize_passes_when_all_targets_pass():
     assert delta["deterministic_verification"]["transformed_targets"] == 1
 
 
+def test_finalize_fails_when_no_targets():
+    """An empty run must not vacuously PASS: zero targets is a FAIL."""
+    ctx = _FakeContext({"target_results": []})
+    event = finalize(ctx)
+    delta = event.actions.state_delta
+    assert delta["deterministic_verification"]["status"] == "FAIL"
+    assert delta["verifier_output"]["status"] == "FAIL"
+    assert delta["deterministic_verification"]["expected_targets"] == 0
+
+
 def test_finalize_surfaces_warnings_without_failing():
     """Advisory WARNINGs are surfaced but must not flip a deterministic PASS."""
     ctx = _FakeContext({
@@ -541,11 +551,36 @@ def test_make_orchestrate_restricted_when_high_risk_blocked(tmp_path):
     assert "[RESTRICTED] repo.py::get_users" in vo["detail"]
 
 
-def test_make_orchestrate_unrejected_failure_stays_fail(tmp_path):
-    """Without a recorded risk rejection an unchanged target is an ordinary FAIL."""
+def test_make_orchestrate_unchanged_target_becomes_restricted(tmp_path):
+    """An unchanged target with no new attempt is RESTRICTED, not FAIL."""
     _, events = _restricted_run(tmp_path, None)
     results = events[-1].actions.state_delta["target_results"]
-    assert results[0]["status"] == "FAIL"
+    assert results[0]["status"] == "RESTRICTED"
+    assert results[0]["verification"]["status"] == "RESTRICTED"
+
+
+def test_make_orchestrate_records_no_attempt_when_optimizer_writes_nothing(tmp_path):
+    """A finished optimizer run that leaves the target unchanged records NO_ATTEMPT."""
+    ctx, _ = _restricted_run(tmp_path, None)
+    attempts = ctx.state["optimizer_attempts"]
+    assert any(
+        entry.get("outcome") == "NO_ATTEMPT"
+        and entry.get("codes") == ["NO_REWRITE"]
+        and entry.get("function") == "get_users"
+        for entry in attempts
+    )
+
+
+def test_make_orchestrate_restricted_no_rewrite_is_finalize_pass(tmp_path):
+    """An unchanged target restricted by the orchestrator finalizes as a PASS."""
+    ctx, events = _restricted_run(tmp_path, None)
+    results = events[-1].actions.state_delta["target_results"]
+    ctx.state["target_results"] = results
+
+    event = finalize(ctx)
+    det = event.actions.state_delta["deterministic_verification"]
+    assert det["status"] == "PASS"
+    assert det["restricted_targets"] == 1
 
 
 def test_make_orchestrate_rejected_but_modified_stays_fail(tmp_path):

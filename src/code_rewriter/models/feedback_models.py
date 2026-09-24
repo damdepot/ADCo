@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 _LOOP_BATCH_HINT = (
     "Remove every DB call from the loop. Hoist ONE set-based batch read per "
@@ -117,3 +117,119 @@ def render_repair_request(issues: list[RepairIssue]) -> str:
                 f"  Definition of done: {issue.fix_hint or '(no specific guidance)'}"
             )
     return "\n".join(lines)
+
+
+class OptimizerAttempt(BaseModel):
+    """One optimizer attempt on a target function, persisted for feedback."""
+
+    file: str = ""
+    function: str = ""
+    bare_function: str = ""
+    outcome: str = ""
+    codes: list[str] = []
+    message: str = ""
+    attempt: int | None = None
+    candidate_key: str = ""
+    diff: str = ""
+
+
+_ATTEMPT_DIFF_MAX_LINES = 40
+
+
+def _bare_name(function: str) -> str:
+    """Strip a qualified name to its bare function component."""
+    return (function or "").strip().rsplit(".", 1)[-1]
+
+
+def _truncate_diff(diff: str, max_lines: int = _ATTEMPT_DIFF_MAX_LINES) -> str:
+    """Keep at most ``max_lines`` lines of a diff, marking truncation."""
+    lines = diff.splitlines()
+    if len(lines) <= max_lines:
+        return diff
+    return "\n".join(lines[:max_lines]) + "\n... (diff truncated)"
+
+
+def record_optimizer_attempt(
+    state: dict, attempt: OptimizerAttempt, cap: int = 12
+) -> None:
+    """Append an attempt, truncating its diff and capping history per target."""
+    try:
+        if not attempt.bare_function:
+            attempt.bare_function = _bare_name(attempt.function)
+        attempt.diff = _truncate_diff(attempt.diff)
+        entries = state.setdefault("optimizer_attempts", [])
+        if not isinstance(entries, list):
+            entries = []
+            state["optimizer_attempts"] = entries
+        entries.append(attempt.model_dump())
+
+        key = (attempt.file, attempt.bare_function)
+        matching = [
+            index
+            for index, entry in enumerate(entries)
+            if isinstance(entry, dict)
+            and (entry.get("file"), entry.get("bare_function")) == key
+        ]
+        for index in matching[: max(0, len(matching) - cap)][::-1]:
+            entries.pop(index)
+    except Exception:
+        return None
+
+
+def render_optimizer_attempts(
+    state: dict, file: str, function: str, limit: int = 3
+) -> str:
+    """Render the most recent prior attempts for a target, newest first."""
+    target = _bare_name(function)
+    raw = state.get("optimizer_attempts")
+    if not isinstance(raw, list):
+        return ""
+
+    matching: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("file") != file:
+            continue
+        bare = entry.get("bare_function") or _bare_name(entry.get("function") or "")
+        if bare != target:
+            continue
+        matching.append(entry)
+
+    if not matching:
+        return ""
+
+    recent = matching[-limit:]
+    lines = ["## Prior Optimizer Attempts (do not repeat these)"]
+    for offset, entry in enumerate(reversed(recent)):
+        index = len(recent) - offset
+        number = entry.get("attempt")
+        label = number if number is not None else index
+        codes = entry.get("codes")
+        codes_text = ", ".join(codes) if isinstance(codes, list) else ""
+        message = entry.get("message") or ""
+        lines.append(f"- attempt {label}: {entry.get('outcome') or ''} [{codes_text or 'NO_CODE'}] {message}")
+        diff = entry.get("diff") or ""
+        if diff:
+            lines.append("  ```diff")
+            lines.extend(f"  {line}" for line in diff.splitlines())
+            lines.append("  ```")
+    return "\n".join(lines)
+
+
+def count_optimizer_attempts(state: dict, file: str, function: str) -> int:
+    """Count recorded attempts for a target, matching on (file, bare function)."""
+    target = _bare_name(function)
+    raw = state.get("optimizer_attempts")
+    if not isinstance(raw, list):
+        return 0
+    count = 0
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("file") != file:
+            continue
+        bare = entry.get("bare_function") or _bare_name(entry.get("function") or "")
+        if bare == target:
+            count += 1
+    return count

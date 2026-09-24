@@ -2,12 +2,13 @@ import ast
 import os
 
 from .ast_analyzer import analyze_file
-from .sql_resolver import collect_module_dicts, resolve
+from .sql_resolver import collect_module_dicts, resolve, _const_str
 from ..models.ast_models import FileAnalysis, FunctionAnalysis
 from ..models.rewrite_models import RewriteContract, RewriteTarget
 from .rewrite_contract import build_rewrite_contract
 from .contract_verifier import verify_contract, VerificationResult, TargetStatus, VerificationCheck, VerificationViolation
 from .dependency_graph import build_dependency_graph, slice_dependency_graph, format_dependency_slice_markdown
+from .._common import find_function_node
 
 EXCLUDED_SETUP_FUNCTION_PATTERNS = {
     "_execute_ddl", "execute_ddl", "load_schema", "init_schema", 
@@ -452,50 +453,6 @@ _SQL_OPERATIONS = ("SELECT", "INSERT", "UPDATE", "DELETE")
 _EXECUTE_METHODS = ("execute", "executemany")
 
 
-def _const_str_key(node) -> str | None:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    return None
-
-
-def _operation_from_sql(sql: str) -> str:
-    if not isinstance(sql, str) or not sql.strip():
-        return "OTHER"
-    head = sql.strip().upper()
-    for name in _SQL_OPERATIONS:
-        if head.startswith(name):
-            return name
-    return "OTHER"
-
-
-def _find_function_node(tree: ast.Module, qualified: str):
-    """Return the AST node for a (qualified) function name, or ``None``."""
-    if not qualified:
-        return None
-    bare = qualified.rsplit(".", 1)[-1]
-
-    def _walk(node: ast.AST, prefix: str):
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, ast.ClassDef):
-                found = _walk(child, f"{prefix}{child.name}.")
-                if found is not None:
-                    return found
-            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                full = f"{prefix}{child.name}"
-                if full == qualified or child.name == bare:
-                    return child
-                found = _walk(child, f"{full}.")
-                if found is not None:
-                    return found
-            else:
-                found = _walk(child, prefix)
-                if found is not None:
-                    return found
-        return None
-
-    return _walk(tree, "")
-
-
 def _discover_query_context(
     source_code: str, fn: FunctionAnalysis | None, qualified: str
 ) -> tuple[list[dict], dict | None]:
@@ -512,7 +469,7 @@ def _discover_query_context(
         return [], None
 
     module_dicts = collect_module_dicts(tree)
-    func_node = _find_function_node(tree, qualified)
+    func_node = find_function_node(tree, qualified)
     if func_node is None:
         return [], None
 
@@ -526,7 +483,7 @@ def _discover_query_context(
         base = module_dicts.get(subscript.value.id)
         if not isinstance(base, dict):
             continue
-        key = _const_str_key(subscript.slice)
+        key = _const_str(subscript.slice)
         if key is None:
             continue
         sub_dict = base.get(key)
@@ -545,7 +502,7 @@ def _discover_query_context(
         subscript = arg0.left if isinstance(arg0, ast.BinOp) and isinstance(arg0.op, ast.Mod) else arg0
         if not isinstance(subscript, ast.Subscript):
             continue
-        key = _const_str_key(subscript.slice)
+        key = _const_str(subscript.slice)
         if key is None:
             continue
         sql = resolve(subscript, local_vars, module_dicts)

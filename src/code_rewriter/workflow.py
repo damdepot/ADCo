@@ -25,6 +25,11 @@ from google.adk.models import BaseLlm
 from google.adk.workflow import FunctionNode
 
 from src.code_rewriter._common import _maybe_parse, extract_function_source_by_name
+from src.code_rewriter.models.feedback_models import (
+    OptimizerAttempt,
+    count_optimizer_attempts,
+    record_optimizer_attempt,
+)
 from src.code_rewriter.models.rewrite_models import RewriteContract
 from src.code_rewriter.sub_agents.optimizer.agent import create_optimizer_agent
 from src.code_rewriter.sub_agents.verifier.agent import create_verifier_agent
@@ -117,6 +122,8 @@ def prepare(ctx: Context, node_input: Any = None) -> Event:
             "target_results": [],
             "current_contract": (contracts[0] if contracts else None),
             "last_failure": None,
+            "optimizer_attempts": [],
+            "optimizer_no_progress": None,
         },
     )
 
@@ -186,6 +193,7 @@ def make_orchestrate(
                         "last_failure": failure,
                     }
                 )
+                attempts_before = count_optimizer_attempts(ctx.state, rel_file, qfn)
                 await ctx.run_node(
                     optimizer_node,
                     node_input=(
@@ -193,6 +201,28 @@ def make_orchestrate(
                         f"Checklist from get_optimization_context."
                     ),
                 )
+                if (
+                    rel_file
+                    and _function_unchanged(
+                        ctx.state.get("target", ""), sandbox, rel_file, qfn
+                    )
+                    and count_optimizer_attempts(ctx.state, rel_file, qfn)
+                    == attempts_before
+                ):
+                    record_optimizer_attempt(
+                        ctx.state,
+                        OptimizerAttempt(
+                            file=rel_file,
+                            function=qfn,
+                            outcome="NO_ATTEMPT",
+                            codes=["NO_REWRITE"],
+                            message=(
+                                "optimizer finished without a successful "
+                                "replace_function call; target unchanged"
+                            ),
+                            attempt=attempt,
+                        ),
+                    )
                 verdict = await ctx.run_node(verify_node)
                 if isinstance(verdict, dict) and verdict.get("status") == "PASS":
                     if llm_verify_node is None:
@@ -279,17 +309,21 @@ def make_orchestrate(
                 status = "PASS"
             else:
                 risk_rejected = qfn in (ctx.state.get("risk_rejections") or [])
-                if risk_rejected and _function_unchanged(
+                unchanged = _function_unchanged(
                     ctx.state.get("target", ""), sandbox, rel_file, qfn
-                ):
-                    # The HIGH-risk rewrite was blocked and no lower-risk attempt
-                    # was found, so the original function is preserved. This is an
-                    # acceptable outcome (RESTRICTED), not a pipeline failure.
+                )
+                if unchanged:
+                    # The original function is preserved: either a HIGH-risk
+                    # rewrite was blocked, or the optimizer never produced a valid
+                    # rewrite. Both are acceptable (RESTRICTED) outcomes rather
+                    # than pipeline failures.
                     status = "RESTRICTED"
                     verdict = {
                         "status": "RESTRICTED",
                         "summary": (
                             "HIGH-risk transformation blocked; original function preserved."
+                            if risk_rejected
+                            else "No valid rewrite produced; original function preserved."
                         ),
                         "violations": [],
                         "target_coverage": [],
@@ -320,7 +354,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
     n_total = len(results)
     n_pass = sum(1 for r in results if r.get("status") == "PASS")
     n_restricted = sum(1 for r in results if r.get("status") == "RESTRICTED")
-    all_ok = all(r.get("status") in ("PASS", "RESTRICTED") for r in results)
+    all_ok = n_total > 0 and all(r.get("status") in ("PASS", "RESTRICTED") for r in results)
 
     errors = [
         v
@@ -349,7 +383,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         "transformed_targets": n_pass,
         "restricted_targets": n_restricted,
         "missing_targets": n_total - n_pass - n_restricted,
-        "rewrite_coverage": (n_pass / n_total) if n_total else 1.0,
+        "rewrite_coverage": (n_pass / n_total) if n_total else 0.0,
         "target_coverage": [
             {
                 "file": r.get("file", ""),

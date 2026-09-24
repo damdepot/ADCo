@@ -1,7 +1,6 @@
 """File utility tools for reading and writing JSON files."""
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 

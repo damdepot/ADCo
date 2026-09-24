@@ -13,6 +13,7 @@ from ..models import (
     DependencyType,
 )
 from .ast_analyzer import analyze_source
+from .._common import target_names
 from ..models.ast_models import FileAnalysis, FunctionAnalysis, DatabaseOperation
 from .dependency_graph import build_dependency_graph, DependencyGraph
 from .sql_analysis import (
@@ -88,19 +89,6 @@ def _residual_loop_ops(ops: List[DatabaseOperation]) -> List[DatabaseOperation]:
         residual.append(op)
     return residual
 
-def _target_names(target: ast.AST) -> List[str]:
-    """Resolve the assigned name(s) from an assignment/unpacking target."""
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names: List[str] = []
-        for elt in target.elts:
-            names.extend(_target_names(elt))
-        return names
-    if isinstance(target, ast.Starred):
-        return _target_names(target.value)
-    return []
-
 def _collect_local_names(node: ast.AST) -> tuple[set[str], set[str], set[str]]:
     """Return (assigned, loaded, excluded) names for a function AST node."""
     assigned: set[str] = set()
@@ -109,17 +97,17 @@ def _collect_local_names(node: ast.AST) -> tuple[set[str], set[str], set[str]]:
     for child in ast.walk(node):
         if isinstance(child, ast.Assign):
             for t in child.targets:
-                assigned.update(_target_names(t))
+                assigned.update(target_names(t))
         elif isinstance(child, ast.AnnAssign):
-            assigned.update(_target_names(child.target))
+            assigned.update(target_names(child.target))
         elif isinstance(child, ast.AugAssign):
-            names = _target_names(child.target)
+            names = target_names(child.target)
             assigned.update(names)
             loaded.update(names)
         elif isinstance(child, (ast.For, ast.AsyncFor)):
-            assigned.update(_target_names(child.target))
+            assigned.update(target_names(child.target))
         elif isinstance(child, ast.NamedExpr):
-            assigned.update(_target_names(child.target))
+            assigned.update(target_names(child.target))
         elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
             loaded.add(child.id)
         elif isinstance(child, ast.Global):
@@ -411,20 +399,28 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             return True
         return fn_name in target_regions or fn_name.split(".")[-1] in target_regions
 
-    opt_row = row_index_violations(optimized_source)
-    orig_row = row_index_violations(original_source)
-    orig_row_sigs = {
-        (v["function"], v["sql"], v["max_index"], v["line"]) for v in orig_row
-    }
-    seen_row = set()
-    for site in opt_row:
-        signature = (site["function"], site["sql"], site["max_index"], site["line"])
-        dedup_key = (site["function"], site["sql"], site["line"])
-        if dedup_key in seen_row or signature in orig_row_sigs:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_row.add(dedup_key)
+    def _new_sites(check_fn, orig_key_fn, dedup_key_fn=None):
+        """Return opt sites that are new vs the original and inside target regions."""
+        if dedup_key_fn is None:
+            dedup_key_fn = orig_key_fn
+        orig_keys = {orig_key_fn(v) for v in check_fn(original_source)}
+        seen = set()
+        out = []
+        for site in check_fn(optimized_source):
+            dedup_key = dedup_key_fn(site)
+            if dedup_key in seen or orig_key_fn(site) in orig_keys:
+                continue
+            if not _in_target_regions(site["function"]):
+                continue
+            seen.add(dedup_key)
+            out.append(site)
+        return out
+
+    for site in _new_sites(
+        row_index_violations,
+        lambda v: (v["function"], v["sql"], v["max_index"], v["line"]),
+        lambda v: (v["function"], v["sql"], v["line"]),
+    ):
         violations.append(VerificationViolation(
             code="ROW_INDEX_OUT_OF_RANGE",
             severity="ERROR",
@@ -438,17 +434,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             actual=site["max_index"],
         ))
 
-    opt_plan = planner_unfriendly_sql(optimized_source)
-    orig_plan = planner_unfriendly_sql(original_source)
-    orig_plan_keys = {(v["function"], v["sql"], v["line"]) for v in orig_plan}
-    seen_plan = set()
-    for site in opt_plan:
-        dedup_key = (site["function"], site["sql"], site["line"])
-        if dedup_key in seen_plan or dedup_key in orig_plan_keys:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_plan.add(dedup_key)
+    for site in _new_sites(
+        planner_unfriendly_sql,
+        lambda v: (v["function"], v["sql"], v["line"]),
+    ):
         violations.append(VerificationViolation(
             code="PLANNER_UNFRIENDLY_SQL",
             severity="WARNING",
@@ -459,17 +448,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_implicit = implicit_join_sql(optimized_source)
-    orig_implicit = implicit_join_sql(original_source)
-    orig_implicit_keys = {(v["function"], v["sql"]) for v in orig_implicit}
-    seen_implicit = set()
-    for site in opt_implicit:
-        dedup_key = (site["function"], site["sql"])
-        if dedup_key in seen_implicit or dedup_key in orig_implicit_keys:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_implicit.add(dedup_key)
+    for site in _new_sites(
+        implicit_join_sql,
+        lambda v: (v["function"], v["sql"]),
+    ):
         snippet = " ".join(site["sql"].split())
         if len(snippet) > 160:
             snippet = snippet[:157] + "..."
@@ -483,17 +465,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_multi = multi_statement_sql(optimized_source)
-    orig_multi = multi_statement_sql(original_source)
-    orig_multi_keys = {(v["function"], v["sql"]) for v in orig_multi}
-    seen_multi = set()
-    for site in opt_multi:
-        dedup_key = (site["function"], site["sql"])
-        if dedup_key in seen_multi or dedup_key in orig_multi_keys:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_multi.add(dedup_key)
+    for site in _new_sites(
+        multi_statement_sql,
+        lambda v: (v["function"], v["sql"]),
+    ):
         violations.append(VerificationViolation(
             code="MULTI_STATEMENT_EXECUTE",
             severity="ERROR",
@@ -505,17 +480,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_dup_where = duplicate_where_sql(optimized_source)
-    orig_dup_where = duplicate_where_sql(original_source)
-    orig_dup_where_keys = {(v["function"], v["sql"]) for v in orig_dup_where}
-    seen_dup_where = set()
-    for site in opt_dup_where:
-        dedup_key = (site["function"], site["sql"])
-        if dedup_key in seen_dup_where or dedup_key in orig_dup_where_keys:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_dup_where.add(dedup_key)
+    for site in _new_sites(
+        duplicate_where_sql,
+        lambda v: (v["function"], v["sql"]),
+    ):
         violations.append(VerificationViolation(
             code="DUPLICATE_WHERE",
             severity="ERROR",
@@ -527,17 +495,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_unknown = unknown_query_key_sql(optimized_source)
-    orig_unknown = unknown_query_key_sql(original_source)
-    orig_unknown_keys = {(v["function"], v["key"]) for v in orig_unknown}
-    seen_unknown = set()
-    for site in opt_unknown:
-        dedup_key = (site["function"], site["key"])
-        if dedup_key in seen_unknown or dedup_key in orig_unknown_keys:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_unknown.add(dedup_key)
+    for site in _new_sites(
+        unknown_query_key_sql,
+        lambda v: (v["function"], v["key"]),
+    ):
         violations.append(VerificationViolation(
             code="UNKNOWN_QUERY_KEY",
             severity="ERROR",
@@ -548,17 +509,11 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_dup_col = duplicate_column_predicate_sql(optimized_source)
-    orig_dup_col = duplicate_column_predicate_sql(original_source)
-    orig_dup_col_keys = {(v["function"], v["column"]) for v in orig_dup_col}
-    seen_dup_col = set()
-    for site in opt_dup_col:
-        dedup_key = (site["function"], site["column"], site["line"])
-        if dedup_key in seen_dup_col or (site["function"], site["column"]) in orig_dup_col_keys:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_dup_col.add(dedup_key)
+    for site in _new_sites(
+        duplicate_column_predicate_sql,
+        lambda v: (v["function"], v["column"]),
+        lambda v: (v["function"], v["column"], v["line"]),
+    ):
         snippet = " ".join(site["sql"].split())
         if len(snippet) > 160:
             snippet = snippet[:157] + "..."
@@ -574,17 +529,11 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_arity = placeholder_param_mismatch_sql(optimized_source)
-    orig_arity = placeholder_param_mismatch_sql(original_source)
-    orig_arity_keys = {(v["function"], v["sql"]) for v in orig_arity}
-    seen_arity = set()
-    for site in opt_arity:
-        dedup_key = (site["function"], site["sql"], site["line"])
-        if dedup_key in seen_arity or (site["function"], site["sql"]) in orig_arity_keys:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_arity.add(dedup_key)
+    for site in _new_sites(
+        placeholder_param_mismatch_sql,
+        lambda v: (v["function"], v["sql"]),
+        lambda v: (v["function"], v["sql"], v["line"]),
+    ):
         violations.append(VerificationViolation(
             code="PLACEHOLDER_PARAM_MISMATCH",
             severity="ERROR",
@@ -596,19 +545,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_percent = percent_format_arity_violations(optimized_source)
-    orig_percent = percent_format_arity_violations(original_source)
-    orig_percent_sigs = {
-        (v["function"], v["template"], v["line"]) for v in orig_percent
-    }
-    seen_percent = set()
-    for site in opt_percent:
-        signature = (site["function"], site["template"], site["line"])
-        if signature in seen_percent or signature in orig_percent_sigs:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_percent.add(signature)
+    for site in _new_sites(
+        percent_format_arity_violations,
+        lambda v: (v["function"], v["template"], v["line"]),
+    ):
         violations.append(VerificationViolation(
             code="PERCENT_FORMAT_ARITY",
             severity="ERROR",
@@ -627,17 +567,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             actual=site["actual"],
         ))
 
-    opt_undef = undefined_name_violations(optimized_source)
-    orig_undef = undefined_name_violations(original_source)
-    orig_undef_sigs = {(v["function"], v["name"]) for v in orig_undef}
-    seen_undef = set()
-    for site in opt_undef:
-        signature = (site["function"], site["name"])
-        if signature in seen_undef or signature in orig_undef_sigs:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_undef.add(signature)
+    for site in _new_sites(
+        undefined_name_violations,
+        lambda v: (v["function"], v["name"]),
+    ):
         violations.append(VerificationViolation(
             code="UNDEFINED_NAME",
             severity="ERROR",
@@ -650,17 +583,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_slow = slow_executemany_violations(optimized_source)
-    orig_slow = slow_executemany_violations(original_source)
-    orig_slow_sigs = {(v["function"], v["line"]) for v in orig_slow}
-    seen_slow = set()
-    for site in opt_slow:
-        signature = (site["function"], site["line"])
-        if signature in seen_slow or signature in orig_slow_sigs:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_slow.add(signature)
+    for site in _new_sites(
+        slow_executemany_violations,
+        lambda v: (v["function"], v["line"]),
+    ):
         violations.append(VerificationViolation(
             code="SLOW_EXECUTEMANY",
             severity="ERROR",
@@ -673,17 +599,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_fragile = fragile_composite_agg_sql(optimized_source)
-    orig_fragile = fragile_composite_agg_sql(original_source)
-    orig_fragile_keys = {(v["function"], v["sql"]) for v in orig_fragile}
-    seen_fragile = set()
-    for site in opt_fragile:
-        dedup_key = (site["function"], site["sql"])
-        if dedup_key in seen_fragile or dedup_key in orig_fragile_keys:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_fragile.add(dedup_key)
+    for site in _new_sites(
+        fragile_composite_agg_sql,
+        lambda v: (v["function"], v["sql"]),
+    ):
         violations.append(VerificationViolation(
             code="FRAGILE_COMPOSITE_AGG",
             severity="ERROR",
@@ -696,17 +615,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_composite_any = composite_any_array_sql(optimized_source)
-    orig_composite_any = composite_any_array_sql(original_source)
-    orig_composite_any_keys = {(v["function"], v["sql"]) for v in orig_composite_any}
-    seen_composite_any = set()
-    for site in opt_composite_any:
-        dedup_key = (site["function"], site["sql"])
-        if dedup_key in seen_composite_any or dedup_key in orig_composite_any_keys:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_composite_any.add(dedup_key)
+    for site in _new_sites(
+        composite_any_array_sql,
+        lambda v: (v["function"], v["sql"]),
+    ):
         violations.append(VerificationViolation(
             code="COMPOSITE_ANY_ARRAY",
             severity="ERROR",
@@ -719,17 +631,10 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             ),
         ))
 
-    opt_lookup = lookup_key_not_selected_sql(optimized_source)
-    orig_lookup = lookup_key_not_selected_sql(original_source)
-    orig_lookup_keys = {(v["function"], v["sql"]) for v in orig_lookup}
-    seen_lookup = set()
-    for site in opt_lookup:
-        dedup_key = (site["function"], site["sql"])
-        if dedup_key in seen_lookup or dedup_key in orig_lookup_keys:
-            continue
-        if not _in_target_regions(site["function"]):
-            continue
-        seen_lookup.add(dedup_key)
+    for site in _new_sites(
+        lookup_key_not_selected_sql,
+        lambda v: (v["function"], v["sql"]),
+    ):
         violations.append(VerificationViolation(
             code="LOOKUP_KEY_NOT_SELECTED",
             severity="ERROR",

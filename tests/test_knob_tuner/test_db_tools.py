@@ -2,8 +2,16 @@
 
 from unittest.mock import MagicMock, patch
 import pytest
+from src.knob_tuner.contracts import ApplyMode, KnobScope
 from src.knob_tuner.tools.db_connector import DBConfig
-from src.knob_tuner.tools.db_tools import apply_knobs, test_database as run_test_database, verify_active_knobs, _parse_time_to_ms, _parse_enumvals
+from src.knob_tuner.tools.db_tools import (
+    apply_knobs,
+    snapshot_settings,
+    test_database as run_test_database,
+    verify_active_knobs,
+    _parse_time_to_ms,
+    _parse_enumvals,
+)
 
 
 def test_apply_knobs_dry_run_postgres(mock_db_config_pg):
@@ -114,6 +122,116 @@ def test_apply_knobs_unsupported_db_type():
     assert len(results) == 1
     assert results[0]["status"] == "failed"
     assert "Unsupported db_type" in results[0]["error"]
+
+
+def test_apply_knobs_mode_none_skips_all_no_connection(mock_db_config_pg):
+    knobs = [
+        {"name": "work_mem", "value": "64MB", "scope": "user"},
+        {"name": "shared_buffers", "value": "1GB", "scope": "postmaster"},
+        {"name": "max_worker_processes", "value": 8, "scope": "internal"},
+    ]
+    with patch("src.knob_tuner.tools.db_tools.get_connection") as mock_conn:
+        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.NONE)
+    mock_conn.assert_not_called()
+    assert len(results) == 3
+    for result in results:
+        assert result["status"] == "skipped"
+        assert result["sql"] == ""
+        assert result["error"] is None
+
+
+def test_apply_knobs_mode_dynamic_excludes_static_and_rejects_internal(
+    mock_db_config_pg, mock_db_conn
+):
+    conn, cursor = mock_db_conn
+    knobs = [
+        {"name": "work_mem", "value": "64MB", "scope": "user"},
+        {"name": "shared_buffers", "value": "1GB", "scope": KnobScope.POSTMASTER},
+        {"name": "max_worker_processes", "value": 8, "scope": "internal"},
+    ]
+    with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
+        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.DYNAMIC)
+
+    assert len(results) == 3
+    assert results[0]["status"] == "applied"
+    assert results[1]["status"] == "skipped"
+    assert results[2]["status"] == "failed"
+    assert results[2]["error"] == "internal knob rejected: max_worker_processes"
+    assert results[2]["sql"] == ""
+    # One ALTER for work_mem + one pg_reload_conf()
+    assert cursor.execute.call_count == 2
+
+
+def test_apply_knobs_mode_persist_static_applies_full_plan_and_reloads(
+    mock_db_config_pg, mock_db_conn
+):
+    conn, cursor = mock_db_conn
+    knobs = [
+        {"name": "work_mem", "value": "64MB", "scope": "user"},
+        {"name": "shared_buffers", "value": "1GB", "scope": "postmaster"},
+        {"name": "max_worker_processes", "value": 8, "scope": "internal"},
+    ]
+    with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
+        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.PERSIST_STATIC)
+
+    # Reloadable knobs go live; restart-required knobs are persisted (pending a
+    # manual restart); internal knobs are rejected.
+    assert results[0]["status"] == "applied"
+    assert results[1]["status"] == "applied"
+    assert results[2]["status"] == "failed"
+    # Two ALTERs + reload.
+    assert cursor.execute.call_count == 3
+    assert cursor.execute.call_args_list[-1].args[0] == "SELECT pg_reload_conf();"
+
+
+def test_apply_knobs_internal_rejected_in_dry_run(mock_db_config_pg):
+    knobs = [{"name": "max_worker_processes", "value": 8, "scope": "internal"}]
+    results = apply_knobs(knobs, mock_db_config_pg, dry_run=True)
+    assert results[0]["status"] == "failed"
+    assert results[0]["error"] == "internal knob rejected: max_worker_processes"
+    assert results[0]["sql"] == ""
+
+
+def test_snapshot_settings_postgres(mock_db_config_pg):
+    rows = [
+        {"name": "work_mem", "setting": "4096"},
+        {"name": "shared_buffers", "setting": "16384"},
+    ]
+    with patch(
+        "src.knob_tuner.tools.db_tools.run_safe_query", return_value=rows
+    ) as mock_query:
+        snapshot = snapshot_settings(
+            mock_db_config_pg, ["work_mem", "shared_buffers", "missing"]
+        )
+    assert snapshot == {"work_mem": "4096", "shared_buffers": "16384"}
+    assert "pg_settings" in mock_query.call_args.args[1]
+
+
+def test_snapshot_settings_mysql_case_insensitive(mock_db_config_mysql):
+    rows = [
+        {"VARIABLE_NAME": "MAX_CONNECTIONS", "VARIABLE_VALUE": "151"},
+        {"VARIABLE_NAME": "innodb_buffer_pool_size", "VARIABLE_VALUE": "134217728"},
+    ]
+    with patch("src.knob_tuner.tools.db_tools.run_safe_query", return_value=rows):
+        snapshot = snapshot_settings(
+            mock_db_config_mysql, ["max_connections", "INNODB_BUFFER_POOL_SIZE"]
+        )
+    assert snapshot["max_connections"] == "151"
+    assert snapshot["INNODB_BUFFER_POOL_SIZE"] == "134217728"
+
+
+def test_snapshot_settings_returns_empty_on_error(mock_db_config_pg):
+    with patch(
+        "src.knob_tuner.tools.db_tools.run_safe_query",
+        side_effect=Exception("connection refused"),
+    ):
+        assert snapshot_settings(mock_db_config_pg, ["work_mem"]) == {}
+
+
+def test_snapshot_settings_empty_names(mock_db_config_pg):
+    with patch("src.knob_tuner.tools.db_tools.run_safe_query") as mock_query:
+        assert snapshot_settings(mock_db_config_pg, []) == {}
+    mock_query.assert_not_called()
 
 
 def test_test_database_success(mock_db_config_pg, mock_db_conn):

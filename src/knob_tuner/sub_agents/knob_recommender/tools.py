@@ -2,7 +2,6 @@
 
 import os
 import re
-from pathlib import Path
 from typing import Any
 
 from google.adk.tools import ToolContext

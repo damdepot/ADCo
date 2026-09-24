@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .sql_analysis import _FUNCTION_NODES, _FunctionAnalyzer, _iter_functions
 from .sql_resolver import SENTINEL, collect_module_dicts, resolve
+from .._common import target_names
 
 _FORMAT_RE = re.compile(r"%(?:\(([A-Za-z_]\w*)\))?[-#0 +]*\d*(?:\.\d+)?[diouxXeEfFgGcrsa]")
 _DYNAMIC_SCOPE_CALLS = {"globals", "locals", "eval", "exec"}
@@ -216,21 +217,6 @@ def percent_format_arity_violations(source: str) -> List[dict]:
     return violations
 
 
-def _target_names(node: Optional[ast.AST]) -> Set[str]:
-    if node is None:
-        return set()
-    if isinstance(node, ast.Name):
-        return {node.id}
-    if isinstance(node, (ast.Tuple, ast.List)):
-        names: Set[str] = set()
-        for elt in node.elts:
-            names |= _target_names(elt)
-        return names
-    if isinstance(node, ast.Starred):
-        return _target_names(node.value)
-    return set()
-
-
 def _bound_names(node: ast.AST) -> Set[str]:
     """Names bound by *node* at module scope (does not descend into scopes)."""
     names: Set[str] = set()
@@ -238,9 +224,9 @@ def _bound_names(node: ast.AST) -> Set[str]:
         names.add(node.name)
     elif isinstance(node, ast.Assign):
         for target in node.targets:
-            names |= _target_names(target)
+            names |= set(target_names(target))
     elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-        names |= _target_names(node.target)
+        names |= set(target_names(node.target))
     elif isinstance(node, ast.Import):
         for alias in node.names:
             names.add(alias.asname or alias.name.split(".")[0])
@@ -249,12 +235,12 @@ def _bound_names(node: ast.AST) -> Set[str]:
             if alias.name != "*":
                 names.add(alias.asname or alias.name)
     elif isinstance(node, (ast.For, ast.AsyncFor)):
-        names |= _target_names(node.target)
+        names |= set(target_names(node.target))
         for child in list(node.body) + list(node.orelse):
             names |= _bound_names(child)
     elif isinstance(node, (ast.With, ast.AsyncWith)):
         for item in node.items:
-            names |= _target_names(item.optional_vars)
+            names |= set(target_names(item.optional_vars))
         for child in node.body:
             names |= _bound_names(child)
     elif isinstance(node, ast.Try):

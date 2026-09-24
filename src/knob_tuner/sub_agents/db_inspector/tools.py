@@ -1,14 +1,12 @@
 """Tools for db_inspector sub-agent — schema inspection, knob extraction, file output."""
 
 import os
-from typing import Any
 
 from google.adk.tools import ToolContext
 
 from src.knob_tuner.sub_agents.db_inspector.models import (
     KnobInfo,
     TableInfo,
-    WorkloadPattern,
 )
 from src.knob_tuner.tools.db_connector import DBConfig, run_safe_query
 from src.knob_tuner.tools.file_tools import write_json_file

@@ -23,3 +23,6 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "case_study: tests that require external benchmark checkouts (e.g. TPC-C) and are excluded from the default core suite",
+]
