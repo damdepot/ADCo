@@ -10,6 +10,9 @@ services:
     ports:
       - "5432:5432"
     platform: linux/amd64
+    # ponytail: live/target DB limits are still hardcoded and are NOT tied to
+    # the per-run ResourceBudget (deferred). Upgrade: drive these from env vars
+    # and verify with `docker inspect` against the requested budget.
     deploy:
       resources:
         limits:
