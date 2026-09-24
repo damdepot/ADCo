@@ -24,6 +24,12 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
+_REQUIRED_ARGS_BY_MODE: dict[str, tuple[str, ...]] = {
+    "all": ("sandbox_dir", "db_type", "db_name", "cpu_cores", "memory"),
+    "rewrite-only": ("sandbox_dir", "db_type", "db_name"),
+    "tune-only": ("db_type", "db_name", "cpu_cores", "memory"),
+}
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -65,19 +71,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--sandbox-dir",
         default=None,
-        help="Directory to write the rewritten project into (rewrite modes only)",
+        help="Directory to write the rewritten project into (required for 'all' and 'rewrite-only' modes)",
     )
     # Knob tuner
-    p.add_argument("--db-name", default="", help="Database name (required for 'all' or 'tune-only' mode)")
+    p.add_argument(
+        "--db-name",
+        default=None,
+        help="Database name (required for 'all', 'rewrite-only', and 'tune-only' modes)",
+    )
     p.add_argument(
         "--db-type",
         choices=["postgres", "mysql"],
-        default="postgres",
-        help="Database engine type (postgres or mysql)",
+        default=None,
+        help="Database engine type: postgres or mysql (required for all modes)",
     )
     p.add_argument("--db-config", default="db.config", help="Path to database config INI file")
-    p.add_argument("--cpu-cores", default="auto", help="Number of CPU cores allocated for DB")
-    p.add_argument("--memory", default="auto", help="Database memory limit in GB")
+    p.add_argument(
+        "--cpu-cores",
+        default=None,
+        help="Number of CPU cores allocated for DB (required for 'all' and 'tune-only' modes)",
+    )
+    p.add_argument(
+        "--memory",
+        default=None,
+        help="Database memory limit in GB (required for 'all' and 'tune-only' modes)",
+    )
     p.add_argument(
         "--knob-path",
         default="out/adco/knobs",
@@ -280,8 +298,16 @@ def main() -> None:
 
     mode = args.mode
 
-    if mode in ("all", "tune-only") and not args.db_name:
-        print("ERROR: --db-name is required when mode is 'all' or 'tune-only'", file=sys.stderr)
+    missing = [
+        f"--{name.replace('_', '-')}"
+        for name in _REQUIRED_ARGS_BY_MODE[mode]
+        if not getattr(args, name)
+    ]
+    if missing:
+        print(
+            f"ERROR: missing required argument(s) for mode '{mode}': {', '.join(missing)}",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     check_auth()

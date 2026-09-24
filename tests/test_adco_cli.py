@@ -23,10 +23,11 @@ def test_build_parser():
     assert args.target == "my_target"
     assert args.db_name == "test_db"
     assert args.model == DEFAULT_MODEL
-    assert args.db_type == "postgres"
+    assert args.db_type is None
     assert args.db_config == "db.config"
-    assert args.cpu_cores == "auto"
-    assert args.memory == "auto"
+    assert args.cpu_cores is None
+    assert args.memory is None
+    assert args.sandbox_dir is None
     assert args.log_file == "logs/adco.log"
     assert args.output_path == "out/adco/result.json"
     assert args.intent_output == "out/adco/intent_result.json"
@@ -441,7 +442,21 @@ def test_main_success(mock_run, monkeypatch, capsys, tmp_path):
     d = tmp_path / "target_app"
     d.mkdir()
 
-    monkeypatch.setattr("sys.argv", ["adco", str(d), "--mode", "rewrite-only"])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "adco",
+            str(d),
+            "--mode",
+            "rewrite-only",
+            "--sandbox-dir",
+            str(tmp_path / "sandbox"),
+            "--db-type",
+            "postgres",
+            "--db-name",
+            "testdb",
+        ],
+    )
 
     with pytest.raises(SystemExit) as exc_info:
         main()
@@ -460,3 +475,87 @@ def test_main_invalid_target(monkeypatch, capsys):
     assert exc_info.value.code == 2
     captured = capsys.readouterr()
     assert "ERROR: target is not a directory" in captured.err
+
+
+def test_main_missing_required_all_mode(monkeypatch, capsys, tmp_path):
+    d = tmp_path / "target_app"
+    d.mkdir()
+    monkeypatch.setattr("sys.argv", ["adco", str(d), "--mode", "all"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "missing required argument(s) for mode 'all'" in captured.err
+    for flag in ("--sandbox-dir", "--db-type", "--db-name", "--cpu-cores", "--memory"):
+        assert flag in captured.err
+
+
+def test_main_missing_required_rewrite_only_mode(monkeypatch, capsys, tmp_path):
+    d = tmp_path / "target_app"
+    d.mkdir()
+    monkeypatch.setattr("sys.argv", ["adco", str(d), "--mode", "rewrite-only"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "missing required argument(s) for mode 'rewrite-only'" in captured.err
+    for flag in ("--sandbox-dir", "--db-type", "--db-name"):
+        assert flag in captured.err
+    assert "--cpu-cores" not in captured.err
+    assert "--memory" not in captured.err
+
+
+def test_main_missing_required_tune_only_mode(monkeypatch, capsys, tmp_path):
+    d = tmp_path / "target_app"
+    d.mkdir()
+    monkeypatch.setattr(
+        "sys.argv",
+        ["adco", str(d), "--mode", "tune-only", "--db-type", "postgres", "--db-name", "testdb"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "missing required argument(s) for mode 'tune-only'" in captured.err
+    assert "--cpu-cores" in captured.err
+    assert "--memory" in captured.err
+    assert "--sandbox-dir" not in captured.err
+
+
+@patch("src.adco.main.run_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.check_auth")
+def test_main_all_mode_accepts_required_args(mock_auth, mock_run, monkeypatch, capsys, tmp_path):
+    d = tmp_path / "target_app"
+    d.mkdir()
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "adco",
+            str(d),
+            "--mode",
+            "all",
+            "--sandbox-dir",
+            str(tmp_path / "sandbox"),
+            "--db-type",
+            "postgres",
+            "--db-name",
+            "testdb",
+            "--cpu-cores",
+            "4",
+            "--memory",
+            "8",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 0
+    assert mock_auth.called
+    assert mock_run.called
