@@ -38,7 +38,3 @@ def create_db_inspector_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lit
             temperature=0.0,
         ),
     )
-
-
-# Backward compatibility alias
-create_intent_analyzer_agent = create_db_inspector_agent

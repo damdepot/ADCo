@@ -13,12 +13,26 @@ from dotenv import load_dotenv
 
 from src.adco.auth_check import check_auth
 from src.intent_analyzer.main import run_pipeline as intent_analyzer_pipeline
+from src.intent_analyzer.tools.db_engine import (
+    filter_paths_by_db_type,
+    filter_targets_by_db_type,
+)
 from src.code_rewriter.main import run_pipeline as rewriter_pipeline, _maybe_parse
-from src.knob_tuner.main import run_pipeline as tuner_pipeline
+from src.knob_tuner.main import (
+    _derive_status as _tuner_status,
+    _parse_budget,
+    run_pipeline as tuner_pipeline,
+)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+_REQUIRED_ARGS_BY_MODE: dict[str, tuple[str, ...]] = {
+    "all": ("sandbox_dir", "db_type", "db_name", "cpu_cores", "memory"),
+    "rewrite-only": ("sandbox_dir", "db_type", "db_name"),
+    "tune-only": ("db_type", "db_name", "cpu_cores", "memory"),
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,19 +75,41 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--sandbox-dir",
         default=None,
-        help="Directory to write the rewritten project into (rewrite modes only)",
+        help="Directory to write the rewritten project into (required for 'all' and 'rewrite-only' modes)",
     )
     # Knob tuner
-    p.add_argument("--db-name", default="", help="Database name (required for 'all' or 'tune-only' mode)")
+    p.add_argument(
+        "--db-name",
+        default=None,
+        help="Database name (required for 'all', 'rewrite-only', and 'tune-only' modes)",
+    )
     p.add_argument(
         "--db-type",
         choices=["postgres", "mysql"],
-        default="postgres",
-        help="Database engine type (postgres or mysql)",
+        default=None,
+        help="Database engine type: postgres or mysql (required for all modes)",
     )
     p.add_argument("--db-config", default="db.config", help="Path to database config INI file")
-    p.add_argument("--cpu-cores", default="auto", help="Number of CPU cores allocated for DB")
-    p.add_argument("--memory", default="auto", help="Database memory limit in GB")
+    p.add_argument(
+        "--cpu-cores",
+        default=None,
+        help="Number of CPU cores allocated for DB (required for 'all' and 'tune-only' modes)",
+    )
+    p.add_argument(
+        "--memory",
+        default=None,
+        help="Database memory limit in GB (required for 'all' and 'tune-only' modes)",
+    )
+    p.add_argument(
+        "--apply-mode",
+        choices=["none", "dynamic", "persist-static"],
+        default="dynamic",
+        help=(
+            "How validated knobs are applied live: 'dynamic' applies reloadable "
+            "knobs; 'persist-static' also persists restart-required knobs for a "
+            "manual restart (default: dynamic)"
+        ),
+    )
     p.add_argument(
         "--knob-path",
         default="out/adco/knobs",
@@ -125,6 +161,7 @@ async def run_pipeline(
     dry_run: bool = False,
     verbose: bool = False,
     buffer_time: float = 0.0,
+    apply_mode: str = "dynamic",
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
 
@@ -136,9 +173,14 @@ async def run_pipeline(
         output_path=intent_output_path,
         verbose=verbose,
         buffer_time=buffer_time,
+        db_type=db_type,
     )
 
     intent_output = intent_state.get("intent_output") or intent_state.get("intent_extractor_output") or {}
+    if isinstance(intent_output, dict) and isinstance(intent_output.get("optimization_targets"), list):
+        intent_output["optimization_targets"] = filter_targets_by_db_type(
+            intent_output["optimization_targets"], db_type
+        )
     workload_info = intent_state.get("workload_info") or (intent_output.get("workload") if isinstance(intent_output, dict) else {})
 
     # ── Phase 2: Code Rewriter ─────────────────────────────
@@ -166,6 +208,7 @@ async def run_pipeline(
                 except Exception:
                     pass
 
+            selected_files = filter_paths_by_db_type(selected_files, db_type)
             if selected_files:
                 intent_output["optimization_targets"] = [
                     {"file": f, "description": "Database interaction file to inspect and optimize"}
@@ -229,10 +272,14 @@ async def run_pipeline(
             db_name=db_name,
             extra_initial_state=tuner_extra_state,
             buffer_time=buffer_time,
+            apply_mode=apply_mode,
         )
     else:
         if verbose:
             print("Skipping knob tuning phase as mode is 'rewrite-only'.")
+
+    tuner_run_dir = tuner_state.get("run_dir") if isinstance(tuner_state, dict) else None
+    tuner_status = _tuner_status(tuner_state) if isinstance(tuner_state, dict) else "UNKNOWN"
 
     # ── Combined output ────────────────────────────────────
     combined: dict[str, Any] = {
@@ -241,6 +288,8 @@ async def run_pipeline(
         "target": target_abs,
         "sandbox": sandbox,
         "model": model,
+        "tuner_run_dir": tuner_run_dir,
+        "tuner_status": tuner_status,
         "intent_analyzer": _maybe_parse(
             open(intent_output_path).read() if os.path.exists(intent_output_path) else "{}"
         ),
@@ -270,14 +319,30 @@ def main() -> None:
 
     mode = args.mode
 
-    if mode in ("all", "tune-only") and not args.db_name:
-        print("ERROR: --db-name is required when mode is 'all' or 'tune-only'", file=sys.stderr)
+    missing = [
+        f"--{name.replace('_', '-')}"
+        for name in _REQUIRED_ARGS_BY_MODE[mode]
+        if not getattr(args, name)
+    ]
+    if missing:
+        print(
+            f"ERROR: missing required argument(s) for mode '{mode}': {', '.join(missing)}",
+            file=sys.stderr,
+        )
         sys.exit(2)
+
+    # Validate the resource contract before any side effect (auth, Docker, LLM).
+    if mode in ("all", "tune-only"):
+        try:
+            _parse_budget(args.cpu_cores, args.memory)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(2)
 
     check_auth()
 
     try:
-        asyncio.run(
+        result = asyncio.run(
             run_pipeline(
                 target=target,
                 model=args.model,
@@ -298,6 +363,7 @@ def main() -> None:
                 dry_run=args.dry_run,
                 verbose=args.verbose,
                 buffer_time=getattr(args, "buffer_time", 0.0),
+                apply_mode=args.apply_mode,
             )
         )
     except Exception as exc:
@@ -305,4 +371,9 @@ def main() -> None:
         sys.exit(1)
 
     print("\n=== ADCo Pipeline COMPLETED ===")
+    tuner_run_dir = result.get("tuner_run_dir")
+    tuner_status = result.get("tuner_status")
+    if tuner_run_dir or tuner_status:
+        print(f"Tuner run directory: {tuner_run_dir}")
+        print(f"Tuner status:        {tuner_status}")
     sys.exit(0)

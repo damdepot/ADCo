@@ -1,18 +1,14 @@
-"""CLI entry point for the ADCo rewriter pipeline.
+"""Programmatic entry point for the ADCo rewriter pipeline.
 
-Usage:
-    uv run python -m src.code_rewriter <target_dir> [--model MODEL] [--verbose]
+Driven by the unified pipeline (``src.adco``) via :func:`run_pipeline`; the
+intent analyzer always runs first, so the rewriter has no standalone CLI.
 """
 
 from __future__ import annotations
 
-import argparse
-import asyncio
 import datetime
 import json
 import os
-import re
-import sys
 import uuid
 from typing import Any
 
@@ -20,28 +16,16 @@ from dotenv import load_dotenv
 from google.genai import types
 
 from google.adk.models import Gemini
+from src.code_rewriter._common import _maybe_parse
 from src.code_rewriter.agent import create_root_agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
-from src.intent_analyzer.main import run_pipeline as run_intent_analyzer
+from src.code_rewriter.tools.pipeline_analysis import build_contracts_from_intent, build_target_context_map
+from src.code_rewriter.tools.db_interaction import build_read_write_map
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-
-
-def _maybe_parse(value: Any) -> Any:
-    """Return *value* as a dict, JSON-parsing strings (stripping markdown fences)."""
-    if isinstance(value, str):
-        stripped = re.sub(r"^```[a-z]*\n?", "", value.strip(), flags=re.MULTILINE)
-        stripped = re.sub(r"```$", "", stripped.strip())
-        try:
-            return json.loads(stripped.strip())
-        except (json.JSONDecodeError, ValueError):
-            return {}
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    return value if isinstance(value, dict) else {}
 
 
 def _log_event(msg: str, log_file: str | None = None, verbose: bool = False) -> None:
@@ -58,50 +42,8 @@ def _log_event(msg: str, log_file: str | None = None, verbose: bool = False) -> 
             pass
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="ADCo Rewriter — application-database co-optimization pipeline",
-    )
-    parser.add_argument(
-        "target",
-        help="Path to the codebase to optimize",
-    )
-    parser.add_argument(
-        "--model",
-        default=DEFAULT_MODEL,
-        help=f"Gemini model to use for all agents (default: {DEFAULT_MODEL})",
-    )
-    parser.add_argument(
-        "--log-file",
-        default="logs/code_rewriter.log",
-        help="Path to execution log file (default: logs/code_rewriter.log)",
-    )
-    parser.add_argument(
-        "--output-path",
-        default="out/code_rewriter/result.json",
-        help="Path to write final tuning result output (default: out/code_rewriter/result.json)",
-    )
-    parser.add_argument(
-        "--sandbox-dir",
-        default=None,
-        help="Directory to write the output project into (skips sandbox-id sub-dir)",
-    )
-    parser.add_argument(
-        "--buffer-time",
-        type=float,
-        default=0.0,
-        help="Buffer sleep time in seconds before each LLM call (default: 0.0)",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Print detailed progress of each pipeline step",
-    )
-    return parser
-
-
 def _write_output_result(output_path: str, state: dict[str, Any], model: str = "") -> None:
-    """Serialize and write final tuning outcome to the output path."""
+    """Serialize and write the rewrite outcome to the output path."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     result_data = {
@@ -116,8 +58,11 @@ def _write_output_result(output_path: str, state: dict[str, Any], model: str = "
             "file_selector_output": _maybe_parse(state.get("file_selector_output", {})),
             "intent_output": _maybe_parse(state.get("intent_output")),
             "intent_extractor_output": _maybe_parse(state.get("intent_extractor_output")),
-            "code_optimizer_output": _maybe_parse(state.get("code_optimizer_output")),
+            "optimizer_output": _maybe_parse(state.get("optimizer_output")),
             "verifier_output": _maybe_parse(state.get("verifier_output")),
+            "deterministic_verification": _maybe_parse(state.get("deterministic_verification", {})),
+            "optimizer_attempts": state.get("optimizer_attempts", []),
+            "transformation_risk": _maybe_parse(state.get("transformation_risk", [])),
         }
     }
 
@@ -146,27 +91,31 @@ async def run_pipeline(
     initial_state = {
         "target": target_abs,
         "sandbox_dir": sandbox_dir_abs,
+        "attempt_count": 0,
     }
     if extra_initial_state:
         initial_state.update(extra_initial_state)
 
-    # Standalone fallback: If intent has not been extracted, run intent_analyzer first
-    if "intent_extractor_output" not in initial_state and "intent_output" not in initial_state:
-        _log_event(
-            f"Intent not in state; running intent_analyzer on {target_abs}",
-            log_file=log_file_abs,
-            verbose=verbose,
+    # Intent is a hard requirement: the unified pipeline (src.adco) always runs
+    # the intent analyzer first and passes its output via extra_initial_state.
+    intent_output = initial_state.get("intent_output") or initial_state.get("intent_extractor_output")
+    if not intent_output:
+        raise RuntimeError(
+            "intent_output is required — run the unified pipeline (src.adco) so the "
+            "intent analyzer runs first, or pass intent_output in extra_initial_state."
         )
-        intent_state = await run_intent_analyzer(
-            target=target_abs,
-            model=model,
-            log_file=log_file_abs,
-            verbose=verbose,
-        )
-        intent = intent_state.get("intent_output") or intent_state.get("intent_extractor_output")
-        if intent:
-            initial_state["intent_output"] = intent
-            initial_state["intent_extractor_output"] = intent
+
+    _log_event("Building rewrite contracts from intent...", log_file=log_file_abs, verbose=verbose)
+    try:
+        analyses, contracts = build_contracts_from_intent(target_abs, intent_output)
+        initial_state["rewrite_contracts"] = [c.model_dump() for c in contracts]
+        _log_event(f"Built {len(contracts)} rewrite contracts.", log_file=log_file_abs, verbose=verbose)
+
+        initial_state["target_context_map"] = build_target_context_map(analyses, contracts, target_abs)
+        initial_state["read_write_map"] = build_read_write_map(analyses)
+    except Exception as e:
+        _log_event(f"Error building contracts: {e}", log_file=log_file_abs, verbose=verbose)
+        raise
 
     session_service = InMemorySessionService()
     sid = uuid.uuid4().hex[:12]
@@ -188,11 +137,10 @@ async def run_pipeline(
     runner = Runner(agent=agent, app_name=app_name, session_service=session_service)
 
     user_message = (
-        f"Optimize the database interaction code in the codebase at: {target_abs}\n\n"
-        f"The database interaction intent has already been extracted into session state. "
-        f"Follow the pipeline order: copy_to_sandbox, get_optimization_strategies, "
-        f"delegate to code_optimizer, then delegate to verifier. Report the "
-        f"verifier's verdict when done."
+        f"Run the ADCo rewriter workflow for the codebase at: {target_abs}.\n\n"
+        f"The extracted intent and rewrite contracts are already in session state. "
+        f"The workflow copies the codebase to a sandbox, selects strategies, then "
+        f"optimizes and deterministically verifies each target function."
     )
     
     _log_event(
@@ -230,52 +178,3 @@ async def run_pipeline(
     _log_event(f"Pipeline completed. Output written to {output_path_abs}", log_file=log_file_abs, verbose=verbose)
 
     return state
-
-# Alias for backwards compatibility
-_run_pipeline = run_pipeline
-
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    target = os.path.abspath(args.target)
-    if not os.path.isdir(target):
-        print(f"ERROR: target is not a directory: {target}", file=sys.stderr)
-        sys.exit(2)
-
-    try:
-        result = asyncio.run(run_pipeline(
-            target=target,
-            model=args.model,
-            log_file=args.log_file,
-            output_path=args.output_path,
-            sandbox_dir=args.sandbox_dir,
-            verbose=args.verbose,
-            buffer_time=getattr(args, "buffer_time", 0.0),
-        ))
-    except Exception as exc:
-        print(f"\n=== Pipeline FAILED ===\nError: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    verdict = _maybe_parse(result.get("verifier_output", {}))
-    status = verdict.get("status", "FAIL")
-    sandbox = result.get("sandbox", "")
-    modified = result.get("modified_files", [])
-
-    print(f"\n=== Pipeline {'PASSED' if status == 'PASS' else 'FAILED'} ===")
-    print(f"Target:    {target}")
-    print(f"Model:     {args.model}")
-    print(f"Sandbox:   {sandbox}")
-    print(f"Modified:  {len(modified)} file(s)")
-    if status == "FAIL":
-        print(f"Category:  {verdict.get('category', 'N/A')}")
-        print(f"Reason:    {verdict.get('reason', 'N/A')}")
-        print(f"Detail:    {verdict.get('detail', 'N/A')}")
-    if args.verbose and verdict:
-        print(f"Verdict:   {verdict}")
-        
-    sys.exit(0 if status == "PASS" else 1)
-
-
-if __name__ == "__main__":
-    main()

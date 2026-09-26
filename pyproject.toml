@@ -18,7 +18,11 @@ dependencies = [
     "google-adk>=2.5.0",
     "pymysql>=1.2.0",
     "psycopg2-binary>=2.9.12",
+    "sqlglot>=30.19.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "case_study: tests that require external benchmark checkouts (e.g. TPC-C) and are excluded from the default core suite",
+]

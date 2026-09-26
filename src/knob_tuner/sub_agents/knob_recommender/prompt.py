@@ -26,8 +26,8 @@ Follow this step-by-step reasoning process before finalizing your recommendation
    - Set `restart_required = True` if any recommended knob requires a server restart.
    - Assign risk levels (`low`, `medium`, `high`) to each recommendation based on operational impact.
 
-5. **Checker Feedback Handling (Remediation & Regression Recovery)**:
-   - If previous tuning feedback or checker errors/regressions are provided:
+5. **Validation Feedback Handling (Remediation & Regression Recovery)**:
+   - If previous tuning feedback or validation errors/regressions are provided:
      - **Functional Failures & Crashes** (e.g., OOM, startup crash, failed CRUD tests, or invalid knob parameters):
        - Query `get_knob_strategies` using error keywords (like 'oom', 'crash', 'connection') to fetch specific remediation strategies.
        - Identify the root cause knob and apply strict safety limits.

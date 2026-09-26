@@ -1,6 +1,7 @@
 """Tools for the verifier agent — syntax check, compare original vs modified, run application."""
 
 import difflib
+import json
 import os
 import re
 import subprocess
@@ -8,12 +9,13 @@ import sys
 from pathlib import Path
 from google.adk.tools import ToolContext
 
-from src.code_rewriter.tools.validator import validate_format_strings
-
-_CODE_ERRORS = re.compile(
-    r"SyntaxError|ImportError|ModuleNotFoundError|NameError|"
-    r"AttributeError|TypeError|IndentationError|ValueError"
+from src.code_rewriter._common import extract_function_source_by_name as _extract_function_source_by_name
+from src.code_rewriter.models.rewrite_models import RewriteContract
+from src.code_rewriter.tools.pipeline_analysis import (
+    verify_all_contracts,
+    verify_contract_target,
 )
+
 _DB_ERRORS = re.compile(
     r"OperationalError|Can't connect|Connection refused|"
     r"Unknown database|Access denied|could not translate host name|"
@@ -41,9 +43,70 @@ def _classify_failure(stderr: str, stdout: str) -> str | None:
         return "DB"
     if _NETWORK_ERRORS.search(combined):
         return "NETWORK"
-    if _CODE_ERRORS.search(combined):
+    # ValueError alone is too generic (may be env); require a traceback to call it CODE.
+    if re.search(r"SyntaxError|ImportError|ModuleNotFoundError|NameError|AttributeError|TypeError|IndentationError", combined):
+        return "CODE"
+    if "ValueError" in combined and re.search(r"Traceback \(most recent call last\)", combined):
         return "CODE"
     return None
+
+
+def _deserialize_contracts(contracts_data: list) -> list[RewriteContract]:
+    """Coerce raw state entries into RewriteContract models (raises on invalid)."""
+    return [RewriteContract(**c) if isinstance(c, dict) else c for c in contracts_data]
+
+
+def _format_verification_details(result) -> list[str]:
+    """Shared summary lines for deterministic verification output."""
+    lines = [
+        f"Deterministic Verification Status: {result.status}",
+        f"Summary: {result.summary}",
+        f"Expected targets: {result.expected_targets}, Transformed targets: {result.transformed_targets}, Missing targets: {result.missing_targets}",
+        f"Rewrite coverage: {result.rewrite_coverage:.2%}",
+    ]
+    if result.violations:
+        lines.append("Violations:")
+        lines.extend(f"  - [{v.severity}] {v.code}: {v.message}" for v in result.violations)
+    if result.target_coverage:
+        lines.append("Target Coverage:")
+        for tc in result.target_coverage:
+            status_info = f"  - {tc.file}::{tc.function} -> {tc.status}"
+            if tc.details:
+                status_info += f" ({tc.details})"
+            lines.append(status_info)
+    return lines
+
+
+def _run_contract_verification(tool_context: ToolContext | None) -> tuple[str, str | None]:
+    """Run deterministic contract verification if contracts exist in tool_context.state.
+
+    Returns (status, details) where status is 'PASS', 'FAIL', or 'NONE' (if no contracts).
+    """
+    if not tool_context or not hasattr(tool_context, "state") or not tool_context.state:
+        return "NONE", None
+
+    state = tool_context.state
+    contracts_data = state.get("rewrite_contracts")
+    if not contracts_data:
+        return "NONE", None
+
+    try:
+        contracts = _deserialize_contracts(contracts_data)
+    except Exception:
+        return "NONE", None
+
+    result = verify_all_contracts(
+        state.get("target", ""),
+        state.get("sandbox", ""),
+        contracts,
+        state.get("modified_files", []),
+    )
+    state["deterministic_verification"] = result.model_dump()
+
+    if result.status == "FAIL":
+        return "FAIL", "\n".join(_format_verification_details(result))
+
+    return "PASS", None
 
 
 def check_syntax(tool_context: ToolContext) -> str:
@@ -60,13 +123,8 @@ def check_syntax(tool_context: ToolContext) -> str:
             continue
         full = os.path.join(sandbox, rel)
         try:
-            content = Path(full).read_text()
-            compile(content, rel, "exec")
-            fmt_errors = validate_format_strings(content, rel)
-            if fmt_errors:
-                lines.append(f"  FAIL {rel}: format string error: {'; '.join(fmt_errors)}")
-            else:
-                lines.append(f"  OK  {rel}")
+            compile(Path(full).read_text(), rel, "exec")
+            lines.append(f"  OK  {rel}")
         except SyntaxError as e:
             lines.append(f"  FAIL {rel}: {e}")
         except FileNotFoundError:
@@ -86,6 +144,9 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
       returned along with the command and any early stdout/stderr.
     - If the process exited within 3 seconds with returncode 0, "STARTED_OK"
       is returned along with the captured output.
+    - If rewrite_contracts exist in state and fail deterministic AST
+      verification, "STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL"
+      is returned instead of "STARTED_OK".
     - If the process exited within 3 seconds with a non-zero returncode, the
       failure is classified into one of:
 
@@ -97,6 +158,8 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
         a code error — the code is syntactically correct.
       * ``STARTUP_FAILED_ENV:NETWORK`` — a network resource is unreachable.
         This is also **not** a code error.
+      * ``STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL`` — AST verification
+        failed (residual loop queries, untransformed targets).
       * ``STARTUP_FAILED_CODE`` — a real code-level error was detected
         (SyntaxError, ImportError, NameError, AttributeError, TypeError).
         This means the optimized code is broken.
@@ -115,7 +178,6 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
             entry = fs_out.entry_point or ""
         elif isinstance(fs_out, str):
             try:
-                import json
                 parsed = json.loads(fs_out)
                 if isinstance(parsed, dict):
                     entry = parsed.get("entry_point", "")
@@ -150,7 +212,10 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
             parts.append(f"stdout:\n{stdout.strip()[:2000]}")
         if stderr and stderr.strip():
             parts.append(f"stderr:\n{stderr.strip()[:2000]}")
-        if proc.returncode == 0:
+        det_status, det_details = _run_contract_verification(tool_context)
+        if det_status == "FAIL":
+            parts.insert(0, f"STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL\n{det_details}")
+        elif proc.returncode == 0:
             parts.insert(0, "STARTED_OK")
         else:
             category = _classify_failure(stderr or "", stdout or "")
@@ -166,7 +231,11 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
-        parts = ["STARTED_OK", f"Command: {cmd}"]
+        det_status, det_details = _run_contract_verification(tool_context)
+        if det_status == "FAIL":
+            parts = [f"STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL\n{det_details}", f"Command: {cmd}"]
+        else:
+            parts = ["STARTED_OK", f"Command: {cmd}"]
         if stdout and stdout.strip():
             parts.append(f"stdout:\n{stdout.strip()[:2000]}")
         if stderr and stderr.strip():
@@ -249,3 +318,136 @@ def compare_original_and_modified(tool_context: ToolContext) -> str:
         return "No modified files to compare."
 
     return "\n".join(sections)
+
+
+def get_verification_context(tool_context: ToolContext) -> str:
+    """Return per-target contract, analysis, and original/optimized source.
+
+    For every rewrite contract in session state, this renders the contract to
+    comply with, the AST analysis summary, the original function source, and the
+    optimized function source extracted from the sandbox (when present).
+    """
+    state = tool_context.state
+    contracts_data = state.get("rewrite_contracts")
+    if not contracts_data:
+        return "No rewrite contracts in state."
+
+    current_contract = state.get("current_contract")
+    if isinstance(current_contract, dict) and current_contract:
+        cc_target = current_contract.get("target") or {}
+        cc_file = cc_target.get("file", "")
+        cc_fn = cc_target.get("qualified_function") or cc_target.get("function") or ""
+        scoped = []
+        for contract in contracts_data:
+            if isinstance(contract, dict):
+                cd = contract
+            elif hasattr(contract, "model_dump"):
+                cd = contract.model_dump()
+            else:
+                continue
+            t = cd.get("target") or {}
+            fn = t.get("qualified_function") or t.get("function") or ""
+            if t.get("file") == cc_file and fn == cc_fn:
+                scoped.append(contract)
+        contracts_data = scoped
+
+    ctx_map = state.get("target_context_map") or {}
+    sandbox = state.get("sandbox", "")
+
+    def _fmt(value: object) -> str:
+        if isinstance(value, (list, tuple)):
+            return ", ".join(str(v) for v in value) if value else "(none)"
+        return str(value) if value not in (None, "") else "(none)"
+
+    sections: list[str] = []
+    for contract in contracts_data:
+        if isinstance(contract, dict):
+            c = contract
+        elif hasattr(contract, "model_dump"):
+            c = contract.model_dump()
+        else:
+            continue
+
+        t = c.get("target") or {}
+        file = t.get("file", "")
+        qfn = t.get("qualified_function") or t.get("function") or ""
+
+        ctx = ctx_map.get(qfn, {}) or {}
+        analysis_summary = ctx.get("analysis_summary") or "(unavailable)"
+        original_source = ctx.get("function_source") or "(unavailable)"
+
+        optimized_source = "(not modified or missing)"
+        if sandbox and file:
+            opt_path = os.path.join(sandbox, file)
+            if os.path.exists(opt_path):
+                try:
+                    opt_src_text = Path(opt_path).read_text(errors="replace")
+                except Exception:
+                    opt_src_text = ""
+                extracted = _extract_function_source_by_name(opt_src_text, qfn)
+                if extracted:
+                    optimized_source = extracted
+
+        section = (
+            f"## Target: {qfn} ({file})\n"
+            f"### Contract\n"
+            f"- Rewrite ID: {_fmt(c.get('rewrite_id'))}\n"
+            f"- Pattern: {_fmt(c.get('pattern'))}\n"
+            f"- Strategy: {_fmt(c.get('strategy'))}\n"
+            f"- Allowed edit regions: {_fmt(c.get('allowed_regions'))}\n"
+            f"- Must preserve: {_fmt(c.get('must_preserve'))}\n"
+            f"- Must not change: {_fmt(c.get('must_not_change'))}\n"
+            f"### Analysis Summary\n"
+            f"{analysis_summary}\n"
+            f"### Original Function Source\n"
+            f"```python\n{original_source}\n```\n"
+            f"### Optimized Function Source\n"
+            f"```python\n{optimized_source}\n```"
+        )
+        sections.append(section)
+
+    return "\n\n".join(sections)
+
+
+def run_contract_verification(tool_context: ToolContext) -> str:
+    """Run deterministic contract verification against rewrite contracts.
+
+    Validates structural changes made by the optimizer using the AST logic,
+    checking if N+1 database operations within loops were removed and replaced.
+    """
+    state = tool_context.state
+    contracts_data = state.get("rewrite_contracts")
+
+    if not contracts_data:
+        return "No rewrite contracts in state."
+
+    current_contract = state.get("current_contract")
+    if isinstance(current_contract, dict) and current_contract:
+        try:
+            contract = RewriteContract(**current_contract)
+        except Exception as e:
+            return f"ERROR deserializing current_contract: {e}"
+
+        result = verify_contract_target(
+            state.get("target", ""),
+            state.get("sandbox", ""),
+            contract,
+        )
+    else:
+        try:
+            contracts = _deserialize_contracts(contracts_data)
+        except Exception as e:
+            return f"ERROR deserializing contracts: {e}"
+
+        result = verify_all_contracts(
+            state.get("target", ""),
+            state.get("sandbox", ""),
+            contracts,
+            state.get("modified_files", []),
+        )
+    state["deterministic_verification"] = result.model_dump()
+
+    lines = _format_verification_details(result)
+    lines += ["```json", json.dumps(result.model_dump(), indent=2), "```"]
+    return "\n".join(lines)
+

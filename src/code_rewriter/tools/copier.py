@@ -115,20 +115,6 @@ def rewrite_imports(sandbox: str, source_root: str) -> int:
     return count
 
 
-def read_files(root: str, file_paths: list[str]) -> dict[str, str]:
-    """Read contents of *file_paths* from *root*. Returns {path: content}."""
-    contents: dict[str, str] = {}
-    for rel_path in file_paths:
-        abs_path = os.path.join(root, rel_path)
-        if not os.path.isfile(abs_path):
-            continue
-        try:
-            contents[rel_path] = Path(abs_path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-    return contents
-
-
 def copy_to_sandbox(tool_context: ToolContext) -> str:
     """Copy the target codebase into a sandbox and rewrite import paths.
 

@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 import src.code_rewriter.tools.copier as copier_mod
-from src.code_rewriter.tools.copier import copy_entire, rewrite_imports, read_files
+from src.code_rewriter.tools.copier import copy_entire, rewrite_imports
+from src.intent_analyzer.sub_agents.intent_extractor.tools import read_files
 
 
 @pytest.fixture

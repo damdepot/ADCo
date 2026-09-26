@@ -2,7 +2,10 @@
 
 import re
 from typing import Any
-from .db_connector import DBConfig, get_connection
+
+from src.knob_tuner.contracts import ApplyMode, KnobScope
+
+from .db_connector import DBConfig, get_connection, run_safe_query
 
 
 def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any, restart_required: bool = False) -> str:
@@ -44,53 +47,160 @@ def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any, restart_requ
         raise ValueError(f"Unsupported db_type for knob application: '{db_type}'")
 
 
+def _coerce_scope(value: Any) -> KnobScope | None:
+    """Best-effort conversion of a raw scope value to a ``KnobScope``."""
+    if value is None:
+        return None
+    if isinstance(value, KnobScope):
+        return value
+    try:
+        return KnobScope(str(value).strip().lower())
+    except ValueError:
+        return None
+
+
+def resolve_knob_scope(item: dict[str, Any]) -> KnobScope:
+    """Resolve the :class:`KnobScope` for a raw knob dict.
+
+    An explicit ``scope`` key wins. When omitted, a ``restart_required=True``
+    flag implies a POSTMASTER (static) knob; otherwise the scope is UNKNOWN.
+    """
+    scope = _coerce_scope(item.get("scope"))
+    if scope is not None:
+        return scope
+    if item.get("restart_required"):
+        return KnobScope.POSTMASTER
+    return KnobScope.UNKNOWN
+
+
+def _knob_requires_restart(item: dict[str, Any], scope: KnobScope) -> bool:
+    """Whether the knob needs a restart (explicit flag or POSTMASTER scope)."""
+    return bool(item.get("restart_required")) or scope == KnobScope.POSTMASTER
+
+
+def _applies_in_mode(scope: KnobScope, mode: ApplyMode) -> bool:
+    """Return True when ``scope`` should be applied under ``mode``."""
+    if scope == KnobScope.INTERNAL:
+        return False
+    if mode == ApplyMode.DYNAMIC:
+        return scope not in (KnobScope.POSTMASTER, KnobScope.INTERNAL)
+    if mode == ApplyMode.PERSIST_STATIC:
+        # Apply the full plan: reloadable knobs go live, restart-required knobs
+        # are persisted and only activated by the operator's manual restart.
+        return True
+    return False
+
+
 def apply_knobs(
-    knobs: list[dict[str, Any]], cfg: DBConfig, dry_run: bool = False
+    knobs: list[dict[str, Any]],
+    cfg: DBConfig,
+    dry_run: bool = False,
+    mode: ApplyMode = ApplyMode.DYNAMIC,
 ) -> list[dict[str, Any]]:
     """Apply database configuration knobs to the target database.
 
     Args:
         knobs: List of knob specifications, where each element is a dict with
-               'name' (or 'knob'), 'value' keys, and optionally 'restart_required'.
+               'name' (or 'knob'), 'value' keys, and optionally 'scope' and
+               'restart_required'.
         cfg: DBConfig object.
         dry_run: If True, only plan the SQL queries without executing them.
+        mode: Apply semantics (NONE/DYNAMIC/PERSIST_STATIC).
 
     Returns:
-        List of dictionaries with status and details for each knob.
+        List of dictionaries with ``knob``, ``value``, ``status``, ``sql`` and
+        ``error`` for each knob, in input order.
     """
-    results: list[dict[str, Any]] = []
-
     if not knobs:
-        return results
+        return []
 
-    if dry_run:
+    if not isinstance(mode, ApplyMode):
+        try:
+            mode = ApplyMode(str(mode).strip().lower())
+        except ValueError:
+            mode = ApplyMode.DYNAMIC
+
+    # NONE never touches the database and emits no SQL.
+    if mode == ApplyMode.NONE:
+        results: list[dict[str, Any]] = []
         for item in knobs:
             name = item.get("name") or item.get("knob")
             if not name:
                 continue
-            val = item.get("value")
-            req_restart = item.get("restart_required", False)
+            results.append(
+                {
+                    "knob": name,
+                    "value": item.get("value"),
+                    "status": "skipped",
+                    "sql": "",
+                    "error": None,
+                }
+            )
+        return results
+
+    # Resolve each knob once, preserving input order.
+    entries: list[dict[str, Any]] = []
+    for item in knobs:
+        name = item.get("name") or item.get("knob")
+        if not name:
+            continue
+        scope = resolve_knob_scope(item)
+        entries.append(
+            {
+                "name": name,
+                "value": item.get("value"),
+                "scope": scope,
+                "restart_required": _knob_requires_restart(item, scope),
+            }
+        )
+
+    results = [{} for _ in entries]
+    to_apply: list[int] = []
+    for idx, entry in enumerate(entries):
+        if entry["scope"] == KnobScope.INTERNAL:
+            results[idx] = {
+                "knob": entry["name"],
+                "value": entry["value"],
+                "status": "failed",
+                "sql": "",
+                "error": f"internal knob rejected: {entry['name']}",
+            }
+        elif not _applies_in_mode(entry["scope"], mode):
+            results[idx] = {
+                "knob": entry["name"],
+                "value": entry["value"],
+                "status": "skipped",
+                "sql": "",
+                "error": None,
+            }
+        else:
+            to_apply.append(idx)
+
+    if dry_run:
+        for idx in to_apply:
+            entry = entries[idx]
             try:
-                sql = _format_knob_sql(cfg.db_type, name, val, restart_required=req_restart)
-                results.append(
-                    {
-                        "knob": name,
-                        "value": val,
-                        "status": "dry_run",
-                        "sql": sql,
-                        "error": None,
-                    }
+                sql = _format_knob_sql(
+                    cfg.db_type,
+                    entry["name"],
+                    entry["value"],
+                    restart_required=entry["restart_required"],
                 )
+                results[idx] = {
+                    "knob": entry["name"],
+                    "value": entry["value"],
+                    "status": "dry_run",
+                    "sql": sql,
+                    "error": None,
+                }
             except Exception as e:
-                results.append(
-                    {
-                        "knob": name,
-                        "value": val,
-                        "status": "failed",
-                        "sql": "",
-                        "error": str(e),
-                    }
-                )
+                results[idx] = {
+                    "knob": entry["name"],
+                    "value": entry["value"],
+                    "status": "failed",
+                    "sql": "",
+                    "error": str(e),
+                }
         return results
 
     conn = get_connection(cfg)
@@ -104,39 +214,41 @@ def apply_knobs(
 
         cursor = conn.cursor()
         try:
-            for item in knobs:
-                name = item.get("name") or item.get("knob")
-                if not name:
-                    continue
-                val = item.get("value")
-                req_restart = item.get("restart_required", False)
+            for idx in to_apply:
+                entry = entries[idx]
                 try:
-                    sql = _format_knob_sql(cfg.db_type, name, val, restart_required=req_restart)
+                    sql = _format_knob_sql(
+                        cfg.db_type,
+                        entry["name"],
+                        entry["value"],
+                        restart_required=entry["restart_required"],
+                    )
                     cursor.execute(sql)
                     if hasattr(conn, "commit") and not getattr(conn, "autocommit", False):
                         conn.commit()
-                    results.append(
-                        {
-                            "knob": name,
-                            "value": val,
-                            "status": "applied",
-                            "sql": sql,
-                            "error": None,
-                        }
-                    )
+                    results[idx] = {
+                        "knob": entry["name"],
+                        "value": entry["value"],
+                        "status": "applied",
+                        "sql": sql,
+                        "error": None,
+                    }
                 except Exception as e:
-                    results.append(
-                        {
-                            "knob": name,
-                            "value": val,
-                            "status": "failed",
-                            "sql": sql if "sql" in locals() else "",
-                            "error": str(e),
-                        }
-                    )
-            
-            # For Postgres, reload configuration so dynamic changes take effect across all sessions
-            if cfg.db_type.lower() in ("postgres", "postgresql"):
+                    results[idx] = {
+                        "knob": entry["name"],
+                        "value": entry["value"],
+                        "status": "failed",
+                        "sql": "",
+                        "error": str(e),
+                    }
+
+            # For Postgres, reload configuration so reloadable changes take
+            # effect across all sessions. Restart-required values stay pending
+            # until the operator's manual restart.
+            if (
+                cfg.db_type.lower() in ("postgres", "postgresql")
+                and mode in (ApplyMode.DYNAMIC, ApplyMode.PERSIST_STATIC)
+            ):
                 try:
                     cursor.execute("SELECT pg_reload_conf();")
                     if hasattr(conn, "commit") and not getattr(conn, "autocommit", False):
@@ -149,6 +261,75 @@ def apply_knobs(
         conn.close()
 
     return results
+
+
+def snapshot_settings(cfg: DBConfig, names: list[str]) -> dict[str, str]:
+    """Read the current values of ``names`` from the database settings catalog.
+
+    Args:
+        cfg: DBConfig object.
+        names: Knob/setting names to snapshot.
+
+    Returns:
+        Mapping of requested name to its current string value. Returns an empty
+        dict on any error; never raises.
+    """
+    if not names:
+        return {}
+
+    try:
+        db_type = cfg.db_type.lower()
+        if db_type in ("postgres", "postgresql"):
+            rows = run_safe_query(
+                cfg,
+                "SELECT name, setting FROM pg_settings WHERE name = ANY(%s);",
+                params=(list(names),),
+            )
+            snapshot: dict[str, str] = {}
+            for row in rows:
+                name = row.get("name")
+                if name is None:
+                    continue
+                snapshot[str(name)] = str(row.get("setting", ""))
+            return snapshot
+
+        if db_type == "mysql":
+            try:
+                rows = run_safe_query(
+                    cfg,
+                    "SELECT VARIABLE_NAME, VARIABLE_VALUE "
+                    "FROM performance_schema.global_variables;",
+                )
+            except Exception:
+                rows = run_safe_query(cfg, "SHOW GLOBAL VARIABLES;")
+
+            lookup: dict[str, str] = {}
+            for row in rows:
+                key = (
+                    row.get("VARIABLE_NAME")
+                    or row.get("Variable_name")
+                    or row.get("variable_name")
+                )
+                if key is None:
+                    continue
+                value = (
+                    row.get("VARIABLE_VALUE")
+                    or row.get("Value")
+                    or row.get("variable_value")
+                    or ""
+                )
+                lookup[str(key).lower()] = str(value)
+
+            snapshot = {}
+            for name in names:
+                matched = lookup.get(str(name).lower())
+                if matched is not None:
+                    snapshot[name] = matched
+            return snapshot
+
+        return {}
+    except Exception:
+        return {}
 
 
 def test_database(cfg: DBConfig) -> dict[str, Any]:
@@ -427,6 +608,11 @@ def _values_are_equivalent(expected_val: Any, actual_val: Any, unit: str = "", v
 
 
 
+# ponytail: PostgreSQL knobs whose value "-1" means "auto". pg_settings.setting
+# reports the resolved value, so an exact string compare would always mismatch.
+_AUTO_KNOBS = {"wal_buffers"}
+
+
 def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> dict[str, Any]:
     """Verify if expected knobs are active on the database."""
     report: dict[str, Any] = {
@@ -507,8 +693,11 @@ def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> 
                 vt = s.get("vartype", "")
                 evals = s.get("enumvals")
                 
+                # A "-1" request for an auto knob is satisfied by any resolved value.
+                if expected_val == "-1" and kname_str in _AUTO_KNOBS:
+                    status = "VERIFIED"
                 # We can do a simplistic check: if pending_restart is True, it's PENDING_RESTART
-                if pending:
+                elif pending:
                     status = "PENDING_RESTART"
                     report["all_verified"] = False
                 else:

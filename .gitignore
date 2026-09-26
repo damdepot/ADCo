@@ -234,3 +234,8 @@ notebooks/*.csv
 skills-lock.json
 logs/
 benchmarks/tools/*
+# Node (OpenCode ponytail wrapper plugin)
+node_modules/
+.opencode/
+results/
+results/dco/

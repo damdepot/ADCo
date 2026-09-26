@@ -2,6 +2,7 @@
 
 import os
 import pytest
+from pydantic import BaseModel
 
 from src.knob_tuner.tools.kb_planner import (
     KnobStrategyDef,
@@ -12,7 +13,11 @@ from src.knob_tuner.tools.kb_planner import (
     get_knob_strategies,
     KB_PATH,
 )
-from src.knob_tuner.sub_agents.knob_checker.models import KnobCheckerOutput, KnobCheckIssue
+
+
+class _Feedback(BaseModel):
+    status: str = "FAIL"
+    issues: list[dict] = []
 
 
 class MockToolContext:
@@ -84,7 +89,7 @@ def test_get_knob_strategies_tool_context():
         "workload": "read-heavy OLTP with connection pooling",
         "memory_gb": 8.0,
         "cpu_cores": 4,
-        "knob_checker_output": "",
+        "feedback": "",
     })
     res = get_knob_strategies(tc)
     assert isinstance(res, str)
@@ -172,12 +177,12 @@ def test_to_text_helper():
     assert _to_text({"key": "val"}) == '{"key": "val"}'
     assert _to_text(["a", "b"]) == '["a", "b"]'
 
-    issue = KnobCheckIssue(
-        knob="shared_buffers",
-        severity="critical",
-        category="crash",
-        description="Database crash OOM",
-    )
+    issue = {
+        "knob": "shared_buffers",
+        "severity": "critical",
+        "category": "crash",
+        "description": "Database crash OOM",
+    }
     issue_text = _to_text(issue)
     assert "shared_buffers" in issue_text
     assert "crash" in issue_text
@@ -202,15 +207,15 @@ def test_plan_knob_tuning_feedback_as_dict():
 
 
 def test_plan_knob_tuning_feedback_as_pydantic_model():
-    feedback_model = KnobCheckerOutput(
+    feedback_model = _Feedback(
         status="FAIL",
         issues=[
-            KnobCheckIssue(
-                knob="shared_buffers",
-                severity="critical",
-                category="crash",
-                description="Database crash OOM",
-            )
+            {
+                "knob": "shared_buffers",
+                "severity": "critical",
+                "category": "crash",
+                "description": "Database crash OOM",
+            }
         ],
     )
     strats, summary = plan_knob_tuning("postgres", feedback=feedback_model)
@@ -231,15 +236,15 @@ def test_plan_knob_tuning_workload_as_dict():
 
 
 def test_get_knob_strategies_dict_and_model_state():
-    feedback_model = KnobCheckerOutput(
+    feedback_model = _Feedback(
         status="FAIL",
         issues=[
-            KnobCheckIssue(
-                knob="shared_buffers",
-                severity="critical",
-                category="crash",
-                description="Database crash OOM",
-            )
+            {
+                "knob": "shared_buffers",
+                "severity": "critical",
+                "category": "crash",
+                "description": "Database crash OOM",
+            }
         ],
     )
     tc = MockToolContext({
@@ -247,7 +252,7 @@ def test_get_knob_strategies_dict_and_model_state():
         "workload": {"query_type": "write", "summary": "heavy write transaction commit redo"},
         "memory_gb": 4.0,
         "cpu_cores": 2,
-        "knob_checker_output": feedback_model,
+        "feedback": feedback_model,
     })
     res = get_knob_strategies(tc)
     assert isinstance(res, str)

@@ -1,11 +1,20 @@
 """Unit tests for benchmark_tools module."""
 
 import os
+import subprocess
 from unittest.mock import MagicMock, patch
-import pytest
+
+from src.knob_tuner.contracts import SysbenchProfile
 from src.knob_tuner.tools import run_sysbench_benchmark
-from src.knob_tuner.tools.benchmark_tools import _parse_sysbench_summary
+from src.knob_tuner.tools.benchmark_tools import (
+    _parse_run_metrics,
+    _parse_sysbench_summary,
+    run_sysbench_measurement,
+)
 from src.knob_tuner.tools.db_connector import DBConfig
+
+RUN_PATCH = "src.knob_tuner.tools.benchmark_tools.subprocess.run"
+DB_CONN_PATCH = "src.knob_tuner.tools.db_connector.get_connection"
 
 
 SAMPLE_SYSBENCH_OUTPUT = """
@@ -52,9 +61,63 @@ Threads fairness:
 """
 
 
+def _output_with(
+    tps: float,
+    qps: float,
+    avg: float = 26.34,
+    p95: float = 33.15,
+    ignored: int = 0,
+    reconnects: int = 0,
+) -> str:
+    """Build a minimal well-formed sysbench summary with the given metrics."""
+    return (
+        "SQL statistics:\n"
+        f"    transactions:                        145780 ({tps} per sec.)\n"
+        f"    queries:                             2915600 ({qps} per sec.)\n"
+        f"    ignored errors:                      {ignored}      (0.00 per sec.)\n"
+        f"    reconnects:                          {reconnects}      (0.00 per sec.)\n"
+        "\n"
+        "Latency (ms):\n"
+        "         min:                                    1.15\n"
+        f"         avg:                                   {avg}\n"
+        "         max:                                  142.50\n"
+        f"         95th percentile:                       {p95}\n"
+    )
+
+
+def _make_runner(run_outputs=None, fail=None):
+    """Return (side_effect, calls) for a mocked subprocess.run.
+
+    ``run_outputs`` are consumed in order by each ``run`` phase. ``fail`` is an
+    optional callable ``(cmd, call_number) -> CompletedProcess | None`` used to
+    force failures on specific invocations.
+    """
+    calls: list[tuple[list[str], dict]] = []
+    outputs = list(run_outputs or [])
+
+    def _side_effect(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if fail is not None:
+            forced = fail(cmd, len(calls))
+            if forced is not None:
+                return forced
+        phase = cmd[-1]
+        if phase == "run":
+            output = outputs.pop(0) if outputs else SAMPLE_SYSBENCH_OUTPUT
+            return MagicMock(returncode=0, stdout=output, stderr="")
+        if phase == "prepare":
+            return MagicMock(returncode=0, stdout="Prepare completed", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    return _side_effect, calls
+
+
 def test_export_import():
     from src.knob_tuner.tools import run_sysbench_benchmark as fn
+    from src.knob_tuner.tools.benchmark_tools import run_sysbench_measurement as fn2
+
     assert callable(fn)
+    assert callable(fn2)
 
 
 def test_parse_sysbench_summary():
@@ -70,173 +133,200 @@ def test_parse_sysbench_summary():
     assert details["latency_95th_ms"] == 33.15
     assert details["latency_sum_ms"] == 3840000.00
     assert details["total_events"] == 145780
+    assert details["ignored_errors"] == 0
+    assert details["reconnects"] == 0
 
 
-def test_run_sysbench_benchmark_postgres_tables_exist(mock_db_config_pg, tmp_path):
-    # Mock DB connection returning 50 tables (so count == tables, no prepare needed)
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = (50,)
-
-    workdir = str(tmp_path / "logs")
-
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
-
-        # subprocess.run for sysbench run
-        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_SYSBENCH_OUTPUT, stderr="")
-
-        res = run_sysbench_benchmark(
-            cfg=mock_db_config_pg,
-            tables=50,
-            table_size=100000,
-            threads=32,
-            duration=120,
-            report_interval=60,
-            workdir=workdir,
-        )
-
-        assert res["status"] == "ok"
-        assert res["duration"] == 120
-        assert res["threads"] == 32
-        assert res["tables"] == 50
-        assert res["error"] is None
-        # QPS is average of last 2 intervals: (24010.00 + 26010.00) / 2 = 25010.00
-        assert res["qps"] == 25010.00
-        assert res["tps"] == 25010.00 / 20.0
-        assert os.path.isfile(res["log_file"])
-
-        # Check that check_query was run for postgres
-        mock_cursor.execute.assert_called_once()
-        query_arg = mock_cursor.execute.call_args[0][0]
-        assert "public" in query_arg
-        assert "sbtest%" in query_arg
-
-        # subprocess.run should be called once (only run, no cleanup or prepare)
-        assert mock_run.call_count == 1
-        cmd = mock_run.call_args[0][0]
-        assert "--db-driver=pgsql" in cmd
-        assert f"--pgsql-host={mock_db_config_pg.host}" in cmd
-        assert f"--pgsql-port={mock_db_config_pg.port}" in cmd
-        assert f"--pgsql-user={mock_db_config_pg.user}" in cmd
-        assert f"--pgsql-password={mock_db_config_pg.password}" in cmd
-        assert f"--pgsql-db={mock_db_config_pg.database}" in cmd
-        assert "--tables=50" in cmd
-        assert "--table-size=100000" in cmd
-        assert "--threads=32" in cmd
-        assert "--time=120" in cmd
-        assert "--report-interval=60" in cmd
-        assert "run" in cmd
+def test_parse_run_metrics():
+    metrics = _parse_run_metrics(_output_with(123.5, 2470.0, avg=11.0, p95=22.0, ignored=1, reconnects=2))
+    assert metrics["tps"] == 123.5
+    assert metrics["qps"] == 2470.0
+    assert metrics["latency_avg_ms"] == 11.0
+    assert metrics["latency_p95_ms"] == 22.0
+    assert metrics["ignored_errors"] == 1
+    assert metrics["reconnects"] == 2
 
 
-def test_run_sysbench_benchmark_mysql_needs_prepare(mock_db_config_mysql, tmp_path):
-    # Mock DB connection returning 0 tables (needs prepare)
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = {"count(*)": 0}  # dict response from DictCursor
+def test_measurement_deterministic_sequence_and_seed(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(
+        tables=5,
+        rows_per_table=1000,
+        threads=8,
+        warmup_seconds=5,
+        measurement_seconds=30,
+        repetitions=2,
+        seed=123,
+    )
+    side_effect, calls = _make_runner()
 
-    workdir = str(tmp_path / "mysql_logs")
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(mock_db_config_pg, profile, workdir=str(tmp_path))
 
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
+    assert result.status == "ok"
+    assert result.threads == 8
+    assert result.tables == 5
+    assert result.rows_per_table == 1000
+    assert result.duration == 30
+    assert result.seed == 123
+    assert result.repetitions == 2
+    assert len(result.per_run_tps) == 2
 
-        # 1st call: cleanup, 2nd call: prepare, 3rd call: run
-        cleanup_res = MagicMock(returncode=0, stdout="", stderr="")
-        prepare_res = MagicMock(returncode=0, stdout="Prepare completed", stderr="")
-        run_res = MagicMock(returncode=0, stdout=SAMPLE_SYSBENCH_OUTPUT, stderr="")
-        mock_run.side_effect = [cleanup_res, prepare_res, run_res]
+    phases = [cmd[-1] for cmd, _ in calls]
+    assert phases == [
+        "cleanup",
+        "prepare",
+        "run",
+        "cleanup",
+        "prepare",
+        "run",
+        "cleanup",
+        "prepare",
+        "run",
+    ]
 
-        res = run_sysbench_benchmark(
-            cfg=mock_db_config_mysql,
-            tables=10,
-            table_size=50000,
-            threads=16,
-            duration=60,
-            report_interval=60,
-            workdir=workdir,
-        )
+    prepare_cmds = [cmd for cmd, _ in calls if cmd[-1] == "prepare"]
+    run_cmds = [cmd for cmd, _ in calls if cmd[-1] == "run"]
+    for cmd in prepare_cmds + run_cmds:
+        assert "--rand-seed=123" in cmd
 
-        assert res["status"] == "ok"
-        assert res["duration"] == 60
-        assert res["threads"] == 16
-        assert res["tables"] == 10
-        assert mock_run.call_count == 3
+    warmup_run = run_cmds[0]
+    measured_runs = run_cmds[1:]
+    assert "--time=5" in warmup_run
+    assert all("--time=30" in cmd for cmd in measured_runs)
 
-        # Check cleanup cmd
-        cleanup_cmd = mock_run.call_args_list[0][0][0]
-        assert "--db-driver=mysql" in cleanup_cmd
-        assert f"--mysql-host={mock_db_config_mysql.host}" in cleanup_cmd
-        assert f"--mysql-db={mock_db_config_mysql.database}" in cleanup_cmd
-        assert "cleanup" in cleanup_cmd
+    for cmd, _ in calls:
+        assert "--report-interval" not in " ".join(cmd)
+        assert "--tables=5" in cmd
+        assert "--table-size=1000" in cmd
+        assert "--threads=8" in cmd
 
-        # Check prepare cmd and prepare log file
-        prepare_cmd = mock_run.call_args_list[1][0][0]
-        assert "prepare" in prepare_cmd
-        prepare_log = os.path.join(workdir, "sysbench_prepare.log")
-        assert os.path.isfile(prepare_log)
-        with open(prepare_log) as f:
-            assert "Prepare completed" in f.read()
-
-        # Check run cmd
-        run_cmd = mock_run.call_args_list[2][0][0]
-        assert "run" in run_cmd
-
-
-def test_run_sysbench_benchmark_prepare_failure(mock_db_config_mysql, tmp_path):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = (0,)
-
-    workdir = str(tmp_path / "fail_logs")
-
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
-
-        cleanup_res = MagicMock(returncode=0, stdout="", stderr="")
-        prepare_res = MagicMock(returncode=1, stdout="", stderr="FATAL: Disk full")
-        mock_run.side_effect = [cleanup_res, prepare_res]
-
-        res = run_sysbench_benchmark(
-            cfg=mock_db_config_mysql,
-            tables=10,
-            workdir=workdir,
-        )
-
-        assert res["status"] == "error"
-        assert "sysbench prepare failed" in res["error"]
-        assert res["tps"] == 0.0
-        assert res["qps"] == 0.0
+    for _, kwargs in calls:
+        assert "timeout" in kwargs
+        assert kwargs["timeout"] > 0
 
 
-def test_run_sysbench_benchmark_run_failure(mock_db_config_pg, tmp_path):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = (50,)
+def test_measurement_median_aggregation(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(
+        tables=2,
+        rows_per_table=100,
+        threads=4,
+        warmup_seconds=0,
+        measurement_seconds=10,
+        repetitions=3,
+        seed=7,
+    )
+    outputs = [
+        _output_with(100.0, 2000.0, avg=10.0, p95=5.0),
+        _output_with(200.0, 4000.0, avg=20.0, p95=15.0),
+        _output_with(300.0, 6000.0, avg=30.0, p95=25.0),
+    ]
+    side_effect, calls = _make_runner(run_outputs=outputs)
 
-    workdir = str(tmp_path / "fail_logs")
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(mock_db_config_pg, profile, workdir=str(tmp_path))
 
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
-
-        mock_run.return_value = MagicMock(returncode=127, stdout="", stderr="sysbench: command not found")
-
-        res = run_sysbench_benchmark(
-            cfg=mock_db_config_pg,
-            tables=50,
-            workdir=workdir,
-        )
-
-        assert res["status"] == "error"
-        assert "sysbench run failed" in res["error"]
-        assert res["tps"] == 0.0
-        assert res["qps"] == 0.0
+    assert result.status == "ok"
+    assert result.per_run_tps == [100.0, 200.0, 300.0]
+    assert result.tps == 200.0
+    assert result.qps == 4000.0
+    assert result.latency_avg_ms == 20.0
+    assert result.latency_p95_ms == 15.0
+    assert len(result.per_run_tps) == profile.repetitions
 
 
-def test_run_sysbench_benchmark_unsupported_db_type(tmp_path):
+def test_measurement_malformed_output_is_error(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(warmup_seconds=0, measurement_seconds=10, repetitions=1)
+    side_effect, _ = _make_runner(run_outputs=["not a sysbench summary"])
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(mock_db_config_pg, profile, workdir=str(tmp_path))
+
+    assert result.status == "error"
+    assert result.tps == 0.0
+    assert "zero TPS" in result.error
+    assert "repetition 1/1" in result.error
+
+
+def test_measurement_ignored_errors_recorded_not_fatal(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(warmup_seconds=0, measurement_seconds=10, repetitions=2)
+    outputs = [
+        _output_with(100.0, 2000.0, ignored=2),
+        _output_with(100.0, 2000.0, ignored=1),
+    ]
+    side_effect, _ = _make_runner(run_outputs=outputs)
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(mock_db_config_pg, profile, workdir=str(tmp_path))
+
+    assert result.status == "ok"
+    assert result.ignored_errors == 3
+    assert result.error is None
+
+
+def test_measurement_reconnects_is_error(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(warmup_seconds=0, measurement_seconds=10, repetitions=1)
+    side_effect, _ = _make_runner(run_outputs=[_output_with(100.0, 2000.0, reconnects=4)])
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(mock_db_config_pg, profile, workdir=str(tmp_path))
+
+    assert result.status == "error"
+    assert result.reconnects == 4
+    assert "reconnects=4" in result.error
+
+
+def test_measurement_segfault_is_error_and_never_threads_one(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(threads=8, warmup_seconds=0, measurement_seconds=10, repetitions=1)
+
+    def _fail(cmd, call_number):
+        if cmd[-1] == "run":
+            return MagicMock(returncode=-11, stdout="", stderr="Segmentation fault")
+        return None
+
+    side_effect, calls = _make_runner(fail=_fail)
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(mock_db_config_pg, profile, workdir=str(tmp_path))
+
+    assert result.status == "error"
+    assert "segmentation fault" in result.error
+    assert result.threads == 8
+    assert all("--threads=1" not in " ".join(cmd) for cmd, _ in calls)
+
+
+def test_measurement_prepare_failure_is_error(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(warmup_seconds=0, measurement_seconds=10, repetitions=1)
+
+    def _fail(cmd, call_number):
+        if cmd[-1] == "prepare":
+            return MagicMock(returncode=1, stdout="", stderr="FATAL: Disk full")
+        return None
+
+    side_effect, _ = _make_runner(fail=_fail)
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(mock_db_config_pg, profile, workdir=str(tmp_path))
+
+    assert result.status == "error"
+    assert "prepare failed" in result.error
+    assert "Disk full" in result.error
+
+
+def test_measurement_timeout_is_error(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(warmup_seconds=0, measurement_seconds=10, repetitions=1)
+
+    def _timeout(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 0))
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=_timeout):
+        result = run_sysbench_measurement(mock_db_config_pg, profile, workdir=str(tmp_path))
+
+    assert result.status == "error"
+    assert "timed out" in result.error
+    assert result.tps == 0.0
+
+
+def test_measurement_unsupported_db_type_never_raises(tmp_path):
     cfg = DBConfig(
         host="localhost",
         port=1521,
@@ -246,62 +336,96 @@ def test_run_sysbench_benchmark_unsupported_db_type(tmp_path):
         db_type="oracle",
         env="dev",
     )
-    res = run_sysbench_benchmark(cfg=cfg, workdir=str(tmp_path))
-    assert res["status"] == "error"
-    assert "Unsupported db_type 'oracle'" in res["error"]
+    result = run_sysbench_measurement(cfg, SysbenchProfile(), workdir=str(tmp_path))
+    assert result.status == "error"
+    assert "Unsupported db_type 'oracle'" in result.error
 
 
-def test_run_sysbench_benchmark_db_conn_failure(mock_db_config_pg, tmp_path):
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", side_effect=Exception("Connection refused")):
-        res = run_sysbench_benchmark(cfg=mock_db_config_pg, workdir=str(tmp_path))
-        assert res["status"] == "error"
-        assert "Connection refused" in res["error"]
-        assert res["tps"] == 0.0
-        assert res["qps"] == 0.0
+def test_measurement_writes_combined_log(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(warmup_seconds=0, measurement_seconds=10, repetitions=1)
+    side_effect, _ = _make_runner()
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(mock_db_config_pg, profile, workdir=str(tmp_path))
+
+    assert os.path.isfile(result.log_file)
+    with open(result.log_file, encoding="utf-8") as f:
+        content = f.read()
+    assert "Prepare completed" in content
+    assert "transactions:" in content
 
 
-def test_run_sysbench_benchmark_summary_fallback_when_no_qps_lines(mock_db_config_pg, tmp_path):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = (50,)
+def test_legacy_wrapper_returns_legacy_and_new_keys(mock_db_config_pg, tmp_path):
+    side_effect, calls = _make_runner()
 
-    summary_only_output = """
-SQL statistics:
-    queries performed:
-        read:                            1000
-        write:                           200
-        other:                           100
-        total:                           1300
-    transactions:                        100    (50.00 per sec.)
-    queries:                             1300   (650.00 per sec.)
-
-Latency (ms):
-         min:                                    1.00
-         avg:                                    5.00
-         max:                                   20.00
-         95th percentile:                       10.00
-"""
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
-
-        mock_run.return_value = MagicMock(returncode=0, stdout=summary_only_output, stderr="")
-
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
         res = run_sysbench_benchmark(
             cfg=mock_db_config_pg,
             tables=50,
-            duration=2,
+            table_size=100000,
+            threads=32,
+            duration=120,
             report_interval=60,
             workdir=str(tmp_path),
         )
 
-        assert res["status"] == "ok"
-        assert res["qps"] == 650.00
-        assert res["tps"] == 650.00 / 20.0
-        assert res["details"]["latency_min_ms"] == 1.00
+    for key in (
+        "status",
+        "tps",
+        "qps",
+        "duration",
+        "threads",
+        "tables",
+        "log_file",
+        "error",
+        "details",
+        "ignored_errors",
+        "reconnects",
+        "latency_p95_ms",
+        "per_run_tps",
+        "seed",
+        "repetitions",
+    ):
+        assert key in res
+
+    assert res["status"] == "ok"
+    assert res["duration"] == 120
+    assert res["threads"] == 32
+    assert res["tables"] == 50
+    assert res["error"] is None
+    assert res["seed"] == 42
+    assert res["repetitions"] == 1
+    assert len(res["per_run_tps"]) == 1
+    assert res["details"]["latency_avg_ms"] == 26.34
+    assert res["details"]["latency_95th_ms"] == 33.15
+    assert res["details"]["ignored_errors"] == 0
+    assert res["details"]["reconnects"] == 0
+    assert os.path.isfile(res["log_file"])
+
+    # report_interval is accepted but ignored (no --report-interval issued).
+    assert all("--report-interval" not in " ".join(cmd) for cmd, _ in calls)
+    assert all("--rand-seed=42" in cmd for cmd, _ in calls if cmd[-1] in ("prepare", "run"))
 
 
-def test_run_sysbench_benchmark_host_normalization_and_env(tmp_path):
+def test_legacy_wrapper_failure_returns_error_dict(mock_db_config_pg, tmp_path):
+    def _fail(cmd, call_number):
+        if cmd[-1] == "run":
+            return MagicMock(returncode=127, stdout="", stderr="sysbench: command not found")
+        return None
+
+    side_effect, _ = _make_runner(fail=_fail)
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        res = run_sysbench_benchmark(cfg=mock_db_config_pg, workdir=str(tmp_path))
+
+    assert res["status"] == "error"
+    assert "exit code 127" in res["error"]
+    assert res["tps"] == 0.0
+    assert res["qps"] == 0.0
+    assert res["details"]["latency_avg_ms"] == 0.0
+
+
+def test_host_normalization_and_env_preserved(tmp_path):
     cfg_localhost = DBConfig(
         host="localhost",
         port=5432,
@@ -311,143 +435,94 @@ def test_run_sysbench_benchmark_host_normalization_and_env(tmp_path):
         db_type="postgres",
         env="staging",
     )
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = (10,)
+    side_effect, calls = _make_runner()
 
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        res = run_sysbench_benchmark(cfg=cfg_localhost, tables=10, workdir=str(tmp_path))
 
-        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_SYSBENCH_OUTPUT, stderr="")
+    assert res["status"] == "ok"
+    assert res["tables"] == 10
+    assert res["threads"] == 4
 
-        res = run_sysbench_benchmark(cfg=cfg_localhost, workdir=str(tmp_path))
+    cmd = calls[0][0]
+    assert "--pgsql-host=127.0.0.1" in cmd
+    assert "--tables=10" in cmd
+    assert "--threads=4" in cmd
 
-        assert res["status"] == "ok"
-        assert res["tables"] == 10
-        assert res["threads"] == 4
-
-        # Verify host normalized to 127.0.0.1
-        cmd = mock_run.call_args[0][0]
-        assert "--pgsql-host=127.0.0.1" in cmd
-        assert "--tables=10" in cmd
-        assert "--threads=4" in cmd
-
-        # Verify env has PGPASSWORD and MYSQL_PWD
-        call_env = mock_run.call_args[1].get("env", {})
-        assert call_env.get("PGPASSWORD") == "test_secret_password"
-        assert call_env.get("MYSQL_PWD") == "test_secret_password"
+    call_env = calls[0][1].get("env", {})
+    assert call_env.get("PGPASSWORD") == "test_secret_password"
+    assert call_env.get("MYSQL_PWD") == "test_secret_password"
 
 
-def test_run_sysbench_benchmark_prepare_segfault_recovery(mock_db_config_pg, tmp_path):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = (0,)  # Needs prepare
+def test_legacy_wrapper_mysql_flags(tmp_path):
+    cfg = DBConfig(
+        host="127.0.0.1",
+        port=3306,
+        user="root",
+        password="secretpassword",
+        database="testdb",
+        db_type="mysql",
+        env="production",
+    )
+    side_effect, calls = _make_runner()
 
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        res = run_sysbench_benchmark(cfg=cfg, tables=10, workdir=str(tmp_path))
 
-        cleanup_res = MagicMock(returncode=0, stdout="", stderr="")
-        prepare_crash = MagicMock(returncode=-11, stdout="", stderr="Segmentation fault (core dumped)")
-        prepare_retry_ok = MagicMock(returncode=0, stdout="Prepare retry ok", stderr="")
-        run_ok = MagicMock(returncode=0, stdout=SAMPLE_SYSBENCH_OUTPUT, stderr="")
-
-        mock_run.side_effect = [cleanup_res, prepare_crash, prepare_retry_ok, run_ok]
-
-        res = run_sysbench_benchmark(cfg=mock_db_config_pg, tables=10, workdir=str(tmp_path))
-
-        assert res["status"] == "ok"
-        assert mock_run.call_count == 4
-        # Check that retry prepare used threads=1 and host=127.0.0.1
-        retry_prep_cmd = mock_run.call_args_list[2][0][0]
-        assert "--threads=1" in retry_prep_cmd
-        assert "--pgsql-host=127.0.0.1" in retry_prep_cmd
+    assert res["status"] == "ok"
+    cmd = calls[0][0]
+    assert "--db-driver=mysql" in cmd
+    assert "--mysql-host=127.0.0.1" in cmd
+    assert "--mysql-db=testdb" in cmd
 
 
-def test_run_sysbench_benchmark_prepare_segfault_permanent_failure(mock_db_config_pg, tmp_path):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = (0,)
-
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
-
-        cleanup_res = MagicMock(returncode=0, stdout="", stderr="")
-        prepare_crash = MagicMock(returncode=-11, stdout="", stderr="Segmentation fault")
-        prepare_retry_crash = MagicMock(returncode=-11, stdout="", stderr="Segmentation fault on retry")
-
-        mock_run.side_effect = [cleanup_res, prepare_crash, prepare_retry_crash]
-
-        res = run_sysbench_benchmark(cfg=mock_db_config_pg, tables=10, workdir=str(tmp_path))
-
-        assert res["status"] == "error"
-        assert "Sysbench encountered a segmentation fault (exit code -11)" in res["error"]
-        assert "prepare" in res["error"]
-
-
-def test_run_sysbench_benchmark_run_segfault_recovery(mock_db_config_pg, tmp_path):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = (10,)
-
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
-
-        run_crash = MagicMock(returncode=139, stdout="", stderr="Segmentation fault (exit code 139)")
-        run_retry_ok = MagicMock(returncode=0, stdout=SAMPLE_SYSBENCH_OUTPUT, stderr="")
-
-        mock_run.side_effect = [run_crash, run_retry_ok]
-
-        res = run_sysbench_benchmark(cfg=mock_db_config_pg, tables=10, threads=4, workdir=str(tmp_path))
-
-        assert res["status"] == "ok"
-        assert res["threads"] == 1  # updated after safe single-thread retry
-        assert mock_run.call_count == 2
-        retry_run_cmd = mock_run.call_args_list[1][0][0]
-        assert "--threads=1" in retry_run_cmd
-        assert "--pgsql-host=127.0.0.1" in retry_run_cmd
-
-
-def test_run_sysbench_benchmark_run_segfault_permanent_failure(mock_db_config_pg, tmp_path):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = (10,)
-
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
-
-        run_crash = MagicMock(returncode=-11, stdout="", stderr="Segmentation fault")
-        run_retry_crash = MagicMock(returncode=-11, stdout="", stderr="Segmentation fault on retry")
-
-        mock_run.side_effect = [run_crash, run_retry_crash]
-
-        res = run_sysbench_benchmark(cfg=mock_db_config_pg, tables=10, workdir=str(tmp_path))
-
-        assert res["status"] == "error"
-        assert "Sysbench encountered a segmentation fault (exit code -11)" in res["error"]
-        assert "benchmark run" in res["error"]
-
-
-def test_run_sysbench_benchmark_default_workdir(mock_db_config_pg, monkeypatch, tmp_path):
+def test_default_workdir(mock_db_config_pg, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
+    side_effect, _ = _make_runner()
 
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = (50,)
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        res = run_sysbench_benchmark(cfg=mock_db_config_pg, tables=10)
 
-    with patch("src.knob_tuner.tools.benchmark_tools.get_connection", return_value=mock_conn), \
-         patch("src.knob_tuner.tools.benchmark_tools.subprocess.run") as mock_run:
+    assert res["status"] == "ok"
+    assert res["log_file"] == os.path.join(
+        "logs", "sysbench", os.path.basename(res["log_file"])
+    )
+    assert os.path.isfile(res["log_file"])
 
-        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_SYSBENCH_OUTPUT, stderr="")
 
-        res = run_sysbench_benchmark(cfg=mock_db_config_pg, tables=50)
+def test_measurement_emits_progress(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(
+        tables=1,
+        rows_per_table=10,
+        threads=1,
+        warmup_seconds=0,
+        measurement_seconds=1,
+        repetitions=2,
+        seed=1,
+    )
+    messages: list[str] = []
+    side_effect, _ = _make_runner()
 
-        assert res["status"] == "ok"
-        assert res["log_file"] == os.path.join("logs", "sysbench", os.path.basename(res["log_file"]))
-        assert os.path.isfile(res["log_file"])
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(
+            mock_db_config_pg,
+            profile,
+            workdir=str(tmp_path),
+            progress=messages.append,
+        )
 
+    assert result.status == "ok"
+    assert any(m.startswith("Measurement:") for m in messages)
+    assert any(m.startswith("rep 1/") for m in messages)
+    assert any(m.startswith("rep 2/") for m in messages)
+    assert any(m.startswith("Done:") for m in messages)
+
+
+def test_measurement_silent_without_progress(mock_db_config_pg, tmp_path, capsys):
+    profile = SysbenchProfile(warmup_seconds=0, measurement_seconds=1, repetitions=1)
+    side_effect, _ = _make_runner()
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        run_sysbench_measurement(mock_db_config_pg, profile, workdir=str(tmp_path))
+
+    assert capsys.readouterr().out == ""

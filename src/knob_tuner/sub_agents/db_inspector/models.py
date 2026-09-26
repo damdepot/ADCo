@@ -40,7 +40,3 @@ class DbInspectorOutput(BaseModel):
     available_knobs: list[KnobInfo] = Field(default_factory=list, description="List of tunable knobs extracted from the database")
     workload: WorkloadPattern = Field(default_factory=WorkloadPattern, description="Workload characteristics extracted from application codebase")
     summary_for_recommender: str = Field(default="", description="Executive summary of workload, schema, and tuning opportunities for the recommender agent")
-
-
-# Backward compatibility alias
-IntentAnalyzerOutput = DbInspectorOutput

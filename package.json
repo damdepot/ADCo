@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@dietrichgebert/ponytail": "^4.10.0"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.0.12"
+  }
+}

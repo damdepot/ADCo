@@ -21,29 +21,15 @@ class MockToolContext:
 # ---------------------------------------------------------------------------
 
 def test_file_selector_output_schema_validates():
-    from src.code_rewriter.sub_agents.file_selector.models import FileSelectorOutput
+    from src.intent_analyzer.sub_agents.file_selector.models import FileSelectorOutput
     m = FileSelectorOutput.model_validate({"files": ["a.py", "b.py"], "entry_point": "main.py"})
     assert m.files == ["a.py", "b.py"]
     assert m.entry_point == "main.py"
 
 
-def test_intent_extractor_output_schema_validates():
-    from src.code_rewriter.sub_agents.intent_extractor.models import IntentExtractorOutput
-    data = {
-        "connection": "pool", "queries": "crud", "transactions": "manual",
-        "n_plus_one": "yes: loop in loader", "concurrency": "sequential",
-        "orm": "raw sql",
-        "optimization_targets": [{"file": "loader.py", "description": "batch inserts"}],
-        "notes": "n/a",
-    }
-    m = IntentExtractorOutput.model_validate(data)
-    assert m.optimization_targets[0].file == "loader.py"
-    assert m.optimization_targets[0].description == "batch inserts"
-
-
-def test_code_optimizer_output_schema_validates():
-    from src.code_rewriter.sub_agents.code_optimizer.models import CodeOptimizerOutput
-    m = CodeOptimizerOutput.model_validate({"modified_files": ["a.py"], "summary": "ok"})
+def test_optimizer_output_schema_validates():
+    from src.code_rewriter.sub_agents.optimizer.models import OptimizerOutput
+    m = OptimizerOutput.model_validate({"modified_files": ["a.py"], "summary": "ok"})
     assert m.modified_files == ["a.py"]
     assert m.summary == "ok"
 
@@ -60,214 +46,37 @@ def test_verifier_output_schema_rejects_invalid_status():
         VerifierOutput.model_validate({"status": "MAYBE"})
 
 
+def test_verifier_output_accepts_evidence_backed_issues():
+    from src.code_rewriter.sub_agents.verifier.models import VerifierOutput
+    from src.code_rewriter.models.feedback_models import RepairIssue
+    out = VerifierOutput.model_validate({
+        "status": "FAIL",
+        "issues": [
+            {
+                "code": "SEMANTIC_ISSUE",
+                "severity": "ERROR",
+                "message": "wrong join",
+                "evidence": "line 42: JOIN ...",
+            }
+        ],
+    })
+    assert len(out.issues) == 1
+    assert isinstance(out.issues[0], RepairIssue)
+    assert out.issues[0].evidence == "line 42: JOIN ..."
+
+
 # ---------------------------------------------------------------------------
-# code_optimizer.tools
+# optimizer.tools
 # ---------------------------------------------------------------------------
 
-from src.code_rewriter.sub_agents.code_optimizer.tools import (
-    write_file as co_write_file,
-    read_file as co_read_file,
-    list_sandbox as co_list_sandbox,
+from src.code_rewriter.sub_agents.optimizer.tools import (
+    _render_previous_attempt,
     get_optimization_context as co_get_optimization_context,
+    replace_function as co_replace_function,
 )
 
 
-def test_codeopt_write_file_writes_content_and_records_modified():
-    with tempfile.TemporaryDirectory() as sandbox:
-        tc = MockToolContext({"sandbox": sandbox})
-
-        result = co_write_file("app.py", "print('hello')", tc)
-
-        content = Path(os.path.join(sandbox, "app.py")).read_text()
-        sandbox_id = os.path.basename(sandbox)
-        assert content == f"# ADCO_OPTIMIZED: {sandbox_id}\nprint('hello')"
-        assert "OK: wrote" in result
-        assert tc.state["modified_files"] == ["app.py"]
-
-
-def test_codeopt_write_file_records_multiple_unique_paths():
-    with tempfile.TemporaryDirectory() as sandbox:
-        tc = MockToolContext({"sandbox": sandbox})
-
-        co_write_file("a.py", "x=1", tc)
-        co_write_file("b.py", "y=2", tc)
-        co_write_file("a.py", "x=3", tc)
-
-        assert tc.state["modified_files"] == ["a.py", "b.py"]
-
-
-def test_codeopt_write_file_rejects_empty_path():
-    tc = MockToolContext({"sandbox": "/tmp"})
-
-    result = co_write_file("", "bad", tc)
-
-    assert "ERROR" in result
-    assert "modified_files" not in tc.state
-
-
-def test_codeopt_write_file_rejects_syntax_error():
-    with tempfile.TemporaryDirectory() as sandbox:
-        tc = MockToolContext({"sandbox": sandbox})
-
-        result = co_write_file("bad.py", "import loggingfrom pprint import x\n", tc)
-
-        assert "ERROR" in result
-        assert "SyntaxError" in result
-        assert not os.path.isfile(os.path.join(sandbox, "bad.py"))
-        assert "modified_files" not in tc.state
-
-
-def test_codeopt_write_file_accepts_valid_python():
-    with tempfile.TemporaryDirectory() as sandbox:
-        tc = MockToolContext({"sandbox": sandbox})
-
-        result = co_write_file("good.py", "import os\nprint('hello')\n", tc)
-
-        assert "OK: wrote" in result
-        assert tc.state["modified_files"] == ["good.py"]
-
-
-def test_codeopt_write_file_rejects_identical_content():
-    with tempfile.TemporaryDirectory() as sandbox:
-        original = "import os\nprint('hello')\n"
-        Path(os.path.join(sandbox, "good.py")).write_text(original)
-        tc = MockToolContext({"sandbox": sandbox})
-
-        result = co_write_file("good.py", original, tc)
-
-        assert "ERROR" in result
-        assert "identical" in result
-        assert "modified_files" not in tc.state
-
-
-def test_codeopt_write_file_accepts_modified_content():
-    with tempfile.TemporaryDirectory() as sandbox:
-        original = "import os\nprint('hello')\n"
-        Path(os.path.join(sandbox, "good.py")).write_text(original)
-        tc = MockToolContext({"sandbox": sandbox})
-
-        result = co_write_file("good.py", "import os\nprint('optimized')\n", tc)
-
-        assert "OK: wrote" in result
-        assert tc.state["modified_files"] == ["good.py"]
-
-
-def test_codeopt_write_file_skips_syntax_check_for_non_python():
-    with tempfile.TemporaryDirectory() as sandbox:
-        tc = MockToolContext({"sandbox": sandbox})
-
-        result = co_write_file("data.json", '{"key": "value"}', tc)
-
-        assert "OK: wrote" in result
-        assert tc.state["modified_files"] == ["data.json"]
-
-
-def test_codeopt_write_file_adds_adco_tag_to_python():
-    with tempfile.TemporaryDirectory() as sandbox:
-        tc = MockToolContext({"sandbox": sandbox})
-        sandbox_id = os.path.basename(sandbox)
-
-        co_write_file("app.py", "x = 1\n", tc)
-
-        content = Path(os.path.join(sandbox, "app.py")).read_text()
-        assert content == f"# ADCO_OPTIMIZED: {sandbox_id}\nx = 1\n"
-
-
-def test_codeopt_write_file_adds_adco_tag_to_sql():
-    with tempfile.TemporaryDirectory() as sandbox:
-        tc = MockToolContext({"sandbox": sandbox})
-        sandbox_id = os.path.basename(sandbox)
-
-        co_write_file("query.sql", "SELECT 1;\n", tc)
-
-        content = Path(os.path.join(sandbox, "query.sql")).read_text()
-        assert content == f"-- ADCO_OPTIMIZED: {sandbox_id}\nSELECT 1;\n"
-
-
-def test_codeopt_write_file_replaces_existing_tag():
-    with tempfile.TemporaryDirectory() as sandbox:
-        tc = MockToolContext({"sandbox": sandbox})
-        sandbox_id = os.path.basename(sandbox)
-        old_content = "# ADCO_OPTIMIZED: old-id\nx = 1\n"
-        Path(os.path.join(sandbox, "app.py")).write_text(old_content)
-
-        co_write_file("app.py", "x = 2\n", tc)
-
-        content = Path(os.path.join(sandbox, "app.py")).read_text()
-        assert content == f"# ADCO_OPTIMIZED: {sandbox_id}\nx = 2\n"
-
-
-def test_codeopt_write_file_no_tag_for_unsupported_extensions():
-    with tempfile.TemporaryDirectory() as sandbox:
-        tc = MockToolContext({"sandbox": sandbox})
-
-        co_write_file("data.json", '{"key": "value"}', tc)
-
-        content = Path(os.path.join(sandbox, "data.json")).read_text()
-        assert content == '{"key": "value"}'
-
-
-def test_codeopt_identity_check_ignores_tag():
-    with tempfile.TemporaryDirectory() as sandbox:
-        sandbox_id = os.path.basename(sandbox)
-        tagged = f"# ADCO_OPTIMIZED: {sandbox_id}\nx = 1\n"
-        Path(os.path.join(sandbox, "app.py")).write_text(tagged)
-        tc = MockToolContext({"sandbox": sandbox})
-
-        result = co_write_file("app.py", "x = 1\n", tc)
-
-        assert "identical" in result
-        assert "ERROR" in result
-
-
-def test_codeopt_read_file_reads_content():
-    with tempfile.TemporaryDirectory() as sandbox:
-        Path(os.path.join(sandbox, "data.txt")).write_text("hello world")
-        tc = MockToolContext({"sandbox": sandbox})
-
-        result = co_read_file("data.txt", tc)
-
-        assert result == "hello world"
-
-
-def test_codeopt_list_sandbox_lists_files():
-    with tempfile.TemporaryDirectory() as sandbox:
-        Path(os.path.join(sandbox, "a.py")).write_text("x")
-        Path(os.path.join(sandbox, "b.py")).write_text("y")
-        tc = MockToolContext({"sandbox": sandbox})
-
-        result = co_list_sandbox("", tc)
-
-        assert "a.py" in result
-        assert "b.py" in result
-
-
-def test_codeopt_get_optimization_context_reads_structured_intent():
-    tc = MockToolContext({
-        "intent_extractor_output": {
-            "connection": "pool", "queries": "crud", "transactions": "manual",
-            "n_plus_one": "yes", "concurrency": "seq", "orm": "raw",
-            "optimization_targets": [
-                {"file": "driver.py", "description": "combine queries"},
-                {"file": "loader.py", "description": "batch inserts"},
-            ],
-            "notes": "n/a",
-        },
-        "strategies": "COMBINING_QUERIES",
-        "sandbox": "/tmp/sb",
-    })
-
-    result = co_get_optimization_context(tc)
-
-    assert "CONNECTION: pool" in result
-    assert "COMBINING_QUERIES" in result
-    assert "driver.py" in result
-    assert "loader.py" in result
-    assert "combine queries" in result
-    assert "/tmp/sb" in result
-
-
-def test_codeopt_get_optimization_context_missing_intent_output():
+def test_optimizer_get_optimization_context_missing_intent_output():
     tc = MockToolContext({})
 
     result = co_get_optimization_context(tc)
@@ -275,12 +84,576 @@ def test_codeopt_get_optimization_context_missing_intent_output():
     assert "ERROR" in result
 
 
-def test_codeopt_get_optimization_context_no_targets():
-    tc = MockToolContext({"intent_extractor_output": {"connection": "pool", "optimization_targets": []}})
+def test_optimizer_get_optimization_context_missing_current_contract():
+    tc = MockToolContext({
+        "intent_extractor_output": {
+            "connection": "pool",
+            "optimization_targets": [{"file": "driver.py"}],
+        },
+    })
 
     result = co_get_optimization_context(tc)
 
     assert "ERROR" in result
+    assert "current_contract" in result
+
+
+def test_optimizer_get_optimization_context_single_target():
+    tc = MockToolContext({
+        "intent_extractor_output": {
+            "connection": "pool", "queries": "crud", "transactions": "manual",
+            "n_plus_one": "yes", "concurrency": "seq", "orm": "raw",
+            "optimization_targets": [
+                {"file": "driver.py", "description": "batch new order queries"},
+            ],
+            "notes": "n/a",
+        },
+        "strategies": "QUERY_BATCHING",
+        "sandbox": "/tmp/sb",
+        "current_contract": {
+            "rewrite_id": "r1",
+            "target": {
+                "file": "driver.py",
+                "function": "doNewOrder",
+                "qualified_function": "Db.doNewOrder",
+            },
+            "targets": [{"file": "driver.py", "function": "Db.doNewOrder"}],
+            "pattern": "N_PLUS_ONE_QUERY",
+            "strategy": "QUERY_BATCHING",
+            "allowed_regions": ["Db.doNewOrder"],
+            "must_preserve": ["function_signature"],
+            "must_not_change": ["return_type"],
+        },
+        "target_context_map": {
+            "Db.doNewOrder": {
+                "analysis_summary": "## Function Analysis: Db.doNewOrder\n- Signature: def doNewOrder(self, warehouse_id)",
+                "function_source": "def doNewOrder(self, warehouse_id):\n    cursor.execute('SELECT 1')\n",
+                "dependency_slice": "# Dependency Slice: `doNewOrder`",
+            },
+        },
+        "last_failure": {
+            "status": "FAIL",
+            "target_coverage": [
+                {
+                    "file": "driver.py",
+                    "function": "Db.doNewOrder",
+                    "status": "MISSING_REWRITE",
+                    "details": "2 loop ops remain",
+                },
+            ],
+            "violations": [
+                {
+                    "code": "STRATEGY_NOT_APPLIED",
+                    "severity": "ERROR",
+                    "message": "Strict-zero violation",
+                },
+            ],
+        },
+    })
+
+    result = co_get_optimization_context(tc)
+
+    assert "Contract" in result
+    assert "Function Analysis" in result
+    assert "Target Function Source" in result
+    assert "def doNewOrder" in result
+    assert "Acceptance Checklist" in result
+    assert "0 database operations inside any loop" in result
+    assert "Dependency Slice" in result
+    assert "doNewOrder" in result
+    assert "MISSING_REWRITE" in result
+    assert "Strict-zero violation" in result
+    assert "/tmp/sb" in result
+
+
+def _optimizer_context_state(attempts):
+    return {
+        "intent_extractor_output": {
+            "connection": "pool", "queries": "crud", "transactions": "manual",
+            "n_plus_one": "yes", "concurrency": "seq", "orm": "raw",
+            "optimization_targets": [
+                {"file": "driver.py", "description": "batch new order queries"},
+            ],
+            "notes": "n/a",
+        },
+        "strategies": "QUERY_BATCHING",
+        "sandbox": "/tmp/sb",
+        "current_contract": {
+            "rewrite_id": "r1",
+            "target": {
+                "file": "driver.py",
+                "function": "doNewOrder",
+                "qualified_function": "Db.doNewOrder",
+            },
+            "targets": [{"file": "driver.py", "function": "Db.doNewOrder"}],
+            "pattern": "N_PLUS_ONE_QUERY",
+            "strategy": "QUERY_BATCHING",
+            "allowed_regions": ["Db.doNewOrder"],
+            "must_preserve": ["function_signature"],
+            "must_not_change": ["return_type"],
+        },
+        "target_context_map": {
+            "Db.doNewOrder": {
+                "analysis_summary": "## Function Analysis: Db.doNewOrder\n- Signature: def doNewOrder(self, warehouse_id)",
+                "function_source": "def doNewOrder(self, warehouse_id):\n    cursor.execute('SELECT 1')\n",
+                "dependency_slice": "# Dependency Slice: `doNewOrder`",
+            },
+        },
+        "optimizer_attempts": attempts,
+    }
+
+
+def test_get_optimization_context_includes_prior_attempts():
+    tc = MockToolContext(_optimizer_context_state([
+        {
+            "file": "driver.py",
+            "function": "Db.doNewOrder",
+            "bare_function": "doNewOrder",
+            "outcome": "REJECTED",
+            "codes": ["DUPLICATE_WHERE"],
+            "message": "boom",
+            "attempt": 1,
+            "candidate_key": "k",
+            "diff": "- old\n+ new",
+        }
+    ]))
+
+    result = co_get_optimization_context(tc)
+
+    assert "## Prior Optimizer Attempts" in result
+    assert "boom" in result
+
+    no_match = MockToolContext(_optimizer_context_state([]))
+    assert "## Prior Optimizer Attempts" not in co_get_optimization_context(no_match)
+
+
+_NO_REWRITE_FN = "def doNewOrder(self, warehouse_id):\n    cursor.execute('SELECT 1')\n"
+
+
+def _optimizer_context_state_with_sandbox(
+    tmp_path, sandbox_function_source, attempt_count
+):
+    state = _optimizer_context_state([])
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    (sandbox / "driver.py").write_text(sandbox_function_source)
+    state["sandbox"] = str(sandbox)
+    state["attempt_count"] = attempt_count
+    return state
+
+
+def test_get_optimization_context_no_rewrite_directive_when_unchanged(tmp_path):
+    state = _optimizer_context_state_with_sandbox(tmp_path, _NO_REWRITE_FN, 2)
+
+    result = co_get_optimization_context(MockToolContext(state))
+
+    assert "## CRITICAL: No rewrite applied" in result
+
+
+def test_get_optimization_context_no_directive_on_first_attempt(tmp_path):
+    state = _optimizer_context_state_with_sandbox(tmp_path, _NO_REWRITE_FN, 1)
+
+    result = co_get_optimization_context(MockToolContext(state))
+
+    assert "## CRITICAL: No rewrite applied" not in result
+
+
+def test_get_optimization_context_no_directive_when_modified(tmp_path):
+    modified = (
+        "def doNewOrder(self, warehouse_id):\n"
+        "    cursor.execute('SELECT * FROM orders')\n"
+    )
+    state = _optimizer_context_state_with_sandbox(tmp_path, modified, 2)
+
+    result = co_get_optimization_context(MockToolContext(state))
+
+    assert "## CRITICAL: No rewrite applied" not in result
+
+
+def test_render_previous_attempt_diff_ignores_indentation(tmp_path):
+    from src.code_rewriter._common import extract_function_source_by_name
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    method_source = (
+        "class Db:\n"
+        "    def doNewOrder(self, warehouse_id):\n"
+        "        cursor.execute('SELECT 1')\n"
+    )
+    (sandbox / "driver.py").write_text(method_source)
+    original_source = extract_function_source_by_name(method_source, "Db.doNewOrder")
+
+    rendered = "\n".join(
+        _render_previous_attempt(
+            {"sandbox": str(sandbox)}, "driver.py", "Db.doNewOrder", original_source
+        )
+    )
+
+    assert "## Diff vs Original" in rendered
+    assert "(no changes)" in rendered
+
+
+def _write_gate_contract():
+    return {
+        "rewrite_id": "gate",
+        "target": {"file": "app.py", "function": "get_user_data"},
+        "targets": [{"file": "app.py", "function": "get_user_data"}],
+        "pattern": "N_PLUS_ONE_QUERY",
+        "strategy": "Replace loop with IN clause",
+        "allowed_regions": ["get_user_data"],
+        "must_preserve": ["return_type", "function_signature"],
+    }
+
+
+_ORIGINAL_LOOP_FN = (
+    "def get_user_data(user_ids):\n"
+    "    results = []\n"
+    "    for uid in user_ids:\n"
+    "        cursor.execute('SELECT * FROM users WHERE id = %s', (uid,))\n"
+    "        results.append(cursor.fetchone())\n"
+    "    return results\n"
+)
+
+
+def _write_gate_dirs(tmp_path, source):
+    target_dir = tmp_path / "target"
+    sandbox_dir = tmp_path / "sandbox"
+    target_dir.mkdir()
+    sandbox_dir.mkdir()
+    (target_dir / "app.py").write_text(source)
+    (sandbox_dir / "app.py").write_text(source)
+    return target_dir, sandbox_dir
+
+
+def test_replace_function_rejects_new_duplicate_where(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s) WHERE name = %s', (user_ids, 'x'))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("ERROR")
+    assert "DUPLICATE_WHERE" in result
+    assert (sandbox_dir / "app.py").read_text() == _ORIGINAL_LOOP_FN
+
+
+def test_replace_function_rejects_unknown_query_key(tmp_path):
+    original = (
+        "QUERIES = {\n"
+        "    'get_user': 'SELECT * FROM users WHERE id = %s',\n"
+        "}\n\n"
+        + _ORIGINAL_LOOP_FN.replace("cursor.execute('SELECT * FROM users WHERE id = %s', (uid,))", "cursor.execute(QUERIES['get_user'], (uid,))")
+    )
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, original)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute(QUERIES['bogus'], (user_ids,))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("ERROR")
+    assert "UNKNOWN_QUERY_KEY" in result
+    assert (sandbox_dir / "app.py").read_text() == original
+
+
+def test_replace_function_accepts_clean_batching_rewrite(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s)', (user_ids,))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("Successfully replaced")
+    assert "ANY(%s)" in (sandbox_dir / "app.py").read_text()
+
+
+def test_replace_function_records_rejected_attempt(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s) WHERE name = %s', (user_ids, 'x'))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("ERROR")
+    entries = tc.state["optimizer_attempts"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["outcome"] == "REJECTED"
+    assert "DUPLICATE_WHERE" in entry["codes"]
+    assert entry["candidate_key"]
+
+
+def test_replace_function_duplicate_rejection_warns_and_sets_no_progress(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s) WHERE name = %s', (user_ids, 'x'))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    co_replace_function("app.py", "get_user_data", candidate, tc)
+    second = co_replace_function("app.py", "get_user_data", candidate, tc)
+    third = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert "already been rejected" in second
+    assert "NO PROGRESS" in third
+    assert tc.state["optimizer_no_progress"] == {
+        "file": "app.py",
+        "function": "get_user_data",
+    }
+
+
+def test_replace_function_whitespace_variant_counts_as_duplicate(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s) WHERE name = %s', (user_ids, 'x'))\n"
+        "    return cursor.fetchall()\n"
+    )
+    variant = (
+        "def get_user_data(user_ids):\n"
+        "\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s) WHERE name = %s', (user_ids, 'x'))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    co_replace_function("app.py", "get_user_data", candidate, tc)
+    second = co_replace_function("app.py", "get_user_data", variant, tc)
+
+    assert "already been rejected" in second
+
+
+def test_replace_function_records_applied_attempt(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s)', (user_ids,))\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("Successfully replaced")
+    entries = tc.state["optimizer_attempts"]
+    assert len(entries) == 1
+    assert entries[0]["outcome"] == "APPLIED"
+
+
+def test_replace_function_rejects_ast_identical_rewrite(tmp_path):
+    """Text-only changes (comments/whitespace/quotes) keep the AST identical and
+    must be rejected, matching the deterministic verifier's AST comparison."""
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    # reformatted only -- no real change\n"
+        "    results = []\n"
+        "\n"
+        "    for uid in user_ids:\n"
+        '        cursor.execute("SELECT * FROM users WHERE id = %s", (uid,))\n'
+        "        results.append(cursor.fetchone())\n"
+        "    return results\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("ERROR")
+    assert "structurally" in result
+    assert (sandbox_dir / "app.py").read_text() == _ORIGINAL_LOOP_FN
+
+
+def test_replace_function_rejects_percent_format_arity_collision(tmp_path):
+    target_dir, sandbox_dir = _write_gate_dirs(tmp_path, _ORIGINAL_LOOP_FN)
+    candidate = (
+        "def get_user_data(user_ids):\n"
+        "    placeholders = ','.join(['%s'] * len(user_ids))\n"
+        "    sql = (f'SELECT * FROM users WHERE id = %02d AND id IN ({placeholders})') % (user_ids,)\n"
+        "    cursor.execute(sql, user_ids)\n"
+        "    return cursor.fetchall()\n"
+    )
+    tc = MockToolContext({
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _write_gate_contract(),
+    })
+
+    result = co_replace_function("app.py", "get_user_data", candidate, tc)
+
+    assert result.startswith("ERROR")
+    assert "PERCENT_FORMAT_ARITY" in result
+    assert (sandbox_dir / "app.py").read_text() == _ORIGINAL_LOOP_FN
+
+
+_TPCC_DRIVER = (
+    Path(__file__).resolve().parents[1]
+    / "benchmarks"
+    / "tools"
+    / "tpcc"
+    / "drivers"
+    / "postgresdriver.py"
+)
+
+
+# The real TPC-C doStockLevel (two sequential, value-dependent reads) rewritten
+# into a single 3-relation JOIN: the canonical HIGH-risk transformation.
+_HIGH_RISK_STOCK_LEVEL = (
+    "def doStockLevel(self, params):\n"
+    "    w_id = params[\"w_id\"]\n"
+    "    d_id = params[\"d_id\"]\n"
+    "    threshold = params[\"threshold\"]\n"
+    "    self.cursor.execute(\n"
+    "        \"SELECT COUNT(DISTINCT OL_I_ID) FROM ORDER_LINE \"\n"
+    "        \"JOIN STOCK ON ORDER_LINE.OL_I_ID = STOCK.S_I_ID \"\n"
+    "        \"JOIN DISTRICT ON STOCK.S_W_ID = DISTRICT.D_W_ID \"\n"
+    "        \"WHERE OL_W_ID = %s AND OL_D_ID = %s AND OL_O_ID < %s\",\n"
+    "        [w_id, d_id, threshold],\n"
+    "    )\n"
+    "    result = self.cursor.fetchone()\n"
+    "    self.conn.commit()\n"
+    "    return int(result[0])\n"
+)
+
+
+# A dependency-preserving variant: the same two statements (and their value
+# dependency) are kept separate, so the risk stays LOW.
+_LOW_RISK_STOCK_LEVEL = (
+    "def doStockLevel(self, params):\n"
+    "    q = TXN_QUERIES[\"STOCK_LEVEL\"]\n"
+    "    w_id = params[\"w_id\"]\n"
+    "    d_id = params[\"d_id\"]\n"
+    "    threshold = params[\"threshold\"]\n"
+    "    self.cursor.execute(q[\"getOId\"], [w_id, d_id])\n"
+    "    result = self.cursor.fetchone()\n"
+    "    if not result:\n"
+    "        raise RuntimeError(\"missing order\")\n"
+    "    o_id = result[0]\n"
+    "    self.cursor.execute(\n"
+    "        q[\"getStockCount\"], [w_id, d_id, o_id, (o_id - 20), w_id, threshold]\n"
+    "    )\n"
+    "    result = self.cursor.fetchone()\n"
+    "    self.conn.commit()\n"
+    "    return int(result[0])\n"
+)
+
+
+def _stock_level_contract():
+    return {
+        "rewrite_id": "stock_level",
+        "target": {
+            "file": "postgresdriver.py",
+            "function": "doStockLevel",
+            "qualified_function": "PostgresDriver.doStockLevel",
+        },
+        "targets": [
+            {
+                "file": "postgresdriver.py",
+                "function": "doStockLevel",
+                "qualified_function": "PostgresDriver.doStockLevel",
+            }
+        ],
+        "pattern": "N_PLUS_ONE_QUERY",
+        "strategy": "combine dependent reads",
+        "allowed_regions": ["PostgresDriver.doStockLevel"],
+        "must_preserve": ["return_type", "function_signature"],
+    }
+
+
+def _stock_level_setup(tmp_path):
+    from src.code_rewriter.tools.ast_analyzer import analyze_file
+    from src.code_rewriter.tools.db_interaction import build_read_write_map
+
+    original = _TPCC_DRIVER.read_text(encoding="utf-8")
+    target_dir = tmp_path / "target"
+    sandbox_dir = tmp_path / "sandbox"
+    target_dir.mkdir()
+    sandbox_dir.mkdir()
+    (target_dir / "postgresdriver.py").write_text(original, encoding="utf-8")
+    (sandbox_dir / "postgresdriver.py").write_text(original, encoding="utf-8")
+    state = {
+        "target": str(target_dir),
+        "sandbox": str(sandbox_dir),
+        "current_contract": _stock_level_contract(),
+        "read_write_map": build_read_write_map(analyze_file(_TPCC_DRIVER)),
+    }
+    return sandbox_dir, original, state
+
+
+def test_replace_function_blocks_high_risk_stock_level(tmp_path):
+    sandbox_dir, original, state = _stock_level_setup(tmp_path)
+    tc = MockToolContext(state)
+
+    result = co_replace_function(
+        "postgresdriver.py", "PostgresDriver.doStockLevel", _HIGH_RISK_STOCK_LEVEL, tc
+    )
+
+    assert result.startswith("ERROR")
+    assert "HIGH transformation risk" in result
+    assert "DEPENDENT_QUERY_FUSION" in result
+    assert (sandbox_dir / "postgresdriver.py").read_text(encoding="utf-8") == original
+    assert "PostgresDriver.doStockLevel" in tc.state["risk_rejections"]
+
+
+def test_replace_function_accepts_low_risk_stock_level(tmp_path):
+    sandbox_dir, original, state = _stock_level_setup(tmp_path)
+    tc = MockToolContext(state)
+
+    result = co_replace_function(
+        "postgresdriver.py", "PostgresDriver.doStockLevel", _LOW_RISK_STOCK_LEVEL, tc
+    )
+
+    assert result.startswith("Successfully replaced")
+    assert (sandbox_dir / "postgresdriver.py").read_text(encoding="utf-8") != original
+    assert not tc.state.get("risk_rejections")
 
 
 # ---------------------------------------------------------------------------
@@ -411,11 +784,198 @@ def test_run_application_classified_as_code_error():
         assert result.startswith("STARTUP_FAILED_CODE:CODE")
 
 
+def test_run_application_deterministic_verification_pass():
+    from src.code_rewriter.sub_agents.verifier.tools import run_contract_verification
+    with tempfile.TemporaryDirectory() as target_dir, tempfile.TemporaryDirectory() as sandbox_dir:
+        orig_code = (
+            "def get_user_data(user_ids):\n"
+            "    results = []\n"
+            "    for uid in user_ids:\n"
+            "        cursor.execute('SELECT * FROM users WHERE id = %s', (uid,))\n"
+            "        results.append(cursor.fetchone())\n"
+            "    return results\n"
+        )
+        opt_code = (
+            "def get_user_data(user_ids):\n"
+            "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s)', (user_ids,))\n"
+            "    return cursor.fetchall()\n"
+        )
+        Path(os.path.join(target_dir, "app.py")).write_text(orig_code)
+        Path(os.path.join(sandbox_dir, "app.py")).write_text(opt_code)
+
+        entry = "app.py"
+        tc = MockToolContext({
+            "target": target_dir,
+            "sandbox": sandbox_dir,
+            "modified_files": ["app.py"],
+            "file_selector_output": {"entry_point": entry},
+            "rewrite_contracts": [
+                {
+                    "rewrite_id": "test_pass",
+                    "target": {"file": "app.py", "function": "get_user_data"},
+                    "targets": [{"file": "app.py", "function": "get_user_data"}],
+                    "pattern": "N+1 Query",
+                    "strategy": "Replace loop with IN clause",
+                    "allowed_regions": ["get_user_data"],
+                    "must_preserve": ["return_type", "function_signature"],
+                }
+            ],
+        })
+
+        result = run_application("", tc)
+        assert result.startswith("STARTED_OK")
+
+        standalone = run_contract_verification(tc)
+        assert "Deterministic Verification Status: PASS" in standalone
+
+
+def test_run_application_deterministic_verification_fail_blocks_started_ok():
+    from src.code_rewriter.sub_agents.verifier.tools import run_contract_verification
+    with tempfile.TemporaryDirectory() as target_dir, tempfile.TemporaryDirectory() as sandbox_dir:
+        # Code is untransformed (queries still in loop), but valid python that exits 0
+        code = (
+            "def get_user_data(user_ids):\n"
+            "    results = []\n"
+            "    for uid in user_ids:\n"
+            "        cursor.execute('SELECT * FROM users WHERE id = %s', (uid,))\n"
+            "        results.append(cursor.fetchone())\n"
+            "    return results\n"
+        )
+        Path(os.path.join(target_dir, "app.py")).write_text(code)
+        Path(os.path.join(sandbox_dir, "app.py")).write_text(code)
+
+        entry = "app.py"
+        tc = MockToolContext({
+            "target": target_dir,
+            "sandbox": sandbox_dir,
+            "modified_files": ["app.py"],
+            "file_selector_output": {"entry_point": entry},
+            "rewrite_contracts": [
+                {
+                    "rewrite_id": "test_fail",
+                    "target": {"file": "app.py", "function": "get_user_data"},
+                    "targets": [{"file": "app.py", "function": "get_user_data"}],
+                    "pattern": "N+1 Query",
+                    "strategy": "Replace loop with IN clause",
+                    "allowed_regions": ["get_user_data"],
+                    "must_preserve": ["return_type", "function_signature"],
+                }
+            ],
+        })
+
+        result = run_application("", tc)
+        assert result.startswith("STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL")
+        assert "Violations:" in result
+        assert "Target Coverage:" in result
+        assert "MISSING_REWRITE" in result or "STRATEGY_NOT_APPLIED" in result
+        assert tc.state["deterministic_verification"]["status"] == "FAIL"
+
+        standalone = run_contract_verification(tc)
+        assert "Deterministic Verification Status: FAIL" in standalone
+
+
+def test_get_verification_context():
+    from src.code_rewriter.sub_agents.verifier.tools import get_verification_context
+    with tempfile.TemporaryDirectory() as target_dir, tempfile.TemporaryDirectory() as sandbox_dir:
+        orig_code = (
+            "def get_user_data(user_ids):\n"
+            "    # ORIGINAL_MARKER\n"
+            "    results = []\n"
+            "    for uid in user_ids:\n"
+            "        cursor.execute('SELECT * FROM users WHERE id = %s', (uid,))\n"
+            "        results.append(cursor.fetchone())\n"
+            "    return results\n"
+        )
+        opt_code = (
+            "def get_user_data(user_ids):\n"
+            "    # OPTIMIZED_MARKER\n"
+            "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s)', (user_ids,))\n"
+            "    return cursor.fetchall()\n"
+        )
+        Path(os.path.join(target_dir, "app.py")).write_text(orig_code)
+        Path(os.path.join(sandbox_dir, "app.py")).write_text(opt_code)
+
+        tc = MockToolContext({
+            "target": target_dir,
+            "sandbox": sandbox_dir,
+            "modified_files": ["app.py"],
+            "rewrite_contracts": [
+                {
+                    "rewrite_id": "ctx_test",
+                    "target": {"file": "app.py", "function": "get_user_data"},
+                    "targets": [{"file": "app.py", "function": "get_user_data"}],
+                    "pattern": "N_PLUS_ONE_QUERY",
+                    "strategy": "Replace loop with IN clause",
+                    "allowed_regions": ["get_user_data"],
+                    "must_preserve": ["return_type", "function_signature"],
+                }
+            ],
+            "target_context_map": {
+                "get_user_data": {
+                    "analysis_summary": "## Function Analysis: get_user_data\n- Signature: def get_user_data(user_ids)",
+                    "function_source": orig_code,
+                    "dependency_slice": "# Dependency Slice: `get_user_data`",
+                },
+            },
+        })
+
+        result = get_verification_context(tc)
+
+        assert "N_PLUS_ONE_QUERY" in result
+        assert "Function Analysis: get_user_data" in result
+        assert "ORIGINAL_MARKER" in result
+        assert "OPTIMIZED_MARKER" in result
+
+
+def test_get_verification_context_scopes_to_current_contract():
+    from src.code_rewriter.sub_agents.verifier.tools import get_verification_context
+    with tempfile.TemporaryDirectory() as target_dir, tempfile.TemporaryDirectory() as sandbox_dir:
+        code = "def f():\n    return 1\n"
+        Path(os.path.join(target_dir, "app.py")).write_text(code)
+        Path(os.path.join(sandbox_dir, "app.py")).write_text(code)
+
+        current = {
+            "rewrite_id": "c1",
+            "target": {"file": "app.py", "function": "f"},
+            "targets": [{"file": "app.py", "function": "f"}],
+            "pattern": "N_PLUS_ONE_QUERY",
+            "strategy": "batch",
+            "allowed_regions": ["f"],
+            "must_preserve": [],
+        }
+        other = {
+            "rewrite_id": "c2",
+            "target": {"file": "app.py", "function": "g"},
+            "targets": [{"file": "app.py", "function": "g"}],
+            "pattern": "N_PLUS_ONE_QUERY",
+            "strategy": "batch",
+            "allowed_regions": ["g"],
+            "must_preserve": [],
+        }
+        tc = MockToolContext({
+            "target": target_dir,
+            "sandbox": sandbox_dir,
+            "modified_files": ["app.py"],
+            "rewrite_contracts": [current, other],
+            "current_contract": current,
+            "target_context_map": {
+                "f": {"analysis_summary": "SUMMARY_F", "function_source": code},
+                "g": {"analysis_summary": "SUMMARY_G", "function_source": code},
+            },
+        })
+
+        result = get_verification_context(tc)
+
+        assert "SUMMARY_F" in result
+        assert "SUMMARY_G" not in result
+
+
+
 # ---------------------------------------------------------------------------
 # intent_extractor.tools
 # ---------------------------------------------------------------------------
 
-from src.code_rewriter.sub_agents.intent_extractor.tools import read_selected_files
+from src.intent_analyzer.sub_agents.intent_extractor.tools import read_selected_files
 
 
 def test_read_selected_files_returns_contents():
@@ -451,29 +1011,8 @@ def test_read_selected_files_no_files():
 # tools layer ADK wrappers
 # ---------------------------------------------------------------------------
 
-from src.code_rewriter.tools.scanner import scan_codebase
 from src.code_rewriter.tools.copier import copy_to_sandbox
 from src.code_rewriter.tools.planner import get_optimization_strategies
-
-
-def test_scan_codebase_writes_scan_result_to_state():
-    with tempfile.TemporaryDirectory() as root:
-        Path(os.path.join(root, "app.py")).write_text("print('hi')\n")
-        Path(os.path.join(root, "README.md")).write_text("docs")
-        tc = MockToolContext({"target": root})
-
-        result = scan_codebase(tc)
-
-        assert "app.py" in result
-        assert tc.state["scan_result"] == result
-
-
-def test_scan_codebase_missing_target():
-    tc = MockToolContext({})
-
-    result = scan_codebase(tc)
-
-    assert "ERROR" in result
 
 
 def test_copy_to_sandbox_writes_sandbox_to_state():
@@ -501,6 +1040,7 @@ def test_get_optimization_strategies_reads_structured_intent():
 
     assert "strategies" in tc.state
     assert len(tc.state["strategies"]) > 0
+    assert result  # strategy summary returned
 
 
 def test_get_optimization_strategies_missing_intent_output():
