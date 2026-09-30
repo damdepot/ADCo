@@ -68,15 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--table-size", type=int, default=10000, help="Rows per table"
     )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--prepare",
-        dest="prepare",
-        action="store_true",
-        default=None,
-        help="Prepare the dataset on the first invocation (default)",
-    )
-    group.add_argument(
+    parser.add_argument(
         "--no-prepare",
         dest="prepare",
         action="store_false",
@@ -110,11 +102,11 @@ def main(argv: list[str]) -> int:
     payloads = []
     pooled_tps: list[float] = []
     for index in range(args.runs):
-        # Prepare on EVERY invocation when --prepare is requested. sysbench
+        # Prepare on EVERY invocation unless --no-prepare is given. sysbench
         # oltp_read_write mutates its dataset (inserts/deletes), so reusing a
         # prepared dataset makes successive reps slower and adds large
         # run-to-run spread. A fresh dataset per sample is the stable unit.
-        do_prepare = args.prepare is not False
+        do_prepare = args.prepare
         print(
             f"{prefix}invocation {index + 1}/{args.runs} "
             f"(db={cfg.database}, prepare={do_prepare})",

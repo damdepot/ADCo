@@ -90,8 +90,6 @@ def _pg_row(**overrides):
         "vartype": "enum",
         "enumvals": "{on,off,local}",
         "pending_restart": False,
-        "boot_val": "on",
-        "reset_val": "on",
     }
     row.update(overrides)
     return row

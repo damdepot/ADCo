@@ -90,7 +90,6 @@ def replace_function_ast(
     source_code: str,
     target_name: str,
     new_func_code: str,
-    preserve_decorators: Optional[bool] = None,
 ) -> Tuple[bool, str, Optional[str]]:
     """Replace a specific function in Python source code using AST analysis.
 
@@ -98,7 +97,6 @@ def replace_function_ast(
         source_code: The original source code string.
         target_name: The name of the function to replace (unqualified or qualified).
         new_func_code: The new function implementation string.
-        preserve_decorators: Optional boolean controlling decorator preservation.
 
     Returns:
         A tuple of (success, reconstructed_source, error_message).
@@ -148,14 +146,8 @@ def replace_function_ast(
     orig_has_decorators = bool(target_node.decorator_list)
     repl_has_decorators = bool(repl_func_node.decorator_list)
 
-    # Determine whether to preserve decorators
-    if preserve_decorators is True:
-        should_preserve = True
-    elif preserve_decorators is False:
-        should_preserve = False
-    else:
-        # Auto-detect: if replacement doesn't start with decorator '@', preserve existing decorators
-        should_preserve = not dedented_new_code.lstrip().startswith("@")
+    # Auto-detect: if replacement doesn't start with decorator '@', preserve existing decorators
+    should_preserve = not dedented_new_code.lstrip().startswith("@")
 
     # Indent new code to match target function indentation
     col_offset = target_node.col_offset

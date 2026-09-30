@@ -27,7 +27,7 @@ def test_copy_entire_copies_files_to_sandbox(temp_sandbox_root):
         os.makedirs(os.path.join(source, "lib"))
         Path(os.path.join(source, "lib", "helpers.py")).write_text("def foo(): pass")
 
-        dest = copy_entire(source, sandbox_id="test_copier_1")
+        dest = copy_entire(source)
 
         assert os.path.isdir(dest)
         assert os.path.isfile(os.path.join(dest, "app.py"))
@@ -56,7 +56,7 @@ def test_copy_entire_excludes_pycache_and_git(temp_sandbox_root):
         os.makedirs(os.path.join(source, "sandbox"))
         Path(os.path.join(source, "sandbox", "secret.py")).write_text("secret")
 
-        dest = copy_entire(source, sandbox_id="test_copier_exclude")
+        dest = copy_entire(source)
 
         assert os.path.isfile(os.path.join(dest, "main.py"))
         assert not os.path.exists(os.path.join(dest, "__pycache__"))

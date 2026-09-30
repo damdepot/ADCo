@@ -33,16 +33,13 @@ def test_knob_recommendation_model_validates():
         knob="shared_buffers",
         current_value="128MB",
         recommended_value="4GB",
-        unit="GB",
         reasoning="25% of 16GB total RAM for dedicated PostgreSQL OLTP instance",
         restart_required=True,
-        risk_level="medium",
     )
     assert rec.knob == "shared_buffers"
     assert rec.current_value == "128MB"
     assert rec.recommended_value == "4GB"
     assert rec.restart_required is True
-    assert rec.risk_level == "medium"
     dump = rec.model_dump()
     assert dump["knob"] == "shared_buffers"
     assert KnobRecommendation.model_validate(dump).recommended_value == "4GB"
@@ -55,41 +52,31 @@ def test_knob_recommendation_defaults():
         recommended_value="32MB",
         reasoning="Sufficient workspace for sort operations with 100 max connections",
     )
-    assert rec.unit == ""
     assert rec.restart_required is False
-    assert rec.risk_level == "low"
 
 
 def test_knob_recommender_output_validates():
     data = {
-        "total_memory_allocated_gb": 12.0,
-        "memory_budget_pct": 75.0,
         "recommendations": [
             {
                 "knob": "innodb_buffer_pool_size",
                 "current_value": "134217728",
                 "recommended_value": "10737418240",
-                "unit": "Bytes",
                 "reasoning": "Allocated 10GB (62.5% of 16GB RAM) to InnoDB buffer pool",
                 "restart_required": False,
-                "risk_level": "low",
             },
             {
                 "knob": "max_connections",
                 "current_value": "151",
                 "recommended_value": "300",
-                "unit": "",
                 "reasoning": "Accommodate connection pool peak spikes",
                 "restart_required": False,
-                "risk_level": "low",
             },
         ],
         "summary": "Optimized memory buffers for read-heavy OLTP workload on 16GB host.",
         "restart_required": False,
     }
     out = KnobRecommenderOutput.model_validate(data)
-    assert out.total_memory_allocated_gb == 12.0
-    assert out.memory_budget_pct == 75.0
     assert len(out.recommendations) == 2
     assert out.recommendations[0].knob == "innodb_buffer_pool_size"
     assert out.restart_required is False
@@ -233,7 +220,6 @@ def test_write_selected_knobs_from_model_output():
             knob="shared_buffers",
             current_value="128MB",
             recommended_value="4GB",
-            unit="GB",
             reasoning="25% RAM",
             restart_required=True,
         )
@@ -241,13 +227,10 @@ def test_write_selected_knobs_from_model_output():
             knob="work_mem",
             current_value="4MB",
             recommended_value="32MB",
-            unit="MB",
             reasoning="Sort workspace",
             restart_required=False,
         )
         output = KnobRecommenderOutput(
-            total_memory_allocated_gb=4.5,
-            memory_budget_pct=56.25,
             recommendations=[rec1, rec2],
             summary="Postgres tuning",
             restart_required=True,

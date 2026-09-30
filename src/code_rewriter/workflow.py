@@ -66,11 +66,6 @@ def _issue_signature(verdict: Any) -> tuple:
     return tuple(sorted(issues, key=lambda item: tuple(str(part) for part in item)))
 
 
-def attempts_exhausted(attempts: int) -> bool:
-    """Return True once *attempts* reaches the per-target retry budget."""
-    return attempts >= MAX_ATTEMPTS_PER_TARGET
-
-
 def _function_unchanged(
     target_dir: str, sandbox_dir: str, rel_file: str, function: str
 ) -> bool:

@@ -9,7 +9,6 @@ from src.knob_tuner.sub_agents.db_inspector.agent import create_db_inspector_age
 from src.knob_tuner.sub_agents.knob_recommender.agent import create_knob_recommender_agent
 
 from src.intent_analyzer.models import IntentAnalyzerResult
-from src.adco.models import AdcoPipelineResult
 
 
 def test_subagent_output_schemas():
@@ -37,20 +36,4 @@ def test_intent_analyzer_result_model():
     model = IntentAnalyzerResult(**data)
     assert model.target == "/path/to/app"
     assert model.intent_output["queries"] == "SELECT 1"
-    assert model.model_dump() == data
-
-
-def test_adco_pipeline_result_model():
-    data = {
-        "timestamp": "2026-09-16T12:00:00",
-        "mode": "all",
-        "target": "/path/to/app",
-        "sandbox": "/path/to/sandbox",
-        "model": "gemini-3.5-flash-lite",
-        "intent_analyzer": {"status": "PASS"},
-        "rewriter": {"status": "PASS"},
-        "knob_tuner": {"status": "PASS"},
-    }
-    model = AdcoPipelineResult(**data)
-    assert model.mode == "all"
     assert model.model_dump() == data

@@ -43,8 +43,6 @@ def _pick_strategy(
 def build_contracts_from_intent(
     target_dir: str, 
     intent_output: dict, 
-    strategy: str = "COMBINING_QUERIES", 
-    pattern: str = "N_PLUS_ONE_QUERY",
     selected_strategy_names: list[str] | None = None,
 ) -> tuple[dict[str, FileAnalysis], list[RewriteContract]]:
     targets = intent_output.get("optimization_targets", [])
@@ -111,20 +109,15 @@ def build_contracts_from_intent(
             qualified_function=fn.qualified_name,
             source_location=fn.source_location,
         )
-        contract_pattern = pattern if has_loop else "SEQUENTIAL_CHAIN"
-        contract_strategy = _pick_strategy(selected_strategy_names, has_loop, strategy)
+        contract_pattern = "N_PLUS_ONE_QUERY" if has_loop else "SEQUENTIAL_CHAIN"
+        contract_strategy = _pick_strategy(selected_strategy_names, has_loop, "COMBINING_QUERIES")
         contract = build_rewrite_contract(
             analysis=file_analysis,
             target=target,
             pattern=contract_pattern,
             strategy=contract_strategy,
         )
-        contract.targets = [RewriteTarget(
-            file=rel_path,
-            function=fn.name,
-            qualified_function=fn.qualified_name,
-            source_location=fn.source_location,
-        )]
+        contract.targets = [target]
         contract.allowed_regions = [fn.qualified_name or fn.name]
         contracts.append(contract)
                 

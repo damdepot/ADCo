@@ -38,6 +38,7 @@ validating a different protocol.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import math
@@ -81,42 +82,43 @@ def total_rate(path: str) -> float:
     raise ValueError(f"no TOTAL row in {path}")
 
 
-def _usage() -> int:
-    print(
-        "usage: noise_stats.py [--write-band PATH] [--protocol KEY=VALUE ...] "
-        "<csv> [<csv> ...]",
-        file=sys.stderr,
+def _parse_protocol(item: str) -> tuple[str, str]:
+    if "=" not in item:
+        raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got {item!r}")
+    key, value = item.split("=", 1)
+    return key.strip(), value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Summarize run-to-run noise from benchmark result CSVs.",
     )
-    return 2
+    parser.add_argument(
+        "--write-band",
+        dest="band_path",
+        default=None,
+        metavar="PATH",
+        help="Write the noise band JSON to PATH",
+    )
+    parser.add_argument(
+        "--protocol",
+        action="append",
+        default=[],
+        type=_parse_protocol,
+        metavar="KEY=VALUE",
+        help="Record a measurement protocol entry (repeatable)",
+    )
+    parser.add_argument(
+        "files", nargs="+", metavar="csv", help="Benchmark result CSV(s)"
+    )
+    return parser
 
 
 def main(argv: list[str]) -> int:
-    band_path = None
-    protocol: dict[str, str] = {}
-    files: list[str] = []
-    index = 0
-    while index < len(argv):
-        arg = argv[index]
-        if arg == "--write-band":
-            index += 1
-            if index >= len(argv):
-                return _usage()
-            band_path = argv[index]
-        elif arg == "--protocol":
-            index += 1
-            if index >= len(argv) or "=" not in argv[index]:
-                return _usage()
-            key, value = argv[index].split("=", 1)
-            protocol[key.strip()] = value
-        elif arg.startswith("--"):
-            print(f"unknown option: {arg}", file=sys.stderr)
-            return _usage()
-        else:
-            files.append(arg)
-        index += 1
-
-    if not files:
-        return _usage()
+    args = build_parser().parse_args(argv)
+    band_path = args.band_path
+    protocol: dict[str, str] = dict(args.protocol)
+    files: list[str] = args.files
 
     rates = [(path, total_rate(path)) for path in files]
     values = [rate for _, rate in rates]

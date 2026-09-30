@@ -53,9 +53,8 @@ def sensitive_function(data):
     new_body = """def sensitive_function(data):
     return data.strip().lower()
 """
-    # Test preserve_decorators=True
     success, modified, error = replace_function_ast(
-        source, "sensitive_function", new_body, preserve_decorators=True
+        source, "sensitive_function", new_body
     )
     assert success is True
     assert "@decorator_one" in modified
@@ -73,7 +72,7 @@ def guarded_func():
     return False
 """
     success, modified, error = replace_function_ast(
-        source, "guarded_func", new_func, preserve_decorators=False
+        source, "guarded_func", new_func
     )
     assert success is True
     assert "@old_decorator" not in modified

@@ -42,7 +42,6 @@ from .._common import target_names
 
 _FETCH_METHODS = {"fetchone", "fetchall", "fetchmany"}
 _EXECUTE_METHODS = {"execute", "executemany"}
-_COMMIT_METHODS = {"commit", "rollback"}
 _SQL_VERBS = ("SELECT", "INSERT", "UPDATE", "DELETE")
 
 #: Dialects retried, in order, when the default dialect fails to parse a query.
@@ -156,18 +155,6 @@ def _collect_without_subqueries(
         _collect_without_subqueries(child, typ, out)
 
 
-def _aggregate_name(agg: exp.Expression) -> str:
-    name = getattr(agg, "sql_name", None)
-    if callable(name):
-        try:
-            value = name()
-            if value:
-                return str(value).upper()
-        except Exception:
-            pass
-    return type(agg).__name__.upper()
-
-
 def analyze_sql(sql: str) -> Optional[SqlModel]:
     """Parse *sql* and return its structural :class:`SqlModel`.
 
@@ -199,34 +186,23 @@ def analyze_sql(sql: str) -> Optional[SqlModel]:
         tables_written = []
 
     top_level_relations = 0
-    join_count = 0
-    aggregate_funcs: List[str] = []
+    has_aggregate = False
     if isinstance(parsed, exp.Select):
         from_node = parsed.args.get("from_")
         if from_node is not None and from_node.this is not None:
             top_level_relations += 1
         joins = parsed.args.get("joins") or []
-        join_count = len(joins)
-        top_level_relations += join_count
+        top_level_relations += len(joins)
 
         found: List[exp.Expression] = []
         _collect_without_subqueries(parsed, exp.AggFunc, found)
-        for agg in found:
-            name = _aggregate_name(agg)
-            if name not in aggregate_funcs:
-                aggregate_funcs.append(name)
+        has_aggregate = bool(found)
 
     return SqlModel(
         tables_read=tables_read,
         tables_written=tables_written,
         top_level_relations=top_level_relations,
-        join_count=join_count,
-        has_aggregate=bool(aggregate_funcs),
-        aggregate_funcs=aggregate_funcs,
-        has_distinct=parsed.find(exp.Distinct) is not None,
-        has_subquery=parsed.find(exp.Subquery) is not None,
-        placeholder_count=normalized.count("?"),
-        parse_ok=True,
+        has_aggregate=has_aggregate,
     )
 
 
@@ -266,7 +242,6 @@ class _ModelBuilder:
         self.derived_from: Dict[str, int] = {}
         self.statements: List[StatementModel] = []
         self.value_edges: List[Tuple[int, int]] = []
-        self.commit_positions: List[int] = []
         self.loop_depth = 0
 
     # -- helpers ---------------------------------------------------------
@@ -351,8 +326,6 @@ class _ModelBuilder:
         attr = _call_attr(node)
         if attr in _EXECUTE_METHODS:
             self._record_execute(node)
-        elif attr in _COMMIT_METHODS:
-            self._record_commit()
 
     def _record_execute(self, call: ast.Call) -> None:
         if not call.args:
@@ -382,11 +355,6 @@ class _ModelBuilder:
                 if edge not in self.value_edges:
                     self.value_edges.append(edge)
 
-    def _record_commit(self) -> None:
-        index = self._last_statement_index()
-        if index is not None:
-            self.commit_positions.append(index)
-
 
 def build_function_model(
     fn_node: ast.AST,
@@ -412,7 +380,6 @@ def build_function_model(
         file=file or "",
         statements=builder.statements,
         value_edges=builder.value_edges,
-        commit_positions=builder.commit_positions,
     )
 
 

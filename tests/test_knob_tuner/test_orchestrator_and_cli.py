@@ -12,7 +12,8 @@ import pytest
 from google.adk import Event, Workflow
 from google.adk.agents import LlmAgent
 
-from src.knob_tuner import create_knob_tuner_workflow, create_root_agent
+from src.knob_tuner.agent import create_root_agent
+from src.knob_tuner.workflow import create_knob_tuner_workflow
 from src.knob_tuner.contracts import ResourceBudget, SysbenchProfile
 from src.knob_tuner.main import (
     DEFAULT_MODEL,
@@ -167,8 +168,6 @@ def _inventory() -> list[dict]:
             "vartype": vartype,
             "enumvals": enumvals or [],
             "pending_restart": False,
-            "boot_val": "",
-            "reset_val": "",
         }
 
     return [
@@ -1490,11 +1489,7 @@ def test_main_cli_exception_exits_1(tmp_path, capsys):
 
 def test_register_cleanup_handlers():
     with patch("atexit.register") as mock_atexit, patch("signal.signal") as mock_signal:
-        import src.knob_tuner.main as main_mod
-
-        main_mod._cleanup_handlers_registered = False
         register_cleanup_handlers()
-        assert main_mod._cleanup_handlers_registered is True
         mock_atexit.assert_called_once_with(_process_cleanup)
         assert mock_signal.call_count >= 2
 

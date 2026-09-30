@@ -8,7 +8,6 @@ from src.knob_tuner.tools.knob_scope import (
     build_knob_plan,
     classify_scope,
     fetch_pg_settings_context,
-    scope_to_restart_required,
 )
 
 
@@ -27,14 +26,6 @@ from src.knob_tuner.tools.knob_scope import (
 )
 def test_classify_scope(context, expected):
     assert classify_scope(context) == expected
-
-
-def test_scope_to_restart_required():
-    assert scope_to_restart_required(KnobScope.POSTMASTER) is True
-    assert scope_to_restart_required(KnobScope.SIGHUP) is False
-    assert scope_to_restart_required(KnobScope.USER) is False
-    assert scope_to_restart_required(KnobScope.INTERNAL) is False
-    assert scope_to_restart_required(KnobScope.UNKNOWN) is False
 
 
 def test_build_knob_plan_skips_internal_and_sets_restart():

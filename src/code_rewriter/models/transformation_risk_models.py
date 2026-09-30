@@ -33,7 +33,3 @@ class RiskReport(BaseModel):
     max_relations_after: int = Field(
         default=0, description="Max top-level relations across the rewritten statements"
     )
-    fused_dependencies: int = Field(
-        default=0,
-        description="Number of original linear value dependencies that were fused away",
-    )

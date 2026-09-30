@@ -56,6 +56,48 @@ def find_modified_files(tool_context: ToolContext) -> str:
     return "\n".join(lines)
 
 
+def _read_numbered(
+    root: Path,
+    file: str,
+    label: str,
+    *,
+    header_prefix: str = "",
+    not_found: str | None = None,
+) -> str:
+    """Resolve *file* inside *root*, enforce containment, read and number it."""
+    MAX_BYTES = 50_000  # Cap file reads for token control
+
+    file_path = root / file
+    try:
+        resolved = file_path.resolve()
+    except (OSError, ValueError):
+        return f"ERROR: invalid file path: {file}"
+
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return f"ERROR: path traversal rejected: {file} resolves outside {label}"
+
+    if not resolved.is_file():
+        return not_found if not_found is not None else f"ERROR: file not found: {file}"
+
+    try:
+        content = resolved.read_text()
+    except UnicodeDecodeError:
+        return f"ERROR: cannot read {file} — it appears to be a binary file"
+    except OSError as e:
+        return f"ERROR: cannot read {file}: {e}"
+
+    if len(content) > MAX_BYTES:
+        content = content[:MAX_BYTES]
+        content += f"\n\n[... truncated at {MAX_BYTES:,} bytes; file is larger ...]"
+
+    lines = content.split("\n")
+    numbered = [f"{i+1:6d}| {line}" for i, line in enumerate(lines)]
+    header = f"=== {header_prefix}{file} ({len(content):,} bytes, {len(lines)} lines) ===\n"
+    return header + "\n".join(numbered)
+
+
 def read_file(file: str, tool_context: ToolContext) -> str:
     """Read the contents of a file in the sandbox.
     
@@ -67,45 +109,11 @@ def read_file(file: str, tool_context: ToolContext) -> str:
     
     Returns the file content or an error message.
     """
-    MAX_BYTES = 50_000  # Cap file reads for token control
-    
     sandbox = tool_context.state.get("sandbox", "")
     if not sandbox:
         return "ERROR: sandbox path not set in state"
-    
-    sandbox_path = Path(sandbox).resolve()
-    
-    # Path containment check
-    file_path = sandbox_path / file
-    try:
-        resolved = file_path.resolve()
-    except (OSError, ValueError):
-        return f"ERROR: invalid file path: {file}"
-    
-    # Must be within sandbox
-    try:
-        resolved.relative_to(sandbox_path)
-    except ValueError:
-        return f"ERROR: path traversal rejected: {file} resolves outside sandbox"
-    
-    if not resolved.is_file():
-        return f"ERROR: file not found: {file}"
-    
-    try:
-        content = resolved.read_text()
-    except UnicodeDecodeError:
-        return f"ERROR: cannot read {file} — it appears to be a binary file"
-    except OSError as e:
-        return f"ERROR: cannot read {file}: {e}"
-    
-    if len(content) > MAX_BYTES:
-        content = content[:MAX_BYTES]
-        content += f"\n\n[... truncated at {MAX_BYTES:,} bytes; file is larger ...]"
-    
-    lines = content.split("\n")
-    numbered = [f"{i+1:6d}| {line}" for i, line in enumerate(lines)]
-    header = f"=== {file} ({len(content):,} bytes, {len(lines)} lines) ===\n"
-    return header + "\n".join(numbered)
+
+    return _read_numbered(Path(sandbox).resolve(), file, "sandbox")
 
 
 def read_original_file(file: str, tool_context: ToolContext) -> str:
@@ -122,8 +130,6 @@ def read_original_file(file: str, tool_context: ToolContext) -> str:
 
     Returns the file content or an error message.
     """
-    MAX_BYTES = 50_000
-
     original = tool_context.state.get("original", "")
     if not original:
         return (
@@ -133,37 +139,16 @@ def read_original_file(file: str, tool_context: ToolContext) -> str:
             "optimized file."
         )
 
-    original_path = Path(original).resolve()
-
-    file_path = original_path / file
-    try:
-        resolved = file_path.resolve()
-    except (OSError, ValueError):
-        return f"ERROR: invalid file path: {file}"
-
-    try:
-        resolved.relative_to(original_path)
-    except ValueError:
-        return f"ERROR: path traversal rejected: {file} resolves outside original"
-
-    if not resolved.is_file():
-        return f"INFO: file not found in original: {file} (this file was likely created by the rewriter)"
-
-    try:
-        content = resolved.read_text()
-    except UnicodeDecodeError:
-        return f"ERROR: cannot read {file} — it appears to be a binary file"
-    except OSError as e:
-        return f"ERROR: cannot read {file}: {e}"
-
-    if len(content) > MAX_BYTES:
-        content = content[:MAX_BYTES]
-        content += f"\n\n[... truncated at {MAX_BYTES:,} bytes; file is larger ...]"
-
-    lines = content.split("\n")
-    numbered = [f"{i+1:6d}| {line}" for i, line in enumerate(lines)]
-    header = f"=== [ORIGINAL] {file} ({len(content):,} bytes, {len(lines)} lines) ===\n"
-    return header + "\n".join(numbered)
+    return _read_numbered(
+        Path(original).resolve(),
+        file,
+        "original",
+        header_prefix="[ORIGINAL] ",
+        not_found=(
+            f"INFO: file not found in original: {file} "
+            "(this file was likely created by the rewriter)"
+        ),
+    )
 
 
 def list_sandbox(tool_context: ToolContext) -> str:

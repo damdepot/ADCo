@@ -27,12 +27,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="${ROOT}/benchmarks/scripts"
+source "${SCRIPTS}/bench_lib.sh"
 CMDDocker="${SCRIPTS}/docker.sh"
 SYSMEAS="${SCRIPTS}/sysbench_measure.py"
 PYTHON="${ROOT}/.venv/bin/python"
 
 C=adcoexp-db
 DB=adcodb
+BENCH_DB_CONTAINER="$C"
 REPS="${REPS:-3}"
 SETTLE="${SETTLE:-20}"
 THREADS="${THREADS:-16}"
@@ -45,47 +47,6 @@ mkdir -p "${OUT}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 BAND="${ROOT}/results/sysbench/noise_band.json"
 
-psql() { docker exec -u postgres "$C" psql -v ON_ERROR_STOP=1 -q "$@"; }
-
-# Fail loudly if a CSV has no parseable TOTAL row, so an empty value can never
-# flow into a median.
-total_of() {
-    awk -F, '
-        $1 ~ /TOTAL/ { v = $NF }
-        END {
-            if (v == "" || v !~ /^-?[0-9]+([.][0-9]+)?$/) {
-                print "no parseable TOTAL row in " FILENAME > "/dev/stderr"
-                exit 1
-            }
-            print v
-        }
-    ' "$1"
-}
-
-# Print the band's threshold basis then value (same precedence as tpcc_delta.py).
-band_field() {
-    "$PYTHON" -c '
-import json, sys
-band = json.load(open(sys.argv[1]))
-for key in ("mde_pct", "ci95_pct", "spread_pct"):
-    if key in band:
-        print(key)
-        print(float(band[key]))
-        break
-else:
-    print("none")
-    print("0")
-' "$1"
-}
-
-# Always restore the production database to pure Postgres defaults so we never
-# leave a tuned GUC behind (shared_buffers needs a restart to take effect).
-restore_defaults() {
-    psql -c "ALTER SYSTEM RESET ALL;" >/dev/null 2>&1 || true
-    psql -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
-    "$CMDDocker" Restart "$C" >/dev/null 2>&1 || true
-    "$CMDDocker" WaitFor "$C" >/dev/null 2>&1 || true
-}
 trap restore_defaults EXIT
 
 apply_arm() {
@@ -120,8 +81,6 @@ measure() {
         --label "${arm} r${rep}" >/dev/null 2>&1
     total_of "$csv"
 }
-
-median_of() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'; }
 
 ARMS="default dco sbuf"
 TAGS=""

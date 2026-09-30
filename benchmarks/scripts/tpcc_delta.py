@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """Compare benchmark result CSVs and judge deltas against noise bands.
 
-Legacy (single workload, backwards compatible):
-    tpcc_delta.py <baseline.csv> <optimized.csv> [noise_band.json]
-
 Dual workload (baseline vs one or more tuned arms, TPC-C + sysbench):
     tpcc_delta.py dual \
         --baseline-tpcc <csv> [<csv> ...] \
@@ -56,11 +53,11 @@ def read_rates(path: str) -> dict[str, float]:
     rates: dict[str, float] = {}
     with open(path, newline="") as handle:
         for row in csv.reader(handle):
-            if row and row[0].strip() and len(row) >= 2:
+            if row and row[0].strip() == "TOTAL" and len(row) >= 2:
                 try:
-                    rates[row[0].strip()] = float(row[-1])
+                    rates["TOTAL"] = float(row[-1])
                 except ValueError:
-                    continue
+                    pass
     return rates
 
 
@@ -116,11 +113,6 @@ def classify(delta_pct: float, band: dict | None) -> tuple[str, float, str]:
     return NO_EFFECT, threshold, basis
 
 
-def workload_verdict(delta_pct: float, band: dict | None) -> str:
-    """Classify a single workload delta against its noise band."""
-    return classify(delta_pct, band)[0]
-
-
 def band_summary(band: dict | None) -> str:
     """One-line human summary of the threshold a band will gate verdicts with."""
     if band is None:
@@ -152,52 +144,6 @@ def overall_verdict(tpcc: str, sysbench: str) -> str:
     if tpcc == NO_EFFECT and sysbench == NO_EFFECT:
         return NO_EFFECT
     return UNKNOWN
-
-
-def run_legacy(argv: list[str]) -> int:
-    if len(argv) < 2:
-        print(
-            "usage: tpcc_delta.py <baseline.csv> <optimized.csv> [noise.json]",
-            file=sys.stderr,
-        )
-        return 2
-    baseline = read_rates(argv[0])
-    optimized = read_rates(argv[1])
-    band = load_band(argv[2] if len(argv) > 2 else None)
-
-    print(f"baseline : {argv[0]}")
-    print(f"optimized: {argv[1]}")
-    print(f"{'transaction':<14}{'baseline':>12}{'optimized':>12}{'delta%':>10}")
-    total_delta = 0.0
-    for name in sorted(set(baseline) | set(optimized)):
-        if name == "TOTAL":
-            continue
-        b = baseline.get(name, 0.0)
-        o = optimized.get(name, 0.0)
-        delta = (o - b) / b * 100.0 if b else 0.0
-        print(f"{name:<14}{b:>12.3f}{o:>12.3f}{delta:>9.2f}%")
-    b_total = baseline.get("TOTAL", 0.0)
-    o_total = optimized.get("TOTAL", 0.0)
-    if b_total:
-        total_delta = (o_total - b_total) / b_total * 100.0
-    print(f"{'TOTAL':<14}{b_total:>12.3f}{o_total:>12.3f}{total_delta:>9.2f}%")
-
-    if band is None:
-        print()
-        print("noise band: MISSING -> TOTAL verdict UNKNOWN (no band)")
-    else:
-        verdict, threshold, basis = classify(total_delta, band)
-        if basis == "none":
-            print()
-            print("noise band: no usable threshold field -> verdict UNKNOWN")
-        else:
-            proven = "PROVEN" if verdict in (WIN, REGRESSION) else "WITHIN NOISE (unproven)"
-            print()
-            print(
-                f"noise band threshold = {threshold:.2f}% (basis: {basis}); "
-                f"TOTAL delta {total_delta:+.2f}% is {proven}"
-            )
-    return 0
 
 
 def _parse_arm_spec(spec: str) -> tuple[str, list[str], list[str]]:
@@ -349,8 +295,8 @@ def run_dual(argv: list[str]) -> int:
 
 def main(argv: list[str]) -> int:
     if argv and argv[0] == "dual":
-        return run_dual(argv[1:])
-    return run_legacy(argv)
+        argv = argv[1:]
+    return run_dual(argv)
 
 
 if __name__ == "__main__":

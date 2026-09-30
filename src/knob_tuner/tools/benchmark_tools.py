@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 from statistics import median
-from typing import Any, Callable
+from typing import Callable
 
 from src.knob_tuner.contracts import SysbenchMeasurement, SysbenchProfile
 
@@ -125,68 +125,6 @@ def _settle_after_load(cfg: DBConfig, emit: Callable[[str], None]) -> None:
             return
         time.sleep(_SETTLE_POLL_SECONDS)
     emit("settle: autovacuum still active after timeout; measuring anyway")
-
-
-def _parse_sysbench_summary(output: str) -> dict[str, Any]:
-    """Parse sysbench run output summary section for query counts and latency statistics."""
-    details: dict[str, Any] = {}
-
-    # Queries
-    queries_match = re.search(r"queries:\s+(\d+)", output)
-    if queries_match:
-        details["total_queries"] = int(queries_match.group(1))
-    else:
-        total_match = re.search(r"total:\s+(\d+)", output)
-        if total_match:
-            details["total_queries"] = int(total_match.group(1))
-
-    # Transactions
-    txn_match = re.search(r"transactions:\s+(\d+)", output)
-    if txn_match:
-        details["total_transactions"] = int(txn_match.group(1))
-
-    # Read / write / other queries
-    read_match = re.search(r"read:\s+(\d+)", output)
-    if read_match:
-        details["read_queries"] = int(read_match.group(1))
-    write_match = re.search(r"write:\s+(\d+)", output)
-    if write_match:
-        details["write_queries"] = int(write_match.group(1))
-    other_match = re.search(r"other:\s+(\d+)", output)
-    if other_match:
-        details["other_queries"] = int(other_match.group(1))
-
-    # Latency statistics (ms)
-    min_lat = re.search(r"min:\s+([\d\.]+)", output)
-    if min_lat:
-        details["latency_min_ms"] = float(min_lat.group(1))
-    avg_lat = _AVG_RE.search(output)
-    if avg_lat:
-        details["latency_avg_ms"] = float(avg_lat.group(1))
-    max_lat = re.search(r"max:\s+([\d\.]+)", output)
-    if max_lat:
-        details["latency_max_ms"] = float(max_lat.group(1))
-    p95_lat = _P95_RE.search(output)
-    if p95_lat:
-        details["latency_95th_ms"] = float(p95_lat.group(1))
-    sum_lat = re.search(r"sum:\s+([\d\.]+)", output)
-    if sum_lat:
-        details["latency_sum_ms"] = float(sum_lat.group(1))
-
-    # Events
-    events_match = re.search(r"total number of events:\s+(\d+)", output)
-    if events_match:
-        details["total_events"] = int(events_match.group(1))
-
-    # Errors / reconnects
-    ignored_match = _IGNORED_ERRORS_RE.search(output)
-    if ignored_match:
-        details["ignored_errors"] = int(ignored_match.group(1))
-    reconnects_match = _RECONNECTS_RE.search(output)
-    if reconnects_match:
-        details["reconnects"] = int(reconnects_match.group(1))
-
-    return details
 
 
 def _parse_run_metrics(output: str) -> dict[str, float | int]:
@@ -403,6 +341,33 @@ def derive_screen_profile(
     )
 
 
+def _make_exec(
+    transcript: list[str],
+    env: dict[str, str],
+    phase_state: dict[str, str],
+) -> Callable[[list[str], int, str], subprocess.CompletedProcess]:
+    """Build a logged subprocess runner bound to ``transcript`` and ``env``."""
+
+    def _exec(cmd: list[str], timeout: int, phase: str) -> subprocess.CompletedProcess:
+        phase_state["phase"] = phase
+        transcript.append(f"$ {' '.join(cmd)}")
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env=env,
+            timeout=timeout,
+        )
+        transcript.append(proc.stdout or "")
+        if proc.stderr:
+            transcript.append(proc.stderr)
+        return proc
+
+    return _exec
+
+
 def run_sysbench_measurement(
     cfg: DBConfig,
     profile: SysbenchProfile,
@@ -461,7 +426,7 @@ def run_sysbench_measurement(
     per_run_p95: list[float] = []
     total_ignored_errors = 0
     total_reconnects = 0
-    current_phase = "initialization"
+    phase_state: dict[str, str] = {"phase": "initialization"}
     prepare_seconds = 0.0
 
     emit(
@@ -484,23 +449,7 @@ def run_sysbench_measurement(
             env["PGPASSWORD"] = cfg.password
             env["MYSQL_PWD"] = cfg.password
 
-        def _exec(cmd: list[str], timeout: int, phase: str) -> subprocess.CompletedProcess:
-            nonlocal current_phase
-            current_phase = phase
-            transcript.append(f"$ {' '.join(cmd)}")
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-                env=env,
-                timeout=timeout,
-            )
-            transcript.append(proc.stdout or "")
-            if proc.stderr:
-                transcript.append(proc.stderr)
-            return proc
+        _exec = _make_exec(transcript, env, phase_state)
 
         if prepare:
             # (a) Best-effort cleanup before preparing the initial dataset.
@@ -652,7 +601,7 @@ def run_sysbench_measurement(
         return measurement
 
     except subprocess.TimeoutExpired as e:
-        error_message = f"sysbench {current_phase} timed out: {e}"
+        error_message = f"sysbench {phase_state['phase']} timed out: {e}"
         emit(f"Measurement failed: {error_message}")
         return _error_measurement(
             profile,
@@ -732,7 +681,7 @@ def run_pgbench_measurement(
     per_run_tps: list[float] = []
     per_run_avg: list[float] = []
     total_failed = 0
-    current_phase = "initialization"
+    phase_state: dict[str, str] = {"phase": "initialization"}
     prepare_seconds = 0.0
 
     if cfg.db_type.lower() not in ("postgres", "postgresql", "pgsql"):
@@ -767,23 +716,7 @@ def run_pgbench_measurement(
         if cfg.password:
             env["PGPASSWORD"] = cfg.password
 
-        def _exec(cmd: list[str], timeout: int, phase: str) -> subprocess.CompletedProcess:
-            nonlocal current_phase
-            current_phase = phase
-            transcript.append(f"$ {' '.join(cmd)}")
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-                env=env,
-                timeout=timeout,
-            )
-            transcript.append(proc.stdout or "")
-            if proc.stderr:
-                transcript.append(proc.stderr)
-            return proc
+        _exec = _make_exec(transcript, env, phase_state)
 
         if prepare:
             base_args = _sysbench_base_args(cfg, profile)
@@ -928,7 +861,7 @@ def run_pgbench_measurement(
         return measurement
 
     except subprocess.TimeoutExpired as e:
-        error_message = f"pgbench {current_phase} timed out: {e}"
+        error_message = f"pgbench {phase_state['phase']} timed out: {e}"
         emit(f"Measurement failed: {error_message}")
         return _error_measurement(
             profile,
@@ -952,67 +885,3 @@ def run_pgbench_measurement(
                 f.write("\n".join(transcript))
         except Exception:  # pragma: no cover - defensive
             pass
-
-
-def run_sysbench_benchmark(
-    cfg: DBConfig,
-    tables: int = 10,
-    table_size: int = 10000,
-    threads: int = 4,
-    duration: int = 120,
-    report_interval: int = 60,
-    workdir: str | None = None,
-) -> dict[str, Any]:
-    """Backward-compatible single-run sysbench benchmark wrapper.
-
-    Builds a deterministic :class:`SysbenchProfile` (single repetition, no
-    warmup) and delegates to :func:`run_sysbench_measurement`.
-
-    Args:
-        cfg: Database configuration.
-        tables: Number of tables for the benchmark (default: 10).
-        table_size: Number of rows per table (default: 10,000).
-        threads: Number of worker threads (default: 4).
-        duration: Duration in seconds to run benchmark.
-        report_interval: Accepted for signature compatibility; ignored.
-        workdir: Directory to save the combined benchmark log.
-
-    Returns:
-        Legacy dictionary with ``status``, ``tps``, ``qps``, ``duration``,
-        ``threads``, ``tables``, ``log_file``, ``error`` and ``details``, plus
-        the new deterministic keys.
-    """
-    profile = SysbenchProfile(
-        tables=tables,
-        rows_per_table=table_size,
-        threads=threads,
-        warmup_seconds=0,
-        measurement_seconds=duration,
-        repetitions=1,
-    )
-    measurement = run_sysbench_measurement(cfg, profile, workdir=workdir)
-
-    details = {
-        "latency_avg_ms": measurement.latency_avg_ms,
-        "latency_95th_ms": measurement.latency_p95_ms,
-        "ignored_errors": measurement.ignored_errors,
-        "reconnects": measurement.reconnects,
-    }
-
-    return {
-        "status": measurement.status,
-        "tps": measurement.tps,
-        "qps": measurement.qps,
-        "duration": measurement.duration,
-        "threads": measurement.threads,
-        "tables": measurement.tables,
-        "log_file": measurement.log_file,
-        "error": measurement.error,
-        "details": details,
-        "ignored_errors": measurement.ignored_errors,
-        "reconnects": measurement.reconnects,
-        "latency_p95_ms": measurement.latency_p95_ms,
-        "per_run_tps": measurement.per_run_tps,
-        "seed": measurement.seed,
-        "repetitions": measurement.repetitions,
-    }

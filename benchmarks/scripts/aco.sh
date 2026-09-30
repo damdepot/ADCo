@@ -10,12 +10,9 @@ if [ -z "$dir_name" ] || [ -z "$db_type" ] || [ -z "$db_name" ]; then
     exit 2
 fi
 
-dbms="postgres"
-
 exp_path="$(cd "$(dirname "$0")/../.." && pwd)"
 source_dir="${exp_path}/benchmarks/tools/$dir_name"
 sandbox_dir="${exp_path}/out/${dir_name}_aco"
-log_fname="${exp_path}/results/$dir_name"
 
 
 CMD="uv run python -m src.adco $source_dir \

@@ -555,18 +555,24 @@ def _iter_functions(tree: ast.Module):
                     yield f"{node.name}.{child.name}", child
 
 
-def row_index_violations(source: str) -> List[dict]:
-    """Return row index reads that exceed the resolved SELECT column count."""
+def _iter_analyzed(source: str, analyzer_cls: type = _FunctionAnalyzer):
+    """Yield ``(function_name, analyzer)`` for each function in *source*."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return []
+        return
     module_dicts = collect_module_dicts(tree)
+    for name, node in _iter_functions(tree):
+        analyzer = analyzer_cls(name, module_dicts)
+        analyzer.analyze(node.body)
+        yield name, analyzer
+
+
+def row_index_violations(source: str) -> List[dict]:
+    """Return row index reads that exceed the resolved SELECT column count."""
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for sql, reads in analyzer.row_reads.items():
             if not reads:
                 continue
@@ -594,16 +600,9 @@ def row_index_violations(source: str) -> List[dict]:
 
 def planner_unfriendly_sql(source: str) -> List[dict]:
     """Return resolved SQL strings that comma-cross-join a derived table in FROM."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for sql, line in analyzer.sql_candidates:
             if not _CROSS_JOIN_DERIVED_RE.search(sql):
                 continue
@@ -617,16 +616,9 @@ def planner_unfriendly_sql(source: str) -> List[dict]:
 
 def implicit_join_sql(source: str) -> List[dict]:
     """Resolved SQL whose top-level FROM list comma-joins 3+ relations."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for sql, line in analyzer.execute_sqls:
             if SENTINEL in sql:
                 continue
@@ -657,16 +649,9 @@ def implicit_join_sql(source: str) -> List[dict]:
 
 def multi_statement_sql(source: str) -> List[dict]:
     """Resolved execute() SQL strings containing >1 top-level statement."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for sql, line in analyzer.execute_sqls:
             statements = sum(1 for seg in _top_level_segments(sql) if seg.strip())
             if statements < 2:
@@ -683,16 +668,9 @@ def multi_statement_sql(source: str) -> List[dict]:
 
 def unknown_query_key_sql(source: str) -> List[dict]:
     """Resolved query-dict keys referenced by execute() that do not exist."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for key, line in analyzer.unknown_query_keys:
             dedup_key = (name, key, line)
             if dedup_key in seen:
@@ -704,16 +682,9 @@ def unknown_query_key_sql(source: str) -> List[dict]:
 
 def duplicate_where_sql(source: str) -> List[dict]:
     """Resolved SQL strings with 2+ top-level WHERE clauses."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for sql, line in analyzer.execute_sqls:
             if SENTINEL in sql:
                 continue
@@ -759,16 +730,9 @@ def _static_params_count(node: Optional[ast.AST]) -> Optional[int]:
 
 def placeholder_param_mismatch_sql(source: str) -> List[dict]:
     """Resolved execute() SQL whose static placeholder count differs from its params."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for sql, line, sql_node, params_node, method in analyzer.execute_calls:
             if method != "execute":
                 continue
@@ -819,16 +783,9 @@ def _any_in_filter_columns(sql: str) -> set:
 
 def fragile_composite_agg_sql(source: str) -> List[dict]:
     """Resolved SQL strings that aggregate ``ROW(...)`` with ``ARRAY_AGG``."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for sql, line in analyzer.execute_sqls:
             if SENTINEL in sql:
                 continue
@@ -844,16 +801,9 @@ def fragile_composite_agg_sql(source: str) -> List[dict]:
 
 def composite_any_array_sql(source: str) -> List[dict]:
     """Resolved SQL comparing a composite key tuple to a single array placeholder."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for sql, line in analyzer.execute_sqls:
             if SENTINEL in sql:
                 continue
@@ -869,16 +819,9 @@ def composite_any_array_sql(source: str) -> List[dict]:
 
 def lookup_key_not_selected_sql(source: str) -> List[dict]:
     """Batched lookup dicts keyed on a filter column missing from the SELECT."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for sql, line in analyzer.lookup_dicts:
             if SENTINEL in sql:
                 continue
@@ -907,16 +850,9 @@ def lookup_key_not_selected_sql(source: str) -> List[dict]:
 
 def duplicate_column_predicate_sql(source: str) -> List[dict]:
     """Resolved SQL constraining one column by both equality and a set predicate."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _FunctionAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source):
         for sql, line in analyzer.execute_sqls:
             if SENTINEL in sql:
                 continue

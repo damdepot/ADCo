@@ -16,8 +16,8 @@ from dotenv import load_dotenv
 from google.genai import types
 
 from google.adk.models import Gemini
-from src.code_rewriter._common import _maybe_parse
-from src.code_rewriter.agent import create_root_agent
+from src.code_rewriter._common import _maybe_parse, log_event as _log_event
+from src.code_rewriter.workflow import create_rewriter_workflow
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from src.code_rewriter.tools.pipeline_analysis import build_contracts_from_intent, build_target_context_map
@@ -26,20 +26,6 @@ from src.code_rewriter.tools.db_interaction import build_read_write_map
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-
-
-def _log_event(msg: str, log_file: str | None = None, verbose: bool = False) -> None:
-    """Write log entry to file and optionally stdout."""
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    formatted_msg = f"[{timestamp}] {msg}"
-    if verbose:
-        print(formatted_msg)
-    if log_file:
-        try:
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(formatted_msg + "\n")
-        except Exception:
-            pass
 
 
 def _write_output_result(output_path: str, state: dict[str, Any], model: str = "") -> None:
@@ -133,7 +119,7 @@ async def run_pipeline(
     else:
         resilient_model = model
 
-    agent = create_root_agent(resilient_model, buffer_time=buffer_time)
+    agent = create_rewriter_workflow(resilient_model, buffer_time=buffer_time)
     runner = Runner(agent=agent, app_name=app_name, session_service=session_service)
 
     user_message = (

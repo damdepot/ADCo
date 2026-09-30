@@ -242,7 +242,6 @@ for rep in $(seq 1 "${REPS}"); do
         "$PYTHON" "${CMDSysbench}" \
             --output "${SYSBENCH_DIR}/${arm}_r${rep}_${RUN_ID}.csv" \
             --runs 3 --repetitions 1 \
-            --prepare \
             --label "${arm} rep ${rep}/${REPS}"
     done
 done

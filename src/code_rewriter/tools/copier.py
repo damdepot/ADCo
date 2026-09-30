@@ -62,7 +62,7 @@ def _contains_protected_path(dest: str) -> str | None:
     return None
 
 
-def copy_entire(source_root: str, sandbox_id: str | None = None, dest_override: str | None = None) -> str:
+def copy_entire(source_root: str, dest_override: str | None = None) -> str:
     """Copy entire *source_root* into a sandbox.
 
     An existing destination is only replaced when it is an empty directory or a
@@ -73,8 +73,7 @@ def copy_entire(source_root: str, sandbox_id: str | None = None, dest_override: 
     if dest_override:
         dest = dest_override
     else:
-        sid = sandbox_id or uuid.uuid4().hex[:12]
-        dest = os.path.join(SANDBOX_ROOT, sid)
+        dest = os.path.join(SANDBOX_ROOT, uuid.uuid4().hex[:12])
 
     dest = os.path.abspath(dest)
 

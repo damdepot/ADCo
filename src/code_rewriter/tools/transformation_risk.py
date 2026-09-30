@@ -245,7 +245,6 @@ def compare_function_models(
         statements_after=statements_after,
         max_relations_before=max_relations_before,
         max_relations_after=max_relations_after,
-        fused_dependencies=len(orig.value_edges) if fusion else 0,
     )
 
 

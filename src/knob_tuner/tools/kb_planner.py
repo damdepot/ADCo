@@ -139,12 +139,8 @@ def _parse_knob_kb(kb_path: str | None = None, target_engine: str | None = None)
                 current_strategy[key] = val
         elif current_strategy and line.strip().startswith("*") and "formulas / baseline" in current_strategy:
             # handle multiline bullet points in formulas
-            if "formulas_multiline" not in current_strategy:
-                current_strategy["formulas_multiline"] = True
-                current_strategy["formulas / baseline"] += "\n" + line.strip()
-            else:
-                current_strategy["formulas / baseline"] += "\n" + line.strip()
-                
+            current_strategy["formulas / baseline"] += "\n" + line.strip()
+
     _flush()
 
     if not strategies:
@@ -243,12 +239,10 @@ def _calculate_strategy_score(
 def plan_knob_tuning(
     db_type: str,
     workload_text: Any = "",
-    memory_gb: float = 1.0,
-    cpu_cores: int = 1,
     feedback: Any = "",
     max_strategies: int = 8,
 ) -> tuple[list[KnobStrategyDef], str]:
-    """Produce a list of applicable strategies given workload intent, system specs, and failure feedback.
+    """Produce a list of applicable strategies given workload intent and failure feedback.
     
     Returns (selected_strategies, strategy_summary_text).
     """
@@ -282,10 +276,10 @@ def plan_knob_tuning(
 
 
 def get_knob_strategies(tool_context: ToolContext) -> str:
-    """Select applicable knob tuning strategies based on workload, specs, and feedback.
+    """Select applicable knob tuning strategies based on workload and feedback.
 
-    Reads session state (db_type, workload, memory_gb, cpu_cores, feedback)
-    and stores the strategy summary text back to state as `knob_strategies`.
+    Reads session state (db_type, workload, feedback) and stores the strategy
+    summary text back to state as `knob_strategies`.
     """
     db_type = tool_context.state.get("db_type", "postgres")
     # Defensively coerce to str in case state stores a dict/object here
@@ -295,15 +289,11 @@ def get_knob_strategies(tool_context: ToolContext) -> str:
     workload_hint = tool_context.state.get("workload_hint") or ""
     if workload_hint:
         workload = f"{_to_text(workload)} {_to_text(workload_hint)}".strip()
-    memory_gb = float(tool_context.state.get("memory_gb", 1.0))
-    cpu_cores = int(tool_context.state.get("cpu_cores", 1))
     feedback = tool_context.state.get("feedback") or ""
     
     _, summary = plan_knob_tuning(
         db_type=db_type,
         workload_text=workload,
-        memory_gb=memory_gb,
-        cpu_cores=cpu_cores,
         feedback=feedback,
     )
     

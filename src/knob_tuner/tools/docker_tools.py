@@ -133,36 +133,6 @@ def unregister_active_container(container_name: str) -> None:
         ACTIVE_CONTAINERS.discard(container_name.strip())
 
 
-def get_active_containers() -> set[str]:
-    """Return a copy of currently tracked active container names."""
-    return set(ACTIVE_CONTAINERS)
-
-
-def is_docker_available() -> tuple[bool, str]:
-    """Check if Docker daemon is running and responsive.
-
-    Returns:
-        Tuple of (is_available: bool, message: str).
-    """
-    try:
-        proc = subprocess.run(
-            ["docker", "info"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if proc.returncode == 0:
-            return True, "Docker daemon is running and responsive."
-        err_msg = proc.stderr.strip() or proc.stdout.strip()
-        return False, f"Docker daemon is not running: {err_msg}"
-    except subprocess.TimeoutExpired:
-        return False, "Docker info check timed out after 10s"
-    except FileNotFoundError:
-        return False, "docker command not found in PATH"
-    except Exception as e:
-        return False, f"Unexpected error checking Docker availability: {e}"
-
-
 def get_container_host_port(container_name: str, internal_port: int = 5432, timeout: int = 15) -> int:
     """Get the mapped host port for a container's internal port.
 

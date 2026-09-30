@@ -11,8 +11,6 @@ def _entry(name, current_value, unit="", vartype="integer", context="user", enum
         "vartype": vartype,
         "context": context,
         "enumvals": enumvals or [],
-        "boot_val": current_value,
-        "reset_val": current_value,
     }
 
 

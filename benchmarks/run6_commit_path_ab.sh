@@ -43,6 +43,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="${ROOT}/benchmarks/scripts"
+source "${SCRIPTS}/bench_lib.sh"
 
 CMDRunTPCC="${SCRIPTS}/tpcc.sh"
 CMDDocker="${SCRIPTS}/docker.sh"
@@ -50,6 +51,7 @@ PYTHON="${ROOT}/.venv/bin/python"
 
 db_container="adcoexp-db"
 db_service="pgdb"
+BENCH_DB_CONTAINER="${db_container}"
 
 export CPU_CORES="${CPU_CORES:-2}"
 export MEMORY_GB="${MEMORY_GB:-8}"
@@ -71,23 +73,7 @@ mkdir -p "${RESULTS_DIR}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 BAND="${ROOT}/results/tpcc/noise_band.json"
 
-psql() { docker exec -i -u postgres "${db_container}" psql -v ON_ERROR_STOP=1 -q "$@"; }
-
 csv_of() { echo "${ROOT}/results/tpcc/$1.csv"; }
-# Fail loudly if a CSV has no parseable TOTAL row, so an empty value can never
-# flow into a median.
-total_of() {
-    awk -F, '
-        $1 ~ /TOTAL/ { v = $NF }
-        END {
-            if (v == "" || v !~ /^-?[0-9]+([.][0-9]+)?$/) {
-                print "no parseable TOTAL row in " FILENAME > "/dev/stderr"
-                exit 1
-            }
-            print v
-        }
-    ' "$1"
-}
 
 apply_arm() {
     # Clean slate, then the arm's settings. synchronous_commit and
@@ -123,27 +109,6 @@ run_one() {
     printf '      %-8s %-34s wal_sync_ms=+%-7s wal_bytes=+%sMB\n' \
         "${arm}" "${tag}" "$(( ${as:-0} - ${bs:-0} ))" \
         "$(( (${ay:-0} - ${by:-0}) / 1048576 ))" >&2
-}
-
-median_of_values() {
-    printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'
-}
-
-# Print the band's threshold basis then value, using the same precedence as
-# tpcc_delta.py. "none" means the band exists but has no usable field.
-band_field() {
-    "$PYTHON" -c '
-import json, sys
-band = json.load(open(sys.argv[1]))
-for key in ("mde_pct", "ci95_pct", "spread_pct"):
-    if key in band:
-        print(key)
-        print(float(band[key]))
-        break
-else:
-    print("none")
-    print("0")
-' "$1"
 }
 
 # Echo the TOTAL of every tag belonging to an arm, one per line.

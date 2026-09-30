@@ -43,6 +43,7 @@ from src.knob_tuner.tools.docker_tools import (
     start_staging_db,
     stop_staging_db,
 )
+from src.knob_tuner.tools.knobs import coerce_apply_mode
 from src.knob_tuner.tools.run_artifacts import write_artifact
 
 _RESTART_MODES = (ApplyMode.PERSIST_STATIC,)
@@ -286,15 +287,6 @@ def _finalize(
         "baseline_reversal": baseline_reversal,
         "ignored_errors": ignored_errors,
     }
-
-
-def _coerce_apply_mode(value: Any) -> ApplyMode:
-    if isinstance(value, ApplyMode):
-        return value
-    try:
-        return ApplyMode(str(value).strip().lower())
-    except (ValueError, AttributeError):
-        return ApplyMode.DYNAMIC
 
 
 def _build_attestation(
@@ -579,7 +571,7 @@ def validate_plan(
             {},
         )
 
-    mode = _coerce_apply_mode(apply_mode)
+    mode = coerce_apply_mode(apply_mode)
     runner = _select_runner(benchmark_kind)
     label = _benchmark_label(benchmark_kind)
     # Read-only benchmarks share one prepared dataset across arms; a mutating

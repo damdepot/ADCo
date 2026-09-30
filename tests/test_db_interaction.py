@@ -90,7 +90,6 @@ def test_analyze_sql_stock_count_original():
     assert set(model.tables_read) == {"ORDER_LINE", "STOCK"}
     assert model.top_level_relations == 2
     assert model.has_aggregate is True
-    assert model.has_distinct is True
 
 
 def test_analyze_sql_three_relation_rewrite():
@@ -103,7 +102,6 @@ def test_analyze_sql_three_relation_rewrite():
     model = analyze_sql(sql)
     assert model is not None
     assert model.top_level_relations == 3
-    assert model.join_count == 2
     assert "DISTRICT" in model.tables_read
 
 

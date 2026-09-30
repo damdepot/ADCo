@@ -274,15 +274,11 @@ class ProductRepository:
         target=target,
         pattern="N+1 Query",
         strategy="Batch Fetching",
-        must_preserve=["Return correct results"],
-        must_not_change=["Table schema"]
     )
     
     assert contract.target.source_location is not None
     assert contract.pattern == "N+1 Query"
     assert contract.strategy == "Batch Fetching"
-    assert contract.must_preserve == ["Return correct results"]
-    assert contract.must_not_change == ["Table schema"]
 
 
 def test_for_iter_fetchall_is_not_inside_loop():

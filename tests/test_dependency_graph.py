@@ -78,7 +78,6 @@ def test_slice_dependency_graph_cycle_handling():
     assert len(slice_res.sliced_nodes) == 2
     assert "mod.py::func_a" in slice_res.sliced_nodes
     assert "mod.py::func_b" in slice_res.sliced_nodes
-    assert slice_res.is_truncated is False
 
 
 def test_slice_dependency_graph_depth_and_node_bounding():
@@ -93,12 +92,10 @@ def test_slice_dependency_graph_depth_and_node_bounding():
     # Test max_depth = 1 from f0 -> should only reach f0 and f1
     s_depth1 = slice_dependency_graph(graph, "mod.py::f0", max_depth=1, max_nodes=10)
     assert set(s_depth1.sliced_nodes.keys()) == {"mod.py::f0", "mod.py::f1"}
-    assert s_depth1.is_truncated is False
 
     # Test max_nodes = 2 with max_depth = 5
     s_bounded = slice_dependency_graph(graph, "mod.py::f0", max_depth=5, max_nodes=2)
     assert len(s_bounded.sliced_nodes) == 2
-    assert s_bounded.is_truncated is True
 
 
 def test_slice_target_not_found():

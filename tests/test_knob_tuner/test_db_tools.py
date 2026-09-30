@@ -8,7 +8,6 @@ from src.knob_tuner.tools.db_tools import (
     apply_knobs,
     is_noop_value,
     snapshot_settings,
-    test_database as run_test_database,
     verify_active_knobs,
     _parse_time_to_ms,
     _parse_enumvals,
@@ -249,51 +248,6 @@ def test_snapshot_settings_empty_names(mock_db_config_pg):
     with patch("src.knob_tuner.tools.db_tools.run_safe_query") as mock_query:
         assert snapshot_settings(mock_db_config_pg, []) == {}
     mock_query.assert_not_called()
-
-
-def test_test_database_success(mock_db_config_pg, mock_db_conn):
-    conn, cursor = mock_db_conn
-    # Returns for:
-    # 1. SELECT 1 -> (1,)
-    # 2. SELECT table_name -> [('users',), ('posts',)]
-    # 3. SELECT val -> ('health_test',)
-    cursor.fetchone.side_effect = [(1,), ("health_test",)]
-    cursor.fetchall.return_value = [("users",), ("posts",)]
-
-    with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
-        res = run_test_database(mock_db_config_pg)
-        assert res["status"] == "ok"
-        assert res["checks"]["connectivity"] is True
-        assert res["checks"]["ping"] is True
-        assert res["checks"]["table_scan"] is True
-        assert res["checks"]["crud"] is True
-        assert res["details"]["tables_found"] == ["users", "posts"]
-        assert res["details"]["crud_result"] == "passed"
-        assert res["error"] is None
-
-
-def test_test_database_connectivity_failure(mock_db_config_pg):
-    with patch("src.knob_tuner.tools.db_tools.get_connection", side_effect=Exception("Connection refused")):
-        res = run_test_database(mock_db_config_pg)
-        assert res["status"] == "error"
-        assert res["checks"]["connectivity"] is False
-        assert res["error"] == "Connection refused"
-
-
-def test_test_database_crud_failure_and_cleanup(mock_db_config_pg, mock_db_conn):
-    conn, cursor = mock_db_conn
-    # Ping succeeds, schema scan succeeds, CRUD select returns unexpected value
-    cursor.fetchone.side_effect = [(1,), ("wrong_value",)]
-    cursor.fetchall.return_value = [{"table_name": "t1"}]
-
-    with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
-        res = run_test_database(mock_db_config_pg)
-        assert res["status"] == "error"
-        assert res["checks"]["connectivity"] is True
-        assert res["checks"]["ping"] is True
-        assert res["checks"]["table_scan"] is True
-        assert res["checks"]["crud"] is False
-        assert "CRUD test failed" in res["error"]
 
 
 def test_parse_time_to_ms():

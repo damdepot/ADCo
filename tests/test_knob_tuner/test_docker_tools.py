@@ -11,7 +11,6 @@ from src.knob_tuner.tools.docker_tools import (
     cleanup_orphan_containers,
     cleanup_snapshot_image,
     commit_staging_db,
-    is_docker_available,
     recreate_docker_db,
     resolve_docker_image,
     start_staging_db,
@@ -27,71 +26,6 @@ def budget(cpu_cores: int = 2, memory_gb: float = 2) -> ResourceBudget:
 
 
 VERIFY_OK = (True, "resources verified")
-
-
-# =====================================================================
-# is_docker_available tests
-# =====================================================================
-
-
-def test_is_docker_available_success():
-    mock_res = MagicMock(returncode=0, stdout="Server Version: 24.0.7\n", stderr="")
-    with patch("subprocess.run", return_value=mock_res) as mock_run:
-        ok, msg = is_docker_available()
-        assert ok is True
-        assert "running and responsive" in msg
-        mock_run.assert_called_once_with(
-            ["docker", "info"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-
-def test_is_docker_available_failure_with_stderr():
-    mock_res = MagicMock(
-        returncode=1,
-        stdout="",
-        stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
-    )
-    with patch("subprocess.run", return_value=mock_res):
-        ok, msg = is_docker_available()
-        assert ok is False
-        assert "Docker daemon is not running" in msg
-        assert "Cannot connect to the Docker daemon" in msg
-
-
-def test_is_docker_available_failure_with_stdout():
-    mock_res = MagicMock(
-        returncode=1,
-        stdout="Docker daemon error",
-        stderr="",
-    )
-    with patch("subprocess.run", return_value=mock_res):
-        ok, msg = is_docker_available()
-        assert ok is False
-        assert "Docker daemon is not running: Docker daemon error" in msg
-
-
-def test_is_docker_available_not_found():
-    with patch("subprocess.run", side_effect=FileNotFoundError):
-        ok, msg = is_docker_available()
-        assert ok is False
-        assert "docker command not found in PATH" in msg
-
-
-def test_is_docker_available_timeout():
-    with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="docker info", timeout=10)):
-        ok, msg = is_docker_available()
-        assert ok is False
-        assert "timed out after 10s" in msg
-
-
-def test_is_docker_available_unexpected_exception():
-    with patch("subprocess.run", side_effect=PermissionError("Permission denied")):
-        ok, msg = is_docker_available()
-        assert ok is False
-        assert "Unexpected error checking Docker availability: Permission denied" in msg
 
 
 # =====================================================================

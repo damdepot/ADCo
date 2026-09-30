@@ -64,7 +64,7 @@ def main() -> None:
     metrics = print_summary(results)
     confusion = print_confusion(results)
     print_responses(results)
-    print_totals(results)
+    print_totals(metrics)
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path, json_path = save_results(results, metrics, confusion, args, ts)
@@ -118,11 +118,7 @@ def discover_samples(data_dir: Path) -> list[Path]:
     if not data_dir.is_dir():
         print(f"ERROR: not a directory: {data_dir}", file=sys.stderr)
         sys.exit(2)
-    samples: list[Path] = []
-    for entry in sorted(data_dir.iterdir()):
-        if entry.is_dir() and (entry / "meta.json").is_file():
-            samples.append(entry)
-    return samples
+    return sorted(p.parent for p in data_dir.glob("*/meta.json"))
 
 
 def load_meta(sample_dir: Path) -> dict[str, Any]:
@@ -173,7 +169,7 @@ def run_sample(sample_dir: Path, model: str, verbose: bool) -> dict[str, Any]:
     started = time.time()
     try:
         state = asyncio.run(
-            src.code_checker.main._run_checker(
+            src.code_checker.main.run_checker(
                 str(sample_dir / "optimized"),
                 original=str(sample_dir / "original"),
                 model=model,
@@ -391,19 +387,20 @@ def print_responses(results: list[dict[str, Any]]) -> None:
         print(f"   response: {summary}")
 
 
-def print_totals(results: list[dict[str, Any]]) -> None:
-    total = len(results)
-    matched = sum(1 for r in results if r["match"])
-    pos = [r for r in results if r["polarity"] == "pos"]
-    neg = [r for r in results if r["polarity"] == "neg"]
+def print_totals(metrics: dict[str, Any]) -> None:
+    total = metrics["total"]
+    matched = metrics["matched"]
     parts = []
-    if pos:
-        pos_m = sum(1 for r in pos if r["match"])
-        parts.append(f"{pos_m}/{len(pos)} positives passed")
-    if neg:
-        neg_m = sum(1 for r in neg if r["match"])
-        parts.append(f"{neg_m}/{len(neg)} negatives detected with correct category")
-    errors = [r for r in results if r["error"]]
+    if "positives" in metrics:
+        pos = metrics["positives"]
+        parts.append(f"{pos['passed']}/{pos['total']} positives passed")
+    if "negatives" in metrics:
+        neg = metrics["negatives"]
+        parts.append(
+            f"{neg['detected_correct_category']}/{neg['total']} "
+            "negatives detected with correct category"
+        )
+    errors = metrics["errors"]
     suffix = f" ({len(errors)} errors)" if errors else ""
     print(f"\nTOTALS: {matched}/{total} samples matched ({', '.join(parts)}){suffix}")
 

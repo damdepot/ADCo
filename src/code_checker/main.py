@@ -11,7 +11,6 @@ import asyncio
 import datetime
 import json
 import os
-import re
 import sys
 import uuid
 from typing import Any
@@ -20,41 +19,13 @@ from dotenv import load_dotenv
 from google.genai import types
 
 from src.code_checker.agent import create_checker_agent
-from src.code_checker.models import CheckerOutput
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from src.code_rewriter._common import _maybe_parse, log_event as _log_event
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-
-
-def _maybe_parse(value: Any) -> dict:
-    """Return *value* as a dict, JSON-parsing strings (stripping markdown fences)."""
-    if isinstance(value, str):
-        stripped = re.sub(r"^```[a-z]*\n?", "", value.strip(), flags=re.MULTILINE)
-        stripped = re.sub(r"```$", "", stripped.strip())
-        try:
-            return json.loads(stripped.strip())
-        except (json.JSONDecodeError, ValueError):
-            return {}
-    if hasattr(value, "model_dump"):
-        return value.model_dump()
-    return value if isinstance(value, dict) else {}
-
-
-def _log_event(msg: str, log_file: str | None = None, verbose: bool = False) -> None:
-    """Write log entry to file and optionally stdout."""
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    formatted_msg = f"[{timestamp}] {msg}"
-    if verbose:
-        print(formatted_msg)
-    if log_file:
-        try:
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(formatted_msg + "\n")
-        except Exception:
-            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -209,8 +180,6 @@ async def run_checker(
 
     return final_state
 
-# Alias for backwards compatibility
-_run_checker = run_checker
 
 def main() -> None:
     """CLI main entry point."""

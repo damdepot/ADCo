@@ -6,6 +6,7 @@ from typing import Any
 from src.knob_tuner.contracts import ApplyMode, KnobScope
 
 from .db_connector import DBConfig, get_connection, run_safe_query
+from .knobs import coerce_apply_mode
 
 
 def _sql_string_literal(value: Any) -> str:
@@ -121,11 +122,7 @@ def apply_knobs(
     if not knobs:
         return []
 
-    if not isinstance(mode, ApplyMode):
-        try:
-            mode = ApplyMode(str(mode).strip().lower())
-        except ValueError:
-            mode = ApplyMode.DYNAMIC
+    mode = coerce_apply_mode(mode)
 
     # NONE never touches the database and emits no SQL.
     if mode == ApplyMode.NONE:
@@ -337,128 +334,6 @@ def snapshot_settings(cfg: DBConfig, names: list[str]) -> dict[str, str]:
         return {}
     except Exception:
         return {}
-
-
-def test_database(cfg: DBConfig) -> dict[str, Any]:
-    """Perform health and connectivity validation tests on the database (Option A).
-
-    Checks:
-    1. Connectivity & Ping (SELECT 1)
-    2. Table scan (information_schema query)
-    3. Basic CRUD lifecycle test on a temporary test table
-
-    Args:
-        cfg: DBConfig object.
-
-    Returns:
-        Dictionary summarizing check results, status ('ok' | 'error'), and details.
-    """
-    report: dict[str, Any] = {
-        "status": "error",
-        "checks": {
-            "connectivity": False,
-            "ping": False,
-            "table_scan": False,
-            "crud": False,
-        },
-        "details": {
-            "tables_found": [],
-            "crud_result": "not_run",
-        },
-        "error": None,
-    }
-
-    test_table = "_adco_health_check"
-
-    conn = None
-    try:
-        # 1. Connectivity Check
-        conn = get_connection(cfg)
-        report["checks"]["connectivity"] = True
-
-        cursor = conn.cursor()
-        try:
-            # 1b. Ping Check
-            cursor.execute("SELECT 1 AS ping;")
-            row = cursor.fetchone()
-            if row is not None:
-                report["checks"]["ping"] = True
-
-            # 2. Table Scan Check
-            schema_sql = (
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'performance_schema', 'sys', 'mysql') "
-                "LIMIT 5;"
-            )
-            cursor.execute(schema_sql)
-            tables = cursor.fetchall()
-            found_tables = []
-            for t in tables:
-                if isinstance(t, dict):
-                    found_tables.append(t.get("table_name") or t.get("TABLE_NAME"))
-                elif isinstance(t, (tuple, list)):
-                    found_tables.append(t[0])
-                else:
-                    found_tables.append(str(t))
-            report["checks"]["table_scan"] = True
-            report["details"]["tables_found"] = found_tables
-
-            # 3. CRUD Lifecycle Test
-            cursor.execute(
-                f"CREATE TABLE IF NOT EXISTS {test_table} (id INT PRIMARY KEY, val VARCHAR(64));"
-            )
-            cursor.execute(
-                f"INSERT INTO {test_table} (id, val) VALUES (999, 'health_test');"
-            )
-            cursor.execute(f"SELECT val FROM {test_table} WHERE id = 999;")
-            fetched = cursor.fetchone()
-            val_match = False
-            if fetched:
-                if isinstance(fetched, dict):
-                    val_match = fetched.get("val") == "health_test"
-                elif isinstance(fetched, (tuple, list)):
-                    val_match = fetched[0] == "health_test"
-
-            if not val_match:
-                raise RuntimeError("CRUD test failed: inserted value did not match")
-
-            cursor.execute(
-                f"UPDATE {test_table} SET val = 'health_updated' WHERE id = 999;"
-            )
-            cursor.execute(f"DELETE FROM {test_table} WHERE id = 999;")
-            cursor.execute(f"DROP TABLE IF EXISTS {test_table};")
-            if hasattr(conn, "commit"):
-                conn.commit()
-
-            report["checks"]["crud"] = True
-            report["details"]["crud_result"] = "passed"
-            report["status"] = "ok"
-
-        except Exception as e:
-            report["error"] = str(e)
-            # Try to cleanup test table if created
-            try:
-                cursor.execute(f"DROP TABLE IF EXISTS {test_table};")
-                if hasattr(conn, "commit"):
-                    conn.commit()
-            except Exception:
-                pass
-        finally:
-            cursor.close()
-
-    except Exception as e:
-        report["error"] = str(e)
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    return report
-
-
-test_database.__test__ = False  # type: ignore[attr-defined]
 
 
 _PG_MEMORY_UNITS = {"b", "kb", "mb", "gb", "tb", "8kb", "16kb", "32kb", "64kb"}

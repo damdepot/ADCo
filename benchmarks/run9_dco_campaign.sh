@@ -46,6 +46,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="${ROOT}/benchmarks/scripts"
+source "${SCRIPTS}/bench_lib.sh"
 
 CMDDocker="${SCRIPTS}/docker.sh"
 CMDRunDCo="${SCRIPTS}/dco.sh"
@@ -58,6 +59,7 @@ C="adcoexp-db"
 SERVICE="pgdb"
 DB="adcodb"
 DBTYPE="postgres"
+BENCH_DB_CONTAINER="$C"
 # Application target scanned by DCo. Matches the existing successful pgbench
 # screening runs: the TPC-C app + a pgbench screening workload + a workload hint.
 DIRNAME="${DCO_DIRNAME:-tpcc}"
@@ -138,36 +140,7 @@ TMP="${OUT}/.tmp"
 mkdir -p "${OUT}" "${TMP}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 
-# ── psql helper ──
-psql() { docker exec -u postgres "$C" psql -v ON_ERROR_STOP=1 -q "$@"; }
-
-# Always leave the production DB at pure Postgres defaults on exit (success,
-# failure or interrupt) so no tuned GUC survives the harness.
-restore_defaults() {
-    psql -d "$DB" -c "ALTER SYSTEM RESET ALL;" >/dev/null 2>&1 || true
-    psql -d "$DB" -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
-    "$CMDDocker" Restart "$C" >/dev/null 2>&1 || true
-    "$CMDDocker" WaitFor "$C" >/dev/null 2>&1 || true
-}
 trap restore_defaults EXIT
-
-total_of() {
-    awk -F, '
-        $1 ~ /TOTAL/ { v = $NF }
-        END {
-            if (v == "" || v !~ /^-?[0-9]+([.][0-9]+)?$/) {
-                print "no parseable TOTAL row in " FILENAME > "/dev/stderr"
-                exit 1
-            }
-            print v
-        }
-    ' "$1"
-}
-
-median_of() {
-    printf '%s\n' "$@" | sort -n |
-        awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'
-}
 
 verify_precondition() {
     local wm sb
@@ -198,7 +171,7 @@ reset_precondition() {
         --output "${TMP}/rebuild_${RUN_ID}.csv" \
         --db-name "$DB" --tables "$TABLES" --table-size "$TABLE_SIZE" \
         --threads "$SYSBENCH_THREADS" --seconds 1 --runs 1 --repetitions 1 \
-        --prepare --label rebuild >/dev/null
+        --label rebuild >/dev/null
 
     echo ">>> reset: ANALYZE ${DB}"
     psql -d "$DB" -c "ANALYZE;" >/dev/null

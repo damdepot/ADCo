@@ -29,11 +29,6 @@ def classify_scope(context: str | None) -> KnobScope:
     return _CONTEXT_TO_SCOPE.get(str(context).strip().lower(), KnobScope.UNKNOWN)
 
 
-def scope_to_restart_required(scope: KnobScope) -> bool:
-    """Return True only when a scope requires a server restart."""
-    return scope == KnobScope.POSTMASTER
-
-
 def fetch_pg_settings_context(cfg: Any) -> dict[str, str]:
     """Fetch a ``{setting_name: context}`` map from ``pg_settings``.
 
@@ -89,7 +84,7 @@ def build_knob_plan(raw_knobs: list[dict], context_map: dict[str, str]) -> KnobP
                 name=str(name),
                 value=raw.get("value", raw.get("recommended_value")),
                 scope=scope,
-                restart_required=scope_to_restart_required(scope),
+                restart_required=scope == KnobScope.POSTMASTER,
                 reasoning=str(raw.get("reasoning", "") or ""),
             )
         )

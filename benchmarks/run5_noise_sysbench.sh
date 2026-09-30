@@ -71,7 +71,6 @@ for i in $(seq 1 "${CONTROL_RUNS}"); do
         --runs "${SYSBENCH_SUB_RUNS}" --repetitions 1 \
         --tables "${SYSBENCH_TABLES}" --table-size "${SYSBENCH_TABLE_SIZE}" \
         --seconds "${SYSBENCH_SECONDS}" --threads "${SYSBENCH_THREADS}" \
-        --prepare \
         --label "control ${i}/${CONTROL_RUNS}"
     files+=("${RESULTS_DIR}/${name}")
 done

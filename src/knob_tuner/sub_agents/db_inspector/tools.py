@@ -285,9 +285,7 @@ def extract_knobs(tool_context: ToolContext) -> str:
                     COALESCE(context, '') AS context,
                     COALESCE(vartype, '') AS vartype,
                     COALESCE(enumvals, '{}') AS enumvals,
-                    COALESCE(pending_restart, false) AS pending_restart,
-                    COALESCE(boot_val, '') AS boot_val,
-                    COALESCE(reset_val, '') AS reset_val
+                    COALESCE(pending_restart, false) AS pending_restart
                 FROM pg_settings
                 ORDER BY category, name;
             """
@@ -334,8 +332,6 @@ def extract_knobs(tool_context: ToolContext) -> str:
                         vartype=str(r.get("vartype", "")),
                         enumvals=enumvals,
                         pending_restart=pending_restart,
-                        boot_val=str(r.get("boot_val", "")),
-                        reset_val=str(r.get("reset_val", "")),
                     )
                 )
 

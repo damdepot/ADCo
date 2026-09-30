@@ -11,7 +11,6 @@ from src.code_rewriter.workflow import (
     MAX_ATTEMPTS_PER_TARGET,
     _attempt_score,
     _issue_signature,
-    attempts_exhausted,
     finalize,
     make_orchestrate,
     prepare,
@@ -34,13 +33,6 @@ def test_verifier_output_category_enum_rejects_unknown():
 def test_verifier_output_accepts_prompt_enum():
     out = VerifierOutput(status="FAIL", category="strategy_not_applied")
     assert out.category == "strategy_not_applied"
-
-
-def test_attempts_exhausted():
-    assert attempts_exhausted(MAX_ATTEMPTS_PER_TARGET) is True
-    assert attempts_exhausted(MAX_ATTEMPTS_PER_TARGET + 1) is True
-    assert attempts_exhausted(MAX_ATTEMPTS_PER_TARGET - 1) is False
-    assert attempts_exhausted(0) is False
 
 
 def test_prepare_seeds_state():

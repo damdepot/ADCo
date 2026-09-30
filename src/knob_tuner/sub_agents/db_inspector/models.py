@@ -22,8 +22,6 @@ class KnobInfo(BaseModel):
     vartype: str = Field(default="", description="Value type (e.g. bool, integer, enum, real, string)")
     enumvals: list[str] = Field(default_factory=list, description="Allowed values when vartype is enum")
     pending_restart: bool = Field(default=False, description="Whether a restart is pending for this knob")
-    boot_val: str = Field(default="", description="Value at server boot")
-    reset_val: str = Field(default="", description="Value the knob would reset to")
 
 
 class WorkloadPattern(BaseModel):

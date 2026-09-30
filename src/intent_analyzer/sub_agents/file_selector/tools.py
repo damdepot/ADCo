@@ -32,25 +32,14 @@ def _apply_db_type(listing: Union[list[str], str], db_type: str) -> Union[list[s
 def get_project_files(tool_context: ToolContext) -> Union[list[str], str]:
     """Retrieve the real project file listing from session state or by scanning the target directory.
 
-    Checks session state for ``scan_result`` (or ``file_list``). If present, returns
-    the file listing. Otherwise, if ``target`` is present in session state, scans
-    the directory using ``scan_directory`` and returns the list of file paths.
+    Checks session state for ``file_list``. If present, returns the file listing.
+    Otherwise, if ``target`` is present in session state, scans the directory
+    using ``scan_directory`` and returns the list of file paths.
 
     When a ``db_type`` is present in session state, the listing is constrained to
     the requested database engine (foreign-engine files are dropped).
     """
     db_type = tool_context.state.get("db_type", "")
-
-    if "scan_result" in tool_context.state and tool_context.state["scan_result"]:
-        scan_res = tool_context.state["scan_result"]
-        if isinstance(scan_res, (list, str)):
-            return _apply_db_type(scan_res, db_type)
-        if hasattr(scan_res, "files"):
-            listing = [f.relative_path if hasattr(f, "relative_path") else str(f) for f in scan_res.files]
-            return _apply_db_type(listing, db_type)
-        if isinstance(scan_res, dict) and "files" in scan_res:
-            return _apply_db_type(scan_res["files"], db_type)
-        return _apply_db_type(str(scan_res), db_type)
 
     if "file_list" in tool_context.state and tool_context.state["file_list"]:
         return _apply_db_type(tool_context.state["file_list"], db_type)
@@ -61,4 +50,4 @@ def get_project_files(tool_context: ToolContext) -> Union[list[str], str]:
             return _apply_db_type(scan_directory(target), db_type)
         return f"ERROR: Target directory '{target}' does not exist or is not a directory."
 
-    return "ERROR: Neither 'scan_result' nor 'target' found in state."
+    return "ERROR: Neither 'file_list' nor 'target' found in state."

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import dataclasses
 import datetime
 import json
 import math
@@ -57,8 +58,6 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
-_cleanup_handlers_registered = False
-
 
 def _process_cleanup() -> None:
     """Process-level cleanup hook to terminate any actively running staging containers."""
@@ -79,15 +78,12 @@ def _signal_handler(signum: int, frame: Any) -> None:
 
 def register_cleanup_handlers() -> None:
     """Register process-level atexit and signal handlers for safe container teardown."""
-    global _cleanup_handlers_registered
-    if not _cleanup_handlers_registered:
-        atexit.register(_process_cleanup)
-        try:
-            signal.signal(signal.SIGINT, _signal_handler)
-            signal.signal(signal.SIGTERM, _signal_handler)
-        except (ValueError, AttributeError):
-            pass
-        _cleanup_handlers_registered = True
+    atexit.register(_process_cleanup)
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except (ValueError, AttributeError):
+        pass
 
 
 # Automatically register on module import
@@ -161,38 +157,27 @@ def _parse_budget(cpu_cores_arg: Any, memory_arg: Any) -> ResourceBudget:
     return ResourceBudget(cpu_cores=cpu_cores, memory_gb=memory_gb)
 
 
-def _load_profile(source: Any) -> SysbenchProfile:
-    """Load a :class:`SysbenchProfile` from a path, dict, or profile instance.
+def _load_profile(source: str | None) -> SysbenchProfile:
+    """Load a :class:`SysbenchProfile` from a JSON path (or return defaults).
 
     Raises:
-        ValueError: If a supplied profile path or payload is missing or invalid.
+        ValueError: If a supplied profile path is missing or invalid.
     """
     if source is None:
         return SysbenchProfile()
-    if isinstance(source, SysbenchProfile):
-        return source
-    if isinstance(source, dict):
-        try:
-            return SysbenchProfile(**source)
-        except Exception as exc:
-            raise ValueError(f"invalid sysbench profile: {exc}") from exc
-    if isinstance(source, str):
-        path = os.path.abspath(source)
-        if not os.path.isfile(path):
-            raise ValueError(f"sysbench profile file not found: {path}")
-        try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise ValueError(
-                f"invalid sysbench profile JSON at {path}: {exc}"
-            ) from exc
-        if not isinstance(data, dict):
-            raise ValueError(f"sysbench profile at {path} must be a JSON object")
-        try:
-            return SysbenchProfile(**data)
-        except Exception as exc:
-            raise ValueError(f"invalid sysbench profile at {path}: {exc}") from exc
-    raise ValueError(f"unsupported sysbench profile value: {source!r}")
+    path = os.path.abspath(source)
+    if not os.path.isfile(path):
+        raise ValueError(f"sysbench profile file not found: {path}")
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"invalid sysbench profile JSON at {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"sysbench profile at {path} must be a JSON object")
+    try:
+        return SysbenchProfile(**data)
+    except Exception as exc:
+        raise ValueError(f"invalid sysbench profile at {path}: {exc}") from exc
 
 
 def _log_event(msg: str, log_file: str | None = None, verbose: bool = False) -> None:
@@ -409,19 +394,9 @@ def _redact_db_config(cfg: DBConfig) -> dict[str, Any]:
     secrets must never be stored there. The real :class:`DBConfig` is
     reconstructed from ``db_config_path`` by the nodes that connect.
     """
-    return {
-        "host": cfg.host,
-        "port": cfg.port,
-        "user": cfg.user,
-        "database": cfg.database,
-        "db_type": cfg.db_type,
-        "env": cfg.env,
-        "restart_type": cfg.restart_type,
-        "restart_target": cfg.restart_target,
-        "restart_cmd": cfg.restart_cmd,
-        "remote_host": cfg.remote_host,
-        "remote_user": cfg.remote_user,
-    }
+    redacted = dataclasses.asdict(cfg)
+    redacted.pop("password", None)
+    return redacted
 
 
 def build_initial_state(
@@ -461,7 +436,6 @@ def build_initial_state(
         "resource_budget": budget.model_dump(),
         "cpu_cores": budget.cpu_cores,
         "memory_gb": budget.memory_gb,
-        "memory": budget.memory_gb,
         "sysbench_profile": profile.model_dump(),
         "sysbench_profile_hash": profile.profile_hash(),
         "apply_mode": apply_mode,
@@ -647,8 +621,6 @@ async def run_pipeline(
     workload_hint: str = "",
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using the ADK Runner and session service."""
-    register_cleanup_handlers()
-
     # 1. Resource contract FIRST: fail before any side effect.
     budget = _parse_budget(cpu_cores_arg, memory_arg)
     profile = _load_profile(sysbench_profile)
@@ -840,7 +812,6 @@ async def run_pipeline(
 
 def main() -> None:
     """CLI main entry point."""
-    register_cleanup_handlers()
     parser = build_parser()
     args = parser.parse_args()
 
@@ -872,24 +843,22 @@ def main() -> None:
                 output_path=args.output_path,
                 dry_run=args.dry_run,
                 verbose=args.verbose,
-                cleanup_orphans=getattr(args, "cleanup_orphans", True),
+                cleanup_orphans=args.cleanup_orphans,
                 db_name=args.db_name,
-                buffer_time=getattr(args, "buffer_time", 0.0),
+                buffer_time=args.buffer_time,
                 apply_mode=args.apply_mode,
                 results_dir=args.results_dir,
                 sysbench_profile=args.sysbench_profile,
-                multi_fidelity_min_seconds=getattr(
-                    args, "multi_fidelity_min_seconds", 300.0
-                ),
-                screen_total_rows=getattr(args, "screen_total_rows", 0),
-                screen_max_rows=getattr(args, "screen_max_rows", 5_000_000),
-                confirm_repetitions=getattr(args, "confirm_repetitions", 5),
-                screen_measurement_seconds=getattr(args, "screen_seconds", 10),
-                screen_warmup_seconds=getattr(args, "screen_warmup_seconds", 2),
-                rand_type=getattr(args, "rand_type", None),
-                durability_profile=getattr(args, "durability_profile", "strict"),
-                screening_benchmark=getattr(args, "screening_benchmark", "sysbench"),
-                workload_hint=getattr(args, "workload_hint", ""),
+                multi_fidelity_min_seconds=args.multi_fidelity_min_seconds,
+                screen_total_rows=args.screen_total_rows,
+                screen_max_rows=args.screen_max_rows,
+                confirm_repetitions=args.confirm_repetitions,
+                screen_measurement_seconds=args.screen_seconds,
+                screen_warmup_seconds=args.screen_warmup_seconds,
+                rand_type=args.rand_type,
+                durability_profile=args.durability_profile,
+                screening_benchmark=args.screening_benchmark,
+                workload_hint=args.workload_hint,
             )
         )
     except Exception as exc:

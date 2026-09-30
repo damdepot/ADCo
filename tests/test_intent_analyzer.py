@@ -3,7 +3,7 @@ import os
 import pytest
 from unittest.mock import MagicMock
 
-from src.intent_analyzer.agent import create_intent_analyzer_agent, create_root_agent
+from src.intent_analyzer.agent import create_intent_analyzer_agent
 from src.intent_analyzer.sub_agents.file_selector.agent import create_file_selector_agent
 from src.intent_analyzer.sub_agents.intent_extractor.agent import create_intent_extractor_agent
 from src.intent_analyzer.sub_agents.intent_extractor.models import (
@@ -20,10 +20,6 @@ def test_agent_creation():
     assert agent.model == "gemini-3.5-flash-lite"
     assert len(agent.tools) == 3
 
-    root_agent = create_root_agent()
-    assert root_agent.name == "intent_analyzer"
-    assert root_agent.model == "gemini-3.5-flash-lite"
-
 
 def test_subagent_creation():
     fs_agent = create_file_selector_agent("gemini-3.5-flash-lite")
@@ -37,17 +33,7 @@ def test_subagent_creation():
 def test_file_selector_get_project_files(tmp_path):
     from src.intent_analyzer.sub_agents.file_selector.tools import get_project_files as intent_get_files
 
-    # 1. scan_result in state as list
-    ctx1 = MagicMock()
-    ctx1.state = {"scan_result": ["a.py", "b.py"]}
-    assert intent_get_files(ctx1) == ["a.py", "b.py"]
-
-    # 2. scan_result in state as str
-    ctx2 = MagicMock()
-    ctx2.state = {"scan_result": "file1.py\nfile2.py"}
-    assert intent_get_files(ctx2) == "file1.py\nfile2.py"
-
-    # 3. target in state (scans directory)
+    # 1. target in state (scans directory)
     d = tmp_path / "app"
     d.mkdir()
     (d / "main.py").write_text("print(1)")

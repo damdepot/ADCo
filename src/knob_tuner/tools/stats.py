@@ -152,39 +152,3 @@ def estimate_multi_fidelity(
         "screen_seconds": float(screen_seconds),
         "confirm_seconds": float(confirm_seconds),
     }
-
-
-if __name__ == "__main__":  # ponytail: one runnable self-check, no framework
-    flat = welch_delta([100.0, 100.0, 100.0], [105.0, 105.0, 105.0])
-    assert flat["zero_spread"] is True and flat["df"] == 1.0
-    assert flat["lcb_pct"] == flat["ucb_pct"] == 5.0
-    none = welch_delta([100.0, 100.0, 100.0], [100.0, 100.0, 100.0])
-    assert none["df"] == 0.0 and none["zero_spread"] is True and none["lcb_pct"] == 0.0
-    thin = welch_delta([100.0], [105.0])
-    assert thin["sufficient"] is False and thin["n1"] == 1 and thin["df"] == 0.0
-    noisy = welch_delta([100.0, 110.0, 90.0], [130.0, 140.0, 120.0])
-    assert noisy["sufficient"] is True and noisy["mean_delta_pct"] > 0
-    assert noisy["lcb_pct"] < noisy["mean_delta_pct"] < noisy["ucb_pct"]
-    assert t_crit(0.5) is None and t_crit(3.7) == 3.182
-    assert t_crit(30.999) == 2.042 and t_crit(40.0) == 2.021
-    narrow = estimate_multi_fidelity(
-        n_candidates=4, n_confirm=2, measurement_seconds=30,
-        screen_repetitions=3, confirm_repetitions=5, minimum_seconds=300,
-    )
-    assert narrow["estimated_saving_seconds"] == -60.0 and narrow["enabled"] is False
-    wide = estimate_multi_fidelity(
-        n_candidates=4, n_confirm=1, measurement_seconds=30,
-        screen_repetitions=3, confirm_repetitions=10, minimum_seconds=300,
-    )
-    assert wide["estimated_saving_seconds"] == 540.0 and wide["enabled"] is True
-    assert narrow["screen_seconds"] == narrow["confirm_seconds"] == 30.0
-    shorter = estimate_multi_fidelity(
-        n_candidates=4, n_confirm=1, measurement_seconds=30,
-        screen_repetitions=3, confirm_repetitions=10, minimum_seconds=300,
-        screen_seconds=10, confirm_seconds=30,
-    )
-    assert shorter["screen_seconds"] == 10.0 and shorter["confirm_seconds"] == 30.0
-    assert shorter["estimated_saving_seconds"] == 780.0
-    assert shorter["estimated_saving_seconds"] > wide["estimated_saving_seconds"]
-    assert shorter["enabled"] is True
-    print("stats self-check ok:", noisy, narrow, wide, shorter)

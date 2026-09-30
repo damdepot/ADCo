@@ -237,39 +237,25 @@ def write_selected_knobs(tool_context: ToolContext) -> str:
     """
     recs: list[dict[str, Any]] = []
 
-    output = tool_context.state.get("knob_recommender_output")
-    if output:
-        if hasattr(output, "recommendations"):
-            for r in output.recommendations:
-                if isinstance(r, KnobRecommendation):
-                    recs.append(r.model_dump())
-                elif isinstance(r, dict):
-                    recs.append(r)
-        elif isinstance(output, dict):
-            raw_recs = output.get("recommendations", [])
-            for r in raw_recs:
-                if isinstance(r, KnobRecommendation):
-                    recs.append(r.model_dump())
-                elif isinstance(r, dict):
-                    recs.append(r)
-
-    if not recs:
-        selected = tool_context.state.get("selected_knobs")
-        if selected and isinstance(selected, list):
-            for r in selected:
-                if isinstance(r, KnobRecommendation):
-                    recs.append(r.model_dump())
-                elif isinstance(r, dict):
-                    recs.append(r)
-
-    if not recs:
-        raw_recs = tool_context.state.get("recommendations")
-        if raw_recs and isinstance(raw_recs, list):
-            for r in raw_recs:
-                if isinstance(r, KnobRecommendation):
-                    recs.append(r.model_dump())
-                elif isinstance(r, dict):
-                    recs.append(r)
+    for key in ("knob_recommender_output", "selected_knobs", "recommendations"):
+        value = tool_context.state.get(key)
+        if not value:
+            continue
+        if hasattr(value, "recommendations"):
+            raw_recs = value.recommendations
+        elif isinstance(value, dict):
+            raw_recs = value.get("recommendations", [])
+        elif isinstance(value, list):
+            raw_recs = value
+        else:
+            continue
+        for r in raw_recs:
+            if isinstance(r, KnobRecommendation):
+                recs.append(r.model_dump())
+            elif isinstance(r, dict):
+                recs.append(r)
+        if recs:
+            break
 
     if not recs:
         return "ERROR: no selected/recommended knobs found in state to write"

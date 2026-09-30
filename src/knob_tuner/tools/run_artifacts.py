@@ -62,15 +62,10 @@ def create_run_dir(base_dir: str, run_id: str) -> str:
     return path
 
 
-def write_json(path: str, data: Any) -> None:
-    """Write ``data`` as pretty JSON, creating parent directories."""
-    write_json_file(path, data)
-
-
 def write_manifest(run_dir: str, manifest: RunManifest) -> str:
     """Write ``manifest.json`` into ``run_dir`` and return its path."""
     path = os.path.join(run_dir, "manifest.json")
-    write_json(path, manifest.model_dump())
+    write_json_file(path, manifest.model_dump())
     return path
 
 
@@ -84,7 +79,7 @@ def write_artifact(run_dir: str, name: str, data: Any) -> str:
     if os.altsep:
         safe_name = safe_name.replace(os.altsep, "_")
     path = os.path.join(run_dir, f"{safe_name}.json")
-    write_json(path, data)
+    write_json_file(path, data)
     return path
 
 

@@ -78,7 +78,6 @@ Before calling `write_selected_knobs` and finalizing output, verify:
 - [ ] `autovacuum_vacuum_scale_factor >= 0.10` and `autovacuum_vacuum_cost_limit <= 400`.
 - [ ] `wal_buffers` is `-1` or `>= 16MB` (never static < 16MB), `max_wal_size >= 4GB`, and `checkpoint_completion_target = 0.9`.
 - [ ] If the workload context is analytical/aggregate/sort-heavy, `work_mem` was explicitly considered and sized for the working set (accounting for `hash_mem_multiplier = 2.0`).
-- [ ] Total memory budget (`total_memory_allocated_gb`) does not exceed 75%-80% of system RAM.
 - [ ] Durability constraints for the stated policy are respected.
 - [ ] `restart_required` is correctly set to `True` if any recommended knob requires a server restart.
 
@@ -88,8 +87,5 @@ Before calling `write_selected_knobs` and finalizing output, verify:
 2. Call `read_knob_details` with the comma-separated shortlist to fetch current values and constraints for those knobs only.
 3. Formulate recommendations based on retrieved knowledge base formulas, workload signals, and performance guardrails.
 4. Call `write_selected_knobs` to persist the chosen recommendations.
-5. Return structured `KnobRecommenderOutput` containing total memory budget, recommendations, and executive summary.
+5. Return structured `KnobRecommenderOutput` containing the recommendations and executive summary.
 """
-
-def build_knob_recommender_prompt() -> str:
-    return KNOB_RECOMMENDER_PROMPT

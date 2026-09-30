@@ -73,7 +73,7 @@ def test_get_project_files_db_type():
 
     ctx = MagicMock()
     ctx.state = {
-        "scan_result": [
+        "file_list": [
             "drivers/postgresdriver.py",
             "drivers/mysqldriver.py",
             "db.py",
@@ -87,7 +87,7 @@ def test_get_project_files_db_type():
     assert "mysqldriver.py" not in result
 
     ctx_no_db = MagicMock()
-    ctx_no_db.state = {"scan_result": ["a.py", "b.py"]}
+    ctx_no_db.state = {"file_list": ["a.py", "b.py"]}
     assert get_project_files(ctx_no_db) == ["a.py", "b.py"]
 
 

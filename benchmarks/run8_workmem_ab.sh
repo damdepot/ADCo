@@ -31,6 +31,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="${ROOT}/benchmarks/scripts"
+source "${SCRIPTS}/bench_lib.sh"
 CMDDocker="${SCRIPTS}/docker.sh"
 MEASURE="${SCRIPTS}/pgbench_measure.py"
 PGBSCRIPT="${ROOT}/benchmarks/tools/pgbench/sort_hash.pgb"
@@ -38,6 +39,8 @@ PYTHON="${ROOT}/.venv/bin/python"
 
 C=adcoexp-db
 DB=adcodb
+BENCH_DB_CONTAINER="$C"
+RESTORE_RESTART=0
 REPS="${REPS:-3}"
 SETTLE="${SETTLE:-5}"
 CLIENTS="${CLIENTS:-2}"
@@ -50,12 +53,6 @@ OUT="${ROOT}/results/workmem"
 mkdir -p "${OUT}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 
-psql() { docker exec -u postgres "$C" psql -v ON_ERROR_STOP=1 -q "$@"; }
-
-restore_defaults() {
-    psql -c "ALTER SYSTEM RESET ALL;" >/dev/null 2>&1 || true
-    psql -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
-}
 trap restore_defaults EXIT
 
 apply_arm() {
@@ -81,7 +78,6 @@ measure() {
 }
 
 total_of() { awk -F, '{print $NF}' "$1"; }
-median_of() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'; }
 spread_pct() {
     printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{m=(NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2; print (a[NR]-a[1])/m*100}'
 }
