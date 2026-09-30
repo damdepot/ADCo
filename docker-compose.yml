@@ -10,14 +10,13 @@ services:
     ports:
       - "5432:5432"
     platform: linux/amd64
-    # ponytail: live/target DB limits are still hardcoded and are NOT tied to
-    # the per-run ResourceBudget (deferred). Upgrade: drive these from env vars
-    # and verify with `docker inspect` against the requested budget.
+    # Limits are env-driven so the benchmark harness's CPU_CORES/MEMORY_GB
+    # match what the container actually gets (defaults preserve 2 cpus / 8g).
     deploy:
       resources:
         limits:
-          cpus: "2"
-          memory: 8g
+          cpus: "${CPU_CORES:-2}"
+          memory: "${MEMORY_GB:-8}g"
     shm_size: 2g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]

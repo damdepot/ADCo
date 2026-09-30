@@ -35,6 +35,30 @@ elif [ "$op" == "Up" ]; then
     if [ "${service}" == "pgdb" ]; then
         $COMPOSE -p adco-experiments -f "${compose_file}" up db-init
     fi
+    # Verify the container actually received the requested limits. Skipped
+    # silently when neither env var is set (backwards compatible).
+    if [ -n "${CPU_CORES:-}" ] || [ -n "${MEMORY_GB:-}" ]; then
+        actual_nano="$(docker inspect -f '{{.HostConfig.NanoCpus}}' "${container}")"
+        actual_mem="$(docker inspect -f '{{.HostConfig.Memory}}' "${container}")"
+        if [ -n "${CPU_CORES:-}" ]; then
+            expected_nano="$(awk -v c="${CPU_CORES}" 'BEGIN { printf "%d", c * 1000000000 }')"
+            if [ "${actual_nano}" == "${expected_nano}" ]; then
+                echo "PASS: container '${container}' cpus=${CPU_CORES} (NanoCpus=${actual_nano})."
+            else
+                echo "ERROR: container '${container}' cpus mismatch: requested ${CPU_CORES} (NanoCpus=${expected_nano}), got NanoCpus=${actual_nano}." >&2
+                exit 1
+            fi
+        fi
+        if [ -n "${MEMORY_GB:-}" ]; then
+            expected_mem="$(awk -v m="${MEMORY_GB}" 'BEGIN { printf "%d", m * 1073741824 }')"
+            if [ "${actual_mem}" == "${expected_mem}" ]; then
+                echo "PASS: container '${container}' memory=${MEMORY_GB}g (Memory=${actual_mem})."
+            else
+                echo "ERROR: container '${container}' memory mismatch: requested ${MEMORY_GB}g (Memory=${expected_mem}), got Memory=${actual_mem}." >&2
+                exit 1
+            fi
+        fi
+    fi
 
 elif [ "$op" == "WaitFor" ]; then
     echo '-------------------<< Waiting for docker production database to become ready >>-------------------'
@@ -58,7 +82,11 @@ elif [ "$op" == "WaitFor" ]; then
     echo "ERROR: timed out after 60s waiting for container '${container}' to become ready." >&2
     exit 1
 
+elif [ "$op" == "Checkpoint" ]; then
+    echo '-------------------<< Checkpointing docker production database >>-------------------'
+    docker exec -u postgres "${container}" psql -v ON_ERROR_STOP=1 -c 'CHECKPOINT;'
+
 else     
-    echo "Invalid operation: $op. Supported operations are: Restart, Down, Up, WaitFor." >&2
+    echo "Invalid operation: $op. Supported operations are: Restart, Down, Up, WaitFor, Checkpoint." >&2
     exit 2
 fi

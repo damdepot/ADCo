@@ -9,9 +9,22 @@ if [ -z "$dir" ] || [ -z "$file_name" ]; then
     exit 2
 fi
 
+phase="${PHASE:-execute}"
+case "${phase}" in
+    load|execute) ;;
+    *)
+        echo "Usage: PHASE must be 'load' or 'execute' (got '${phase}')" >&2
+        exit 2
+        ;;
+esac
+
 dbms="postgres"
-warehouses=2
-clients=2
+# Bench defaults target a less noisy, harder-to-move workload: more warehouses
+# lower row-level contention, more clients raise offered load, and a longer run
+# shrinks the relative variance of the reported rate. Override via the env.
+warehouses="${WAREHOUSES:-4}"
+clients="${CLIENTS:-4}"
+duration="${DURATION:-60}"
 exp_path="$(cd "$(dirname "$0")/../.." && pwd)"
 workload_path="${exp_path}/benchmarks/tools/tpcc"
 log_fname="${exp_path}/results/tpcc/$file_name"
@@ -29,7 +42,16 @@ CMD="python tpcc.py ${dbms} \
                 --config=${workload_path}/db.config \
                 --clients=${clients} \
                 --warehouses=${warehouses} \
-                --duration=30 \
+                --duration=${duration}"
+
+if [ "${phase}" = "load" ]; then
+    CMD="${CMD} \
+                --reset \
+                --no-execute"
+else
+    CMD="${CMD} \
                 --output-path=${log_fname} \
-                --reset"
+                --no-load"
+fi
+
 $CMD
