@@ -355,7 +355,7 @@ def test_tune_loop_rejects_likely_regression():
         }
 
     recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
     )
     ctx = _FakeContext(_base_loop_state())
     events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
@@ -365,9 +365,10 @@ def test_tune_loop_rejects_likely_regression():
     assert delta["knob_plan"]["knobs"] == []
 
 
-def test_tune_loop_negative_lcb_is_not_promoted():
+def test_tune_loop_noisy_positive_mean_is_promoted():
     def validator(**kwargs):
         # Noisy improvement: positive mean, negative LCB; health check passes.
+        # Non-negative rule: tuned is not worse, so it promotes (LCB is info).
         return {
             "status": "PASS",
             "paired": _paired([100.0, 100.0, 100.0], [106.0, 95.0, 110.0]),
@@ -375,22 +376,22 @@ def test_tune_loop_negative_lcb_is_not_promoted():
         }
 
     recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
     )
     ctx = _FakeContext(_base_loop_state())
     events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
 
     delta = events[-1].actions.state_delta
-    # A paired PASS alone is not enough: the 95% LCB is negative, so the
-    # candidate is not promoted.
-    assert delta["result_status"] == "INCONCLUSIVE"
-    assert delta["staging_validated"] is False
+    # Mean delta is positive and health passes: promoted even though LCB < 0.
+    assert delta["result_status"] == "PASS"
+    assert delta["staging_validated"] is True
     assert delta["improvement_confident"] is False
 
 
-def test_tune_loop_lcb_below_minimum_is_not_promoted():
+def test_tune_loop_small_positive_mean_is_promoted():
     def validator(**kwargs):
-        # +1% with zero spread: positive LCB, but below the 2% default minimum.
+        # +1% with zero spread: LCB below the 2% default minimum, but the
+        # mean is non-negative and health passes, so it promotes.
         return {
             "status": "PASS",
             "paired": _paired([100.0, 100.0, 100.0], [101.0, 101.0, 101.0]),
@@ -398,7 +399,28 @@ def test_tune_loop_lcb_below_minimum_is_not_promoted():
         }
 
     recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
+    )
+    ctx = _FakeContext(_base_loop_state())
+    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+
+    delta = events[-1].actions.state_delta
+    assert delta["result_status"] == "PASS"
+    assert delta["staging_validated"] is True
+
+
+def test_tune_loop_negative_mean_is_not_promoted():
+    def validator(**kwargs):
+        # Negative mean with a wide interval (ucb >= 0 passes screening
+        # eligibility), but health alone is not enough: tuned is worse.
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0, 100.0, 100.0], [90.0, 100.0, 105.0]),
+            "reasons": [],
+        }
+
+    recommender = _recommender(
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
     )
     ctx = _FakeContext(_base_loop_state())
     events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))

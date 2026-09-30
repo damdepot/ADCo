@@ -1239,7 +1239,7 @@ def test_reversal_failure_is_visible_in_result(budget, profile, plan, staging_cf
     )
 
 
-def test_ignored_error_mismatch_downgrades_to_inconclusive(
+def test_ignored_error_mismatch_is_warning_only(
     budget, profile, plan, staging_cfg
 ):
     baseline = _measurement([100.0, 100.0], ignored_errors=20)
@@ -1268,15 +1268,19 @@ def test_ignored_error_mismatch_downgrades_to_inconclusive(
             apply_mode=ApplyMode.DYNAMIC,
         )
 
-    # The throughput comparison itself passes, but the error-rate mismatch means
-    # the arms did different work, so it is not reported as a clean win.
+    # The throughput comparison itself passes; the error-rate mismatch is
+    # recorded as a warning only and never vetoes the win.
     assert result["paired"]["status"] == "PASS"
-    assert result["status"] == "INCONCLUSIVE"
+    assert result["status"] == "PASS"
     assert result["ignored_errors"]["mismatch"] is True
     assert result["ignored_errors"]["baseline_first"] == 20
     assert result["ignored_errors"]["baseline_reversal"] == 20
     assert result["ignored_errors"]["tuned"] == 38
     assert any("ignored-error mismatch" in reason for reason in result["reasons"])
+    assert any(
+        reason.startswith("warning:") and "ignored-error mismatch" in reason
+        for reason in result["reasons"]
+    )
 
     written = {call.args[1]: call.args[2] for call in m_write.call_args_list}
     assert written["ignored-errors"]["mismatch"] is True

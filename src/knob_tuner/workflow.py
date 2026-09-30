@@ -558,17 +558,25 @@ def make_tune_loop(recommender_node: Any, validator: Any):
                     cand["confirm_result"] = result
                     cand["confirm_stats"] = stats
                     # Promotion requires BOTH the paired health check (PASS) and
-                    # a positive improvement whose 95% lower confidence bound
-                    # clears the configured minimum effect.
+                    # a non-negative result (mean delta >= 0). The ignored-error
+                    # mismatch is a warning only and never blocks promotion;
+                    # health failures (non-ok measurements, reconnects,
+                    # unverified knobs, failed applies) still block via the
+                    # non-PASS status. The LCB-vs-threshold figure is retained
+                    # in the archive as information only.
                     improvement_confident = (
                         stats["df"] >= 1
                         and stats["lcb_pct"] > min_improvement_pct
+                    )
+                    not_worse = (
+                        stats["df"] >= 1
+                        and stats["mean_delta_pct"] >= 0
                     )
                     healthy = (
                         str(result.get("status", "")).upper()
                         == TuningStatus.PASS.value
                     )
-                    cand["confirmed"] = healthy and improvement_confident
+                    cand["confirmed"] = healthy and not_worse
                     cand["improvement_confident"] = improvement_confident
                     archive.append(
                         {

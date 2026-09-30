@@ -914,8 +914,9 @@ def validate_plan(
 
         # 8b. Surface the per-arm ignored-error counts. Ignored errors are
         #     recoverable DB errors (e.g. deadlocks) that sysbench swallows; a
-        #     materially different count means the arms did different work and
-        #     the throughput comparison is not like-for-like.
+        #     materially different count is recorded as a warning so the
+        #     operator can see the arms may have done different work, but it
+        #     never vetoes a win on its own: apply whenever tuned is not worse.
         ignored_errors = {
             "baseline_first": baseline.ignored_errors,
             "baseline_reversal": (
@@ -935,7 +936,7 @@ def validate_plan(
             run_dir, "ignored-errors", ignored_errors
         )
         if ignored_error_mismatch:
-            reasons.append(ignored_error_reason)
+            reasons.append(f"warning: {ignored_error_reason}")
 
         # 9. Paired comparison against the pooled baseline.
         paired = PairedResult.evaluate(pooled_baseline, tuned, profile)
@@ -958,15 +959,9 @@ def validate_plan(
 
         if failed_applications or restart_failed:
             status = TuningStatus.FAIL
-        elif (
-            paired.status == TuningStatus.PASS
-            and all_verified
-            and not ignored_error_mismatch
-        ):
+        elif paired.status == TuningStatus.PASS and all_verified:
             status = TuningStatus.PASS
-        elif paired.status == TuningStatus.INCONCLUSIVE or (
-            paired.status == TuningStatus.PASS and ignored_error_mismatch
-        ):
+        elif paired.status == TuningStatus.INCONCLUSIVE:
             status = TuningStatus.INCONCLUSIVE
         else:
             status = TuningStatus.FAIL
