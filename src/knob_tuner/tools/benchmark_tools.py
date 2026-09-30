@@ -409,6 +409,7 @@ def run_sysbench_measurement(
     workdir: str | None = None,
     progress: Callable[[str], None] | None = None,
     prepare: bool = True,
+    on_prepared: Callable[[], None] | None = None,
 ) -> SysbenchMeasurement:
     """Run a deterministic, repeated sysbench OLTP measurement.
 
@@ -429,6 +430,11 @@ def run_sysbench_measurement(
         prepare: When ``True`` (default) reset the dataset with a cleanup and
             prepare. When ``False`` reuse the already-prepared dataset and skip
             both calls.
+        on_prepared: Optional best-effort callback invoked once, right after a
+            fresh ``prepare`` and its settle have completed and before the
+            warmup/measured runs. Used to snapshot the cleanly loaded dataset.
+            A failing callback is reported and otherwise ignored so a snapshot
+            failure never fails the measurement.
 
     Returns:
         A ``SysbenchMeasurement``; ``status`` is ``"ok"`` only when every
@@ -530,6 +536,14 @@ def run_sysbench_measurement(
         if prepare:
             emit("settling database (checkpoint + autovacuum quiesce)...")
             _settle_after_load(cfg, emit)
+            if on_prepared is not None:
+                try:
+                    on_prepared()
+                except Exception as e:
+                    emit(
+                        "snapshot hook failed (continuing without snapshot): "
+                        f"{e}"
+                    )
 
         # (c) Optional discarded warmup run.
         if profile.warmup_seconds > 0:
@@ -670,6 +684,7 @@ def run_pgbench_measurement(
     workdir: str | None = None,
     progress: Callable[[str], None] | None = None,
     prepare: bool = True,
+    on_prepared: Callable[[], None] | None = None,
 ) -> SysbenchMeasurement:
     """Run a repeated, host-side pgbench measurement of the sort/hash workload.
 
@@ -692,6 +707,10 @@ def run_pgbench_measurement(
         progress: Optional progress callback.
         prepare: When ``True`` (default) reset the dataset with a sysbench
             cleanup and prepare. When ``False`` reuse the already-prepared one.
+        on_prepared: Optional best-effort callback invoked once, right after a
+            fresh ``prepare`` and its settle have completed and before the
+            warmup/measured runs (used to snapshot the loaded dataset). A
+            failing callback is reported and otherwise ignored.
 
     Returns:
         A ``SysbenchMeasurement`` whose ``tps`` is the median of the per-run
@@ -796,6 +815,14 @@ def run_pgbench_measurement(
         if prepare:
             emit("settling database (checkpoint + autovacuum quiesce)...")
             _settle_after_load(cfg, emit)
+            if on_prepared is not None:
+                try:
+                    on_prepared()
+                except Exception as e:
+                    emit(
+                        "snapshot hook failed (continuing without snapshot): "
+                        f"{e}"
+                    )
 
         def _pgbench_cmd(seconds: int) -> list[str]:
             return [

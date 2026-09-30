@@ -15,6 +15,7 @@ from src.knob_tuner.contracts import (
 )
 from src.knob_tuner.tools.db_connector import DBConfig
 from src.knob_tuner.tools.validation import (
+    SnapshotRegistry,
     _collect_pg_write_stats,
     _enable_wal_io_timing,
     _pooled_baseline,
@@ -840,6 +841,7 @@ def test_validate_plan_records_wal_evidence(budget, profile, plan, staging_cfg):
         _wal_state(wal_records=100, wal_bytes=1000, xact_commit=50),
         _wal_state(wal_records=200, wal_bytes=2000, xact_commit=100),
         _wal_state(wal_records=350, wal_bytes=3500, xact_commit=190),
+        _wal_state(wal_records=500, wal_bytes=5000, xact_commit=280),
     ]
     fake_conn = _FakeConn()
 
@@ -874,8 +876,9 @@ def test_validate_plan_records_wal_evidence(budget, profile, plan, staging_cfg):
 
     evidence = result["wal_evidence"]
     assert evidence["snapshots"]["before"]["wal_records"] == 100.0
-    assert evidence["snapshots"]["tuned_before"]["wal_records"] == 200.0
-    assert evidence["snapshots"]["after"]["wal_records"] == 350.0
+    assert evidence["snapshots"]["baseline_after"]["wal_records"] == 200.0
+    assert evidence["snapshots"]["tuned_before"]["wal_records"] == 350.0
+    assert evidence["snapshots"]["after"]["wal_records"] == 500.0
 
     assert evidence["baseline_delta"]["wal_records"] == 100.0
     assert evidence["tuned_delta"]["wal_records"] == 150.0
@@ -1280,3 +1283,200 @@ def test_ignored_error_mismatch_downgrades_to_inconclusive(
     assert result["attestation"]["benchmark_artifacts"]["ignored_errors"] == (
         "/tmp/artifact.json"
     )
+
+
+def _snapshot_key(profile: SysbenchProfile) -> str:
+    return SnapshotRegistry.key_for(
+        "postgres", "17", profile.tables, profile.rows_per_table
+    )
+
+
+def test_reversal_disabled_skips_reversal(budget, profile, plan, staging_cfg):
+    baseline = _measurement([100.0, 100.0])
+    tuned = _measurement([112.0, 110.0])
+
+    with (
+        patch(
+            f"{_VALIDATION}.start_staging_db",
+            return_value=("stg-container", staging_cfg),
+        ),
+        patch(
+            f"{_VALIDATION}.run_sysbench_measurement",
+            side_effect=[baseline, tuned],
+        ) as m_bench,
+        patch(f"{_VALIDATION}.apply_knobs", return_value=_apply_results()),
+        patch(f"{_VALIDATION}.verify_active_knobs", return_value=_verify()),
+        patch(f"{_VALIDATION}.snapshot_settings", side_effect=_settings_seq()),
+        patch(f"{_VALIDATION}.write_artifact", return_value="/tmp/artifact.json"),
+        patch(f"{_VALIDATION}.stop_staging_db", return_value=(True, "stopped")),
+        patch(f"{_VALIDATION}._collect_pg_write_stats", return_value={}),
+        patch(f"{_VALIDATION}._measure_baseline_reversal") as m_rev,
+    ):
+        result = validate_plan(
+            **_call_kwargs(budget, profile, plan),
+            apply_mode=ApplyMode.DYNAMIC,
+            reversal=False,
+        )
+
+    assert m_bench.call_count == 2
+    m_rev.assert_not_called()
+    assert result["baseline_reversal"]["measured"] is False
+    assert "disabled" in result["baseline_reversal"]["reason"]
+
+
+def test_snapshot_hit_boots_from_image_and_reuses_dataset(
+    budget, profile, plan, staging_cfg
+):
+    baseline = _measurement([100.0, 100.0])
+    tuned = _measurement([112.0, 110.0])
+    reversal = _measurement([100.0, 100.0])
+    registry = SnapshotRegistry()
+    image = "adco-staging-ready:run1-1x10"
+    registry.register(_snapshot_key(profile), image)
+
+    with (
+        patch(
+            f"{_VALIDATION}.start_staging_db",
+            return_value=("stg-container", staging_cfg),
+        ) as m_start,
+        patch(
+            f"{_VALIDATION}.recreate_docker_db",
+            return_value=(True, "stg-new", staging_cfg),
+        ) as m_rec,
+        patch(
+            f"{_VALIDATION}.run_sysbench_measurement",
+            side_effect=[baseline, tuned, reversal],
+        ) as m_bench,
+        patch(f"{_VALIDATION}.apply_knobs", return_value=_apply_results()),
+        patch(f"{_VALIDATION}.verify_active_knobs", return_value=_verify()),
+        patch(f"{_VALIDATION}.snapshot_settings", side_effect=_settings_seq()),
+        patch(f"{_VALIDATION}.write_artifact", return_value="/tmp/artifact.json"),
+        patch(f"{_VALIDATION}.stop_staging_db", return_value=(True, "stopped")),
+        patch(f"{_VALIDATION}._collect_pg_write_stats", return_value={}),
+    ):
+        validate_plan(
+            **_call_kwargs(budget, profile, plan),
+            apply_mode=ApplyMode.DYNAMIC,
+            snapshot=registry,
+        )
+
+    assert m_start.call_args.kwargs.get("base_image") == image
+    assert [c.kwargs["prepare"] for c in m_bench.call_args_list] == [
+        False,
+        False,
+        False,
+    ]
+    # Mutating tuned and reversal arms restore from the snapshot instead of
+    # re-running prepare.
+    assert m_rec.call_count == 2
+    assert m_rec.call_args_list[0].kwargs.get("base_image") == image
+
+
+def test_snapshot_miss_commits_clean_dataset_then_recreates_arms(
+    budget, profile, plan, staging_cfg
+):
+    measurements = iter(
+        [
+            _measurement([100.0, 100.0]),
+            _measurement([112.0, 110.0]),
+            _measurement([100.0, 100.0]),
+        ]
+    )
+    registry = SnapshotRegistry()
+    committed: dict[str, str] = {}
+
+    def fake_runner(
+        cfg, prof, workdir=None, progress=None, prepare=True, on_prepared=None
+    ):
+        if prepare and on_prepared is not None:
+            on_prepared()
+        return next(measurements)
+
+    def fake_commit(container, image_name):
+        committed["image"] = image_name
+        return True, "ok"
+
+    with (
+        patch(
+            f"{_VALIDATION}.start_staging_db",
+            return_value=("stg-container", staging_cfg),
+        ),
+        patch(f"{_VALIDATION}.commit_staging_db", side_effect=fake_commit),
+        patch(
+            f"{_VALIDATION}.recreate_docker_db",
+            return_value=(True, "stg-new", staging_cfg),
+        ) as m_rec,
+        patch(f"{_VALIDATION}.run_sysbench_measurement", side_effect=fake_runner) as m_bench,
+        patch(f"{_VALIDATION}.apply_knobs", return_value=_apply_results()),
+        patch(f"{_VALIDATION}.verify_active_knobs", return_value=_verify()),
+        patch(f"{_VALIDATION}.snapshot_settings", side_effect=_settings_seq()),
+        patch(f"{_VALIDATION}.write_artifact", return_value="/tmp/artifact.json"),
+        patch(f"{_VALIDATION}.stop_staging_db", return_value=(True, "stopped")),
+        patch(f"{_VALIDATION}._collect_pg_write_stats", return_value={}),
+    ):
+        validate_plan(
+            **_call_kwargs(budget, profile, plan),
+            apply_mode=ApplyMode.DYNAMIC,
+            snapshot=registry,
+        )
+
+    assert committed["image"].startswith("adco-staging-ready:")
+    assert registry.get(_snapshot_key(profile)) == committed["image"]
+    assert [c.kwargs["prepare"] for c in m_bench.call_args_list] == [
+        True,
+        False,
+        False,
+    ]
+    assert m_rec.call_count == 2
+
+
+def test_snapshot_commit_failure_falls_back_to_prepare(
+    budget, profile, plan, staging_cfg
+):
+    measurements = iter(
+        [
+            _measurement([100.0, 100.0]),
+            _measurement([112.0, 110.0]),
+            _measurement([100.0, 100.0]),
+        ]
+    )
+    registry = SnapshotRegistry()
+
+    def fake_runner(
+        cfg, prof, workdir=None, progress=None, prepare=True, on_prepared=None
+    ):
+        if prepare and on_prepared is not None:
+            on_prepared()
+        return next(measurements)
+
+    with (
+        patch(
+            f"{_VALIDATION}.start_staging_db",
+            return_value=("stg-container", staging_cfg),
+        ),
+        patch(
+            f"{_VALIDATION}.commit_staging_db",
+            return_value=(False, "disk full"),
+        ),
+        patch(f"{_VALIDATION}.recreate_docker_db") as m_rec,
+        patch(f"{_VALIDATION}.run_sysbench_measurement", side_effect=fake_runner) as m_bench,
+        patch(f"{_VALIDATION}.apply_knobs", return_value=_apply_results()),
+        patch(f"{_VALIDATION}.verify_active_knobs", return_value=_verify()),
+        patch(f"{_VALIDATION}.snapshot_settings", side_effect=_settings_seq()),
+        patch(f"{_VALIDATION}.write_artifact", return_value="/tmp/artifact.json"),
+        patch(f"{_VALIDATION}.stop_staging_db", return_value=(True, "stopped")),
+        patch(f"{_VALIDATION}._collect_pg_write_stats", return_value={}),
+    ):
+        validate_plan(
+            **_call_kwargs(budget, profile, plan),
+            apply_mode=ApplyMode.DYNAMIC,
+            snapshot=registry,
+        )
+
+    assert registry.images() == []
+    assert [c.kwargs["prepare"] for c in m_bench.call_args_list] == [
+        True,
+        True,
+        True,
+    ]
+    m_rec.assert_not_called()

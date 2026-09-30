@@ -28,6 +28,7 @@ from src.knob_tuner.contracts import (
     KnobScope,
     ResourceBudget,
     RunManifest,
+    SysbenchProfile,
     TuningStatus,
 )
 from src.knob_tuner.sub_agents.db_inspector.agent import create_db_inspector_agent
@@ -37,7 +38,10 @@ from src.knob_tuner.sub_agents.knob_recommender.agent import (
 from src.knob_tuner.tools.benchmark_tools import derive_screen_profile
 from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
 from src.knob_tuner.tools.db_tools import apply_knobs, is_noop_value
-from src.knob_tuner.tools.docker_tools import resolve_docker_image
+from src.knob_tuner.tools.docker_tools import (
+    cleanup_snapshot_image,
+    resolve_docker_image,
+)
 from src.knob_tuner.tools.knob_scope import fetch_pg_settings_context
 from src.knob_tuner.tools.knobs import (
     build_plan,
@@ -49,7 +53,7 @@ from src.knob_tuner.tools.knobs import (
 from src.knob_tuner.tools.progress import make_progress_callback
 from src.knob_tuner.tools.run_artifacts import application_code_hash, write_artifact
 from src.knob_tuner.tools.stats import estimate_multi_fidelity, welch_delta
-from src.knob_tuner.tools.validation import validate_plan
+from src.knob_tuner.tools.validation import SnapshotRegistry, validate_plan
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
@@ -332,14 +336,49 @@ def make_tune_loop(recommender_node: Any, validator: Any):
             + ")"
         )
 
-        def _validate(plan: KnobPlan, reps: int, attempt: int) -> dict[str, Any]:
-            run_profile = screen_profile.model_copy(update={"repetitions": reps})
+        # Time-fidelity: the screening pass measures a shorter window than the
+        # full confirmation so a rejected candidate is failed faster. Both share
+        # the same dataset size, so the prepared-dataset snapshot serves both.
+        screen_seconds = int(state.get("screen_measurement_seconds", 10) or 10)
+        screen_warmup = int(state.get("screen_warmup_seconds", 2) or 2)
+        screen_run_profile = screen_profile.model_copy(
+            update={
+                "measurement_seconds": max(
+                    1, min(screen_seconds, screen_profile.measurement_seconds)
+                ),
+                "warmup_seconds": max(
+                    0, min(screen_warmup, screen_profile.warmup_seconds)
+                ),
+            }
+        )
+        confirm_run_profile = screen_profile
+
+        # One prepared-dataset snapshot per dataset profile, reused by every
+        # screening/confirmation pass in this run; deleted before the run ends.
+        snapshots = SnapshotRegistry()
+
+        def _cleanup_snapshots() -> None:
+            for image in snapshots.images():
+                try:
+                    cleanup_snapshot_image(image)
+                except Exception:
+                    pass
+
+        def _validate(
+            plan: KnobPlan,
+            reps: int,
+            attempt: int,
+            *,
+            run_profile: SysbenchProfile,
+            reversal: bool,
+        ) -> dict[str, Any]:
+            profile_for_run = run_profile.model_copy(update={"repetitions": reps})
             result = validator(
                 run_id=run_id,
                 run_dir=run_dir,
                 plan=plan,
                 budget=budget,
-                profile=run_profile,
+                profile=profile_for_run,
                 db_type=db_type,
                 db_version=db_version,
                 database=database,
@@ -351,6 +390,8 @@ def make_tune_loop(recommender_node: Any, validator: Any):
                 attempt=attempt,
                 benchmark_kind=benchmark_kind,
                 progress=progress,
+                snapshot=snapshots,
+                reversal=reversal,
             )
             return result or {}
 
@@ -423,11 +464,14 @@ def make_tune_loop(recommender_node: Any, validator: Any):
             screen_repetitions=screen_reps,
             confirm_repetitions=confirm_reps,
             minimum_seconds=min_seconds,
+            screen_seconds=float(screen_run_profile.measurement_seconds),
+            confirm_seconds=float(confirm_run_profile.measurement_seconds),
         )
         multi_fidelity = bool(gate["enabled"])
         screen_reps_used = screen_reps if multi_fidelity else confirm_reps
         progress(
-            f"screening {len(candidates)} candidate(s) at {screen_reps_used} rep(s); "
+            f"screening {len(candidates)} candidate(s) at {screen_reps_used} rep(s) "
+            f"× {screen_run_profile.measurement_seconds}s; "
             f"multi-fidelity={'on' if multi_fidelity else 'off'} "
             f"(est. saving {gate['estimated_saving_seconds']}s)"
         )
@@ -436,7 +480,13 @@ def make_tune_loop(recommender_node: Any, validator: Any):
             for cand in candidates:
                 plan = cand["plan"]
                 t0 = time.monotonic()
-                result = _validate(plan, screen_reps_used, len(archive) + 1)
+                result = _validate(
+                    plan,
+                    screen_reps_used,
+                    len(archive) + 1,
+                    run_profile=screen_run_profile,
+                    reversal=False,
+                )
                 stats = _screen_stats(result)
                 cand["screen_result"] = result
                 cand["screen_stats"] = stats
@@ -496,7 +546,13 @@ def make_tune_loop(recommender_node: Any, validator: Any):
                     # reusing the screening result would leave no independent
                     # evidence for promotion.
                     t0 = time.monotonic()
-                    result = _validate(plan, reps, len(archive) + 1)
+                    result = _validate(
+                        plan,
+                        reps,
+                        len(archive) + 1,
+                        run_profile=confirm_run_profile,
+                        reversal=True,
+                    )
                     stats = _screen_stats(result)
                     wall = round(time.monotonic() - t0, 3)
                     cand["confirm_result"] = result
@@ -606,6 +662,15 @@ def make_tune_loop(recommender_node: Any, validator: Any):
                 ),
             }
 
+        archive_payload["snapshot_images"] = snapshots.images()
+        archive_payload["screen_measurement_seconds"] = (
+            screen_run_profile.measurement_seconds
+        )
+        archive_payload["confirm_measurement_seconds"] = (
+            confirm_run_profile.measurement_seconds
+        )
+        archive_payload["screen_reversal"] = False
+
         last_reasons = [
             str(r)
             for entry in archive
@@ -617,6 +682,8 @@ def make_tune_loop(recommender_node: Any, validator: Any):
                 write_artifact(run_dir, "candidate-archive", archive_payload)
             except Exception:
                 pass
+
+        _cleanup_snapshots()
 
         attestation = (
             (winner.get("confirm_result") or {}).get("attestation") if winner else None

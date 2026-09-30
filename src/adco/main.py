@@ -151,6 +151,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--screen-seconds",
+        type=int,
+        default=10,
+        help="Measured seconds per screening repetition (default: 10)",
+    )
+    p.add_argument(
+        "--screen-warmup-seconds",
+        type=int,
+        default=2,
+        help="Warmup seconds for screening (default: 2)",
+    )
+    p.add_argument(
         "--screening-benchmark",
         choices=["sysbench", "pgbench"],
         default="sysbench",
@@ -223,6 +235,8 @@ async def run_pipeline(
     screen_total_rows: int = 0,
     screen_max_rows: int = 5_000_000,
     confirm_repetitions: int = 5,
+    screen_measurement_seconds: int = 10,
+    screen_warmup_seconds: int = 2,
     screening_benchmark: str = "sysbench",
     workload_hint: str = "",
 ) -> dict[str, Any]:
@@ -322,6 +336,8 @@ async def run_pipeline(
             tuner_extra_state["screen_total_rows"] = screen_total_rows
         tuner_extra_state["screen_max_rows"] = screen_max_rows
         tuner_extra_state["confirm_repetitions"] = confirm_repetitions
+        tuner_extra_state["screen_measurement_seconds"] = screen_measurement_seconds
+        tuner_extra_state["screen_warmup_seconds"] = screen_warmup_seconds
         tuner_extra_state["screening_benchmark"] = screening_benchmark
         if workload_hint:
             tuner_extra_state["workload_hint"] = workload_hint
@@ -439,6 +455,8 @@ def main() -> None:
                 screen_total_rows=getattr(args, "screen_total_rows", 0),
                 screen_max_rows=getattr(args, "screen_max_rows", 5_000_000),
                 confirm_repetitions=getattr(args, "confirm_repetitions", 5),
+                screen_measurement_seconds=getattr(args, "screen_seconds", 10),
+                screen_warmup_seconds=getattr(args, "screen_warmup_seconds", 2),
                 screening_benchmark=getattr(args, "screening_benchmark", "sysbench"),
                 workload_hint=getattr(args, "workload_hint", ""),
             )

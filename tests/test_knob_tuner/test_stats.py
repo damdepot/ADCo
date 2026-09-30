@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.knob_tuner.tools.stats import t_crit, welch_delta
+from src.knob_tuner.tools.stats import estimate_multi_fidelity, t_crit, welch_delta
 
 
 def test_welch_delta_reports_sample_counts_and_sufficiency():
@@ -67,3 +67,65 @@ def test_welch_delta_zero_spread_zero_delta_has_no_evidence():
 )
 def test_t_crit_truncates_and_floors_to_tabulated_df(df, expected):
     assert t_crit(df) == expected
+
+
+def test_estimate_multi_fidelity_defaults_match_measurement_seconds():
+    stats = estimate_multi_fidelity(
+        n_candidates=4,
+        n_confirm=2,
+        measurement_seconds=30,
+        screen_repetitions=3,
+        confirm_repetitions=5,
+        minimum_seconds=300,
+    )
+    assert stats["screen_seconds"] == 30.0
+    assert stats["confirm_seconds"] == 30.0
+    # Defaults reproduce the pre-existing formula: -60s, disabled.
+    assert stats["estimated_saving_seconds"] == -60.0
+    assert stats["enabled"] is False
+
+
+def test_estimate_multi_fidelity_shorter_screen_increases_saving():
+    kwargs = dict(
+        n_candidates=4,
+        n_confirm=1,
+        measurement_seconds=30,
+        screen_repetitions=3,
+        confirm_repetitions=10,
+        minimum_seconds=300,
+    )
+    default = estimate_multi_fidelity(**kwargs)
+    shorter = estimate_multi_fidelity(**kwargs, screen_seconds=10, confirm_seconds=30)
+    assert shorter["screen_seconds"] == 10.0
+    assert shorter["confirm_seconds"] == 30.0
+    assert shorter["estimated_saving_seconds"] > default["estimated_saving_seconds"]
+    assert default["estimated_saving_seconds"] == 540.0
+    assert shorter["estimated_saving_seconds"] == 780.0
+    assert shorter["enabled"] is True
+
+
+def test_estimate_multi_fidelity_enabled_boundary():
+    base = dict(
+        n_candidates=5,
+        n_confirm=1,
+        measurement_seconds=100,
+        screen_repetitions=1,
+        confirm_repetitions=1,
+        screen_seconds=60,
+        confirm_seconds=100,
+    )
+    # full=500, multi=5*60 + 1*100 = 400 -> saving=100s, pct=20.0.
+    at_boundary = estimate_multi_fidelity(**base, minimum_seconds=100)
+    assert at_boundary["estimated_saving_pct"] == 20.0
+    assert at_boundary["estimated_saving_seconds"] == 100.0
+    assert at_boundary["enabled"] is True
+
+    # A minimum one second higher rejects the same run.
+    assert estimate_multi_fidelity(**base, minimum_seconds=101)["enabled"] is False
+
+    # 19% saving fails the percentage gate even with enough absolute seconds.
+    below_pct = estimate_multi_fidelity(
+        **{**base, "screen_seconds": 61}, minimum_seconds=0
+    )
+    assert below_pct["estimated_saving_pct"] < 20.0
+    assert below_pct["enabled"] is False

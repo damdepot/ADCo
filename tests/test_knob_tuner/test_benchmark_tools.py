@@ -975,3 +975,101 @@ def test_pgbench_script_mutation_detection(tmp_path):
     assert _pgbench_script_mutates(str(mutating)) is True
     # Unreadable script -> assume mutating (conservative).
     assert _pgbench_script_mutates(str(tmp_path / "missing.pgb")) is True
+
+
+def test_on_prepared_fires_after_prepare_and_settle(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(
+        tables=1,
+        rows_per_table=100,
+        threads=1,
+        warmup_seconds=0,
+        measurement_seconds=1,
+        repetitions=1,
+        seed=1,
+    )
+    order: list[str] = []
+    side_effect, _ = _make_runner()
+
+    def fake_settle(cfg, emit):
+        order.append("settle")
+
+    with (
+        patch(DB_CONN_PATCH),
+        patch(RUN_PATCH, side_effect=side_effect),
+        patch(
+            "src.knob_tuner.tools.benchmark_tools._settle_after_load",
+            side_effect=fake_settle,
+        ),
+    ):
+        result = run_sysbench_measurement(
+            mock_db_config_pg,
+            profile,
+            workdir=str(tmp_path),
+            on_prepared=lambda: order.append("snapshot"),
+        )
+
+    assert result.status == "ok"
+    assert order == ["settle", "snapshot"]
+
+
+def test_on_prepared_skipped_when_not_preparing(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(
+        tables=1,
+        rows_per_table=100,
+        threads=1,
+        warmup_seconds=0,
+        measurement_seconds=1,
+        repetitions=1,
+        seed=1,
+    )
+    calls: list[int] = []
+    side_effect, _ = _make_runner()
+
+    with (
+        patch(DB_CONN_PATCH),
+        patch(RUN_PATCH, side_effect=side_effect),
+        patch(
+            "src.knob_tuner.tools.benchmark_tools._settle_after_load"
+        ) as m_settle,
+    ):
+        result = run_sysbench_measurement(
+            mock_db_config_pg,
+            profile,
+            workdir=str(tmp_path),
+            prepare=False,
+            on_prepared=lambda: calls.append(1),
+        )
+
+    assert result.status == "ok"
+    m_settle.assert_not_called()
+    assert calls == []
+
+
+def test_on_prepared_failure_is_not_fatal(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(
+        tables=1,
+        rows_per_table=100,
+        threads=1,
+        warmup_seconds=0,
+        measurement_seconds=1,
+        repetitions=1,
+        seed=1,
+    )
+    side_effect, _ = _make_runner()
+
+    def boom():
+        raise RuntimeError("commit failed")
+
+    with (
+        patch(DB_CONN_PATCH),
+        patch(RUN_PATCH, side_effect=side_effect),
+        patch("src.knob_tuner.tools.benchmark_tools._settle_after_load"),
+    ):
+        result = run_sysbench_measurement(
+            mock_db_config_pg,
+            profile,
+            workdir=str(tmp_path),
+            on_prepared=boom,
+        )
+
+    assert result.status == "ok"

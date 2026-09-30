@@ -9,6 +9,7 @@ expected failure modes; every outcome is reported through a structured dict.
 
 from __future__ import annotations
 
+import re
 import time
 from statistics import median
 from typing import Any, Callable
@@ -35,7 +36,9 @@ from src.knob_tuner.tools.db_tools import (
     verify_active_knobs,
 )
 from src.knob_tuner.tools.docker_tools import (
+    commit_staging_db,
     get_container_host_port,
+    recreate_docker_db,
     restart_docker_db,
     start_staging_db,
     stop_staging_db,
@@ -45,6 +48,51 @@ from src.knob_tuner.tools.run_artifacts import write_artifact
 _RESTART_MODES = (ApplyMode.PERSIST_STATIC,)
 
 _POSTGRES_TYPES = ("postgres", "postgresql")
+
+
+class SnapshotRegistry:
+    """Run-scoped cache of prepared-dataset snapshot images.
+
+    One image per ``(db_type, db_version, tables, rows_per_table)`` serves every
+    validation pass in a run. The first pass that loads a dataset snapshots it;
+    later passes boot from the image and skip the multi-million-row prepare, and
+    a mutating workload's arms recreate from it instead of re-preparing. The
+    caller (workflow) owns the lifecycle and deletes the images at run end.
+    """
+
+    def __init__(self) -> None:
+        self._images: dict[str, str] = {}
+
+    @staticmethod
+    def key_for(
+        db_type: str,
+        db_version: str | None,
+        tables: int,
+        rows_per_table: int,
+    ) -> str:
+        version = str(db_version or "").strip()
+        return f"{str(db_type).strip().lower()}:{version}:{int(tables)}x{int(rows_per_table)}"
+
+    def get(self, key: str) -> str | None:
+        return self._images.get(key)
+
+    def register(self, key: str, image: str) -> None:
+        if key and image:
+            self._images[key] = image
+
+    def images(self) -> list[str]:
+        return list(self._images.values())
+
+
+def _snapshot_image_name(
+    run_id: str, tables: int, rows_per_table: int
+) -> str:
+    """Build a Docker-safe snapshot image tag for one dataset profile."""
+    safe = re.sub(r"[^a-z0-9_.-]", "-", str(run_id or "run").lower()).strip("-")
+    if not safe:
+        safe = "run"
+    return f"adco-staging-ready:{safe}-{int(tables)}x{int(rows_per_table)}"
+
 
 _WAL_METRICS = (
     "wal_records",
@@ -478,6 +526,8 @@ def validate_plan(
     reuse_dataset: bool = True,
     benchmark_kind: str = "sysbench",
     progress: Callable[[str], None] | None = None,
+    snapshot: SnapshotRegistry | None = None,
+    reversal: bool = True,
 ) -> dict[str, Any]:
     """Validate a knob plan end-to-end against an isolated staging database.
 
@@ -501,6 +551,13 @@ def validate_plan(
             read-only benchmark shares one prepared dataset across arms.
         benchmark_kind: Measurement runner to use, ``"sysbench"`` (default) or
             ``"pgbench"`` (the sort/hash analytical workload).
+        snapshot: Optional run-scoped prepared-dataset snapshot registry. When
+            provided, the first pass snapshots the cleanly prepared dataset and
+            later passes boot from it, skipping the (multi-million-row) prepare
+            and settle. Mutating arms recreate the staging container from the
+            snapshot and re-apply their knobs instead of re-preparing.
+        reversal: When True (default) measure the A/B/A baseline reversal. Set
+            False for cheap screening passes; confirmation keeps the reversal.
 
     Returns:
         A structured dict with ``status``, ``attestation``, ``paired``,
@@ -508,6 +565,8 @@ def validate_plan(
         ``baseline_reversal`` and ``ignored_errors``.
     """
     emit = progress or (lambda _message: None)
+    # Preserve the request before the local A2 measurement variable shadows it.
+    reversal_enabled = bool(reversal)
 
     if dry_run:
         emit("dry-run: validation skipped")
@@ -528,9 +587,23 @@ def validate_plan(
     # bloat. Re-preparing a multi-million-row dataset is the dominant gate cost,
     # so only do it when the workload actually mutates the data.
     mutates_dataset = benchmark_mutates_dataset(benchmark_kind, profile)
+    # Snapshotting relies on PGDATA living on the container's writable layer
+    # (see docker_tools.start_staging_db); only PostgreSQL is wired for that, so
+    # other engines keep the plain re-prepare behavior.
+    snapshot_supported = str(db_type).strip().lower() in _POSTGRES_TYPES
+    snapshot_key = (
+        SnapshotRegistry.key_for(
+            db_type, db_version, profile.tables, profile.rows_per_table
+        )
+        if snapshot is not None and snapshot_supported
+        else ""
+    )
+    snapshot_image = snapshot.get(snapshot_key) if snapshot is not None and snapshot_key else None
     emit(
         f"benchmark runner: {label} "
-        f"(re-prepare per arm: {'yes' if mutates_dataset else 'no'})"
+        f"(re-prepare per arm: {'yes' if mutates_dataset else 'no'}"
+        + (", snapshot: reuse" if snapshot_image else "")
+        + ")"
     )
 
     reasons: list[str] = []
@@ -558,6 +631,44 @@ def validate_plan(
         "reason": "baseline reversal was not attempted",
     }
     ignored_errors: dict[str, Any] | None = None
+    wal_baseline_after: dict[str, float] = {}
+
+    def _restore_from_snapshot(reason: str) -> bool:
+        """Recreate the staging container from the current snapshot image.
+
+        Returns True when a fresh container was started from the snapshot;
+        False when no snapshot is available or the recreate failed, in which
+        case the caller falls back to re-preparing the dataset in place.
+        """
+        nonlocal container, staging_cfg
+        image = (
+            snapshot.get(snapshot_key)
+            if snapshot is not None and snapshot_key
+            else None
+        )
+        if not image or not container:
+            return False
+        emit(f"restoring prepared dataset from snapshot ({reason})...")
+        t0 = time.monotonic()
+        ok, new_container, new_cfg = recreate_docker_db(
+            container,
+            db_type=db_type,
+            db_version=db_version,
+            database=database,
+            budget=budget,
+            base_image=image,
+        )
+        if ok and new_cfg is not None:
+            container = new_container
+            staging_cfg = new_cfg
+            timings["restore_seconds"] = round(
+                timings.get("restore_seconds", 0.0)
+                + (time.monotonic() - t0),
+                3,
+            )
+            return True
+        emit(f"snapshot restore failed, re-preparing instead: {new_cfg}")
+        return False
 
     try:
         # 1. Provision the isolated staging container (also verifies resources).
@@ -572,6 +683,7 @@ def validate_plan(
                 db_version=db_version,
                 budget=budget,
                 database=database,
+                base_image=snapshot_image,
             )
             timings["provision_seconds"] = round(time.monotonic() - t0, 3)
         except Exception as e:
@@ -595,18 +707,58 @@ def validate_plan(
         # 2. Snapshot settings before any mutation.
         settings_before = snapshot_settings(staging_cfg, names)
 
-        # 3. Baseline measurement.
+        # 3. Baseline measurement. When a snapshot is reused the dataset is
+        #    already loaded and settled, so the prepare/settle is skipped; when
+        #    loading fresh, the cleanly prepared dataset is snapshotted for the
+        #    rest of the run via the on_prepared hook.
+        baseline_on_prepared: Callable[[], None] | None = None
+        if snapshot is not None and snapshot_key and not snapshot_image:
+            image_name = _snapshot_image_name(
+                run_id, profile.tables, profile.rows_per_table
+            )
+            baseline_container = container
+
+            def baseline_on_prepared() -> None:
+                ok, message = commit_staging_db(baseline_container, image_name)
+                if ok:
+                    snapshot.register(snapshot_key, image_name)
+                    emit(f"snapshot ready: {image_name}")
+                else:
+                    emit(
+                        "snapshot commit failed (continuing without "
+                        f"snapshot): {message}"
+                    )
+
         emit("running baseline measurement...")
         wal_before = _collect_pg_write_stats(staging_cfg)
         t0 = time.monotonic()
         baseline = runner(
-            staging_cfg, profile, workdir, progress=emit, prepare=True
+            staging_cfg,
+            profile,
+            workdir,
+            progress=emit,
+            prepare=not bool(snapshot_image),
+            on_prepared=baseline_on_prepared,
         )
         timings["baseline_seconds"] = round(time.monotonic() - t0, 3)
         timings["prepare_seconds"] = baseline.prepare_seconds
         artifacts["baseline"] = write_artifact(
             run_dir, f"{label}-baseline", baseline.model_dump()
         )
+        # Baseline window must be measured on one container before any restore.
+        wal_baseline_after = _collect_pg_write_stats(staging_cfg)
+
+        # 3b. A mutating workload must start the tuned arm from the same clean
+        #     dataset the baseline saw. Restore it from the snapshot instead of
+        #     re-running the (multi-minute) prepare in place.
+        tuned_restored = False
+        if (
+            mutates_dataset
+            and snapshot is not None
+            and snapshot_key
+            and snapshot.get(snapshot_key)
+        ):
+            tuned_restored = _restore_from_snapshot("tuned arm")
 
         # 4. Apply the plan using the requested mode.
         raw_knobs = [
@@ -665,14 +817,18 @@ def validate_plan(
             {"settings": settings_after, "verify": verification},
         )
 
-        # 7. Tuned measurement. The dataset is re-prepared here only when the
-        #    workload mutates it; for a read-only benchmark the candidate runs
-        #    against the exact dataset the baseline used.
+        # 7. Tuned measurement. A mutating workload restores the dataset from
+        #    the snapshot above (or re-prepares on fallback); a read-only
+        #    benchmark runs against the exact dataset the baseline used.
         emit("running tuned measurement...")
         wal_tuned_before = _collect_pg_write_stats(staging_cfg)
         t0 = time.monotonic()
         tuned = runner(
-            staging_cfg, profile, workdir, progress=emit, prepare=mutates_dataset
+            staging_cfg,
+            profile,
+            workdir,
+            progress=emit,
+            prepare=(mutates_dataset and not tuned_restored),
         )
         timings["measurement_seconds"] = round(time.monotonic() - t0, 3)
         artifacts["tuned"] = write_artifact(
@@ -681,11 +837,12 @@ def validate_plan(
 
         # 7b. Write-path evidence: baseline window vs tuned window vs net effect.
         wal_after = _collect_pg_write_stats(staging_cfg)
-        baseline_window = _snapshot_delta(wal_before, wal_tuned_before)
+        baseline_window = _snapshot_delta(wal_before, wal_baseline_after)
         tuned_window = _snapshot_delta(wal_tuned_before, wal_after)
         wal_evidence = {
             "snapshots": {
                 "before": wal_before,
+                "baseline_after": wal_baseline_after,
                 "tuned_before": wal_tuned_before,
                 "after": wal_after,
             },
@@ -705,8 +862,21 @@ def validate_plan(
         #    instead of only in a reason string that can be overwritten later.
         pooled_baseline = baseline
         reversal: SysbenchMeasurement | None = None
-        if settings_before:
+        if not reversal_enabled:
+            baseline_reversal = {
+                "measured": False,
+                "reason": "baseline reversal disabled for this pass",
+            }
+        elif settings_before:
             try:
+                reversal_restored = False
+                if (
+                    mutates_dataset
+                    and snapshot is not None
+                    and snapshot_key
+                    and snapshot.get(snapshot_key)
+                ):
+                    reversal_restored = _restore_from_snapshot("baseline reversal")
                 reversal = _measure_baseline_reversal(
                     run_dir=run_dir,
                     plan=plan,
@@ -718,7 +888,7 @@ def validate_plan(
                     settings_before=settings_before,
                     runner=runner,
                     benchmark_kind=benchmark_kind,
-                    prepare=mutates_dataset,
+                    prepare=(mutates_dataset and not reversal_restored),
                     emit=emit,
                     timings=timings,
                     artifacts=artifacts,

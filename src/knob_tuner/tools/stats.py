@@ -120,18 +120,26 @@ def estimate_multi_fidelity(
     screen_repetitions: int,
     confirm_repetitions: int,
     minimum_seconds: float = 300.0,
+    screen_seconds: float | None = None,
+    confirm_seconds: float | None = None,
 ) -> dict[str, float | bool]:
     """Decide whether cheap screening + fresh confirmation actually saves time.
 
     ``full_seconds`` is every candidate measured at the full sample count;
     ``multi_seconds`` is every candidate screened cheaply plus a fresh
     confirmation for ``n_confirm`` of them. Per-arm prepare/warmup costs are
-    assumed roughly equal in both arms, so they cancel.
+    assumed roughly equal in both arms, so they cancel. ``screen_seconds`` /
+    ``confirm_seconds`` default to ``measurement_seconds`` so callers that do
+    not shorten the screening run are unchanged.
     """
-    full_seconds = n_candidates * confirm_repetitions * measurement_seconds
+    screen_seconds = measurement_seconds if screen_seconds is None else screen_seconds
+    confirm_seconds = (
+        measurement_seconds if confirm_seconds is None else confirm_seconds
+    )
+    full_seconds = n_candidates * confirm_repetitions * confirm_seconds
     multi_seconds = (
-        n_candidates * screen_repetitions * measurement_seconds
-        + n_confirm * confirm_repetitions * measurement_seconds
+        n_candidates * screen_repetitions * screen_seconds
+        + n_confirm * confirm_repetitions * confirm_seconds
     )
     saving_seconds = full_seconds - multi_seconds
     saving_pct = (saving_seconds / full_seconds * 100.0) if full_seconds > 0 else 0.0
@@ -141,6 +149,8 @@ def estimate_multi_fidelity(
         "estimated_saving_pct": round(saving_pct, 3),
         "estimated_saving_seconds": round(saving_seconds, 1),
         "configured_minimum_seconds": float(minimum_seconds),
+        "screen_seconds": float(screen_seconds),
+        "confirm_seconds": float(confirm_seconds),
     }
 
 
@@ -167,4 +177,14 @@ if __name__ == "__main__":  # ponytail: one runnable self-check, no framework
         screen_repetitions=3, confirm_repetitions=10, minimum_seconds=300,
     )
     assert wide["estimated_saving_seconds"] == 540.0 and wide["enabled"] is True
-    print("stats self-check ok:", noisy, narrow, wide)
+    assert narrow["screen_seconds"] == narrow["confirm_seconds"] == 30.0
+    shorter = estimate_multi_fidelity(
+        n_candidates=4, n_confirm=1, measurement_seconds=30,
+        screen_repetitions=3, confirm_repetitions=10, minimum_seconds=300,
+        screen_seconds=10, confirm_seconds=30,
+    )
+    assert shorter["screen_seconds"] == 10.0 and shorter["confirm_seconds"] == 30.0
+    assert shorter["estimated_saving_seconds"] == 780.0
+    assert shorter["estimated_saving_seconds"] > wide["estimated_saving_seconds"]
+    assert shorter["enabled"] is True
+    print("stats self-check ok:", noisy, narrow, wide, shorter)

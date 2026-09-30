@@ -31,6 +31,7 @@ from src.knob_tuner.main import (
     run_pipeline,
 )
 from src.knob_tuner.tools.db_connector import DBConfig
+from src.knob_tuner.tools.validation import SnapshotRegistry
 from src.knob_tuner.workflow import (
     _recommendation_instruction,
     _resolve_db_config,
@@ -957,6 +958,8 @@ def test_cli_parser_defaults_with_required_resources():
     assert args.multi_fidelity_min_seconds == 300.0
     assert args.screen_total_rows == 0
     assert args.screen_max_rows == 5_000_000
+    assert args.screen_seconds == 10
+    assert args.screen_warmup_seconds == 2
     assert args.rand_type is None
     assert args.durability_profile == "strict"
     assert args.screening_benchmark == "sysbench"
@@ -979,6 +982,8 @@ def test_cli_parser_custom_args():
             "-v",
             "--no-cleanup-orphans",
             "--buffer-time", "1.5",
+            "--screen-seconds", "6",
+            "--screen-warmup-seconds", "1",
             "--screening-benchmark", "pgbench",
             "--workload-hint", "analytical sort spills",
         ]
@@ -993,6 +998,8 @@ def test_cli_parser_custom_args():
     assert args.verbose is True
     assert args.cleanup_orphans is False
     assert args.buffer_time == 1.5
+    assert args.screen_seconds == 6
+    assert args.screen_warmup_seconds == 1
     assert args.screening_benchmark == "pgbench"
     assert args.workload_hint == "analytical sort spills"
 
@@ -1080,6 +1087,27 @@ def test_build_initial_state_without_config_file():
     assert "db_config" not in state
     assert state["screening_benchmark"] == "sysbench"
     assert state["workload_hint"] == ""
+    assert state["screen_measurement_seconds"] == 10
+    assert state["screen_warmup_seconds"] == 2
+
+
+def test_build_initial_state_threads_screen_measurement_settings():
+    state = build_initial_state(
+        target="/tmp/my_app",
+        db_type="postgres",
+        db_name="custom_db",
+        budget=ResourceBudget(cpu_cores=2, memory_gb=4.0),
+        db_config_path="/tmp/non_existent.config",
+        production_db=False,
+        log_file="/tmp/log.log",
+        knob_path="/tmp/knobs",
+        output_path=None,
+        dry_run=False,
+        screen_measurement_seconds=7,
+        screen_warmup_seconds=3,
+    )
+    assert state["screen_measurement_seconds"] == 7
+    assert state["screen_warmup_seconds"] == 3
 
 
 def test_build_initial_state_with_valid_config(sample_ini_path):
@@ -1574,3 +1602,40 @@ def test_run_pipeline_exception_triggers_cleanup(tmp_path: Path):
                 )
             )
         mock_cleanup.assert_called_once()
+
+
+def test_tune_loop_screen_is_time_fidelity_and_reversal_disabled():
+    calls: list[dict] = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        snapshot = kwargs.get("snapshot")
+        if snapshot is not None and not snapshot.images():
+            snapshot.register("key", "adco-staging-ready:test")
+        return {
+            "status": "PASS",
+            "attestation": {"run_id": "run-1"},
+            "paired": _paired([1.0, 1.0, 1.0], [8.0, 8.0, 8.0]),
+            "reasons": [],
+        }
+
+    recommender = _recommender(
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
+    )
+    ctx = _FakeContext(_base_loop_state())
+    with patch("src.knob_tuner.workflow.cleanup_snapshot_image") as m_clean:
+        asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+
+    assert len(calls) >= 2
+    screen, confirm = calls[0], calls[-1]
+    # Screening runs a shorter window without the A/B/A reversal; confirmation
+    # keeps the full window and the reversal.
+    assert screen["reversal"] is False
+    assert confirm["reversal"] is True
+    assert screen["profile"].measurement_seconds == 10
+    assert screen["profile"].warmup_seconds == 2
+    assert confirm["profile"].measurement_seconds == 30
+    assert isinstance(screen["snapshot"], SnapshotRegistry)
+    assert screen["snapshot"] is confirm["snapshot"]
+    # The run-scoped snapshot is deleted before the loop returns.
+    m_clean.assert_any_call("adco-staging-ready:test")

@@ -305,6 +305,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--screen-seconds",
+        type=int,
+        default=10,
+        help="Measured seconds per screening repetition (default: 10)",
+    )
+    parser.add_argument(
+        "--screen-warmup-seconds",
+        type=int,
+        default=2,
+        help="Warmup seconds for screening (default: 2)",
+    )
+    parser.add_argument(
         "--workload-hint",
         default="",
         help=(
@@ -431,6 +443,8 @@ def build_initial_state(
     screen_total_rows: int = 0,
     screen_max_rows: int = 5_000_000,
     confirm_repetitions: int = 5,
+    screen_measurement_seconds: int = 10,
+    screen_warmup_seconds: int = 2,
     durability_profile: str = "strict",
     screening_benchmark: str = "sysbench",
     workload_hint: str = "",
@@ -467,6 +481,8 @@ def build_initial_state(
         "screen_total_rows": int(screen_total_rows),
         "screen_max_rows": int(screen_max_rows),
         "confirm_repetitions": int(confirm_repetitions),
+        "screen_measurement_seconds": int(screen_measurement_seconds),
+        "screen_warmup_seconds": int(screen_warmup_seconds),
         "durability_profile": durability_profile,
         "screening_benchmark": str(screening_benchmark or "sysbench"),
         "workload_hint": str(workload_hint or ""),
@@ -623,6 +639,8 @@ async def run_pipeline(
     screen_total_rows: int = 0,
     screen_max_rows: int = 5_000_000,
     confirm_repetitions: int = 5,
+    screen_measurement_seconds: int = 10,
+    screen_warmup_seconds: int = 2,
     rand_type: str | None = None,
     durability_profile: str = "strict",
     screening_benchmark: str = "sysbench",
@@ -684,6 +702,8 @@ async def run_pipeline(
         screen_total_rows=screen_total_rows,
         screen_max_rows=screen_max_rows,
         confirm_repetitions=confirm_repetitions,
+        screen_measurement_seconds=screen_measurement_seconds,
+        screen_warmup_seconds=screen_warmup_seconds,
         durability_profile=durability_profile,
         screening_benchmark=screening_benchmark,
         workload_hint=workload_hint,
@@ -864,6 +884,8 @@ def main() -> None:
                 screen_total_rows=getattr(args, "screen_total_rows", 0),
                 screen_max_rows=getattr(args, "screen_max_rows", 5_000_000),
                 confirm_repetitions=getattr(args, "confirm_repetitions", 5),
+                screen_measurement_seconds=getattr(args, "screen_seconds", 10),
+                screen_warmup_seconds=getattr(args, "screen_warmup_seconds", 2),
                 rand_type=getattr(args, "rand_type", None),
                 durability_profile=getattr(args, "durability_profile", "strict"),
                 screening_benchmark=getattr(args, "screening_benchmark", "sysbench"),
