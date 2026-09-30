@@ -45,6 +45,7 @@ from src.knob_tuner.tools.docker_tools import (
 )
 from src.knob_tuner.tools.knobs import coerce_apply_mode
 from src.knob_tuner.tools.run_artifacts import write_artifact
+from src.knob_tuner.tools.stats import futility_stop
 
 _RESTART_MODES = (ApplyMode.PERSIST_STATIC,)
 
@@ -274,6 +275,7 @@ def _finalize(
     wal_evidence: dict[str, Any] | None = None,
     baseline_reversal: dict[str, Any] | None = None,
     ignored_errors: dict[str, Any] | None = None,
+    stopped_early: bool = False,
 ) -> dict[str, Any]:
     """Build the JSON-serializable return payload (except the DBConfig)."""
     return {
@@ -286,6 +288,7 @@ def _finalize(
         "wal_evidence": wal_evidence,
         "baseline_reversal": baseline_reversal,
         "ignored_errors": ignored_errors,
+        "stopped_early": stopped_early,
     }
 
 
@@ -501,6 +504,140 @@ def _measure_baseline_reversal(
     return reversal
 
 
+def _measure_shared_baseline(
+    *,
+    run_id: str,
+    run_dir: str,
+    budget: ResourceBudget,
+    profile: SysbenchProfile,
+    db_type: str,
+    db_version: str | None,
+    database: str,
+    runner: Callable[..., SysbenchMeasurement],
+    label: str,
+    snapshot: SnapshotRegistry | None,
+    snapshot_key: str,
+    emit: Callable[[str], None],
+    workdir: str | None = None,
+) -> dict[str, Any]:
+    """Provision, prepare, and measure the shared baseline once per run.
+
+    The cleanly prepared dataset is snapshotted (when supported) so every
+    later candidate boots from the image instead of re-preparing. Returns a
+    dict with ``status`` (``"ok"``/``"error"``), ``baseline`` (the
+    :class:`SysbenchMeasurement` or ``None``), ``reasons``, ``artifacts``,
+    ``snapshot_key`` and ``snapshot_image``.
+    """
+    reasons: list[str] = []
+    artifacts: dict[str, Any] = {}
+    timings: dict[str, float] = {}
+    container: str | None = None
+    try:
+        emit(
+            f"provisioning shared-baseline {db_type} {db_version or 'default'} "
+            f"({budget.cpu_cores} CPU / {budget.memory_gb} GB)..."
+        )
+        try:
+            t0 = time.monotonic()
+            container, staging_cfg = start_staging_db(
+                db_type=db_type,
+                db_version=db_version,
+                budget=budget,
+                database=database,
+                base_image=None,
+            )
+            timings["provision_seconds"] = round(time.monotonic() - t0, 3)
+        except Exception as e:
+            emit(f"shared baseline provisioning failed: {e}")
+            return {
+                "status": "error",
+                "baseline": None,
+                "reasons": [f"environment error: shared baseline provisioning failed: {e}"],
+                "artifacts": artifacts,
+                "snapshot_key": snapshot_key,
+                "snapshot_image": None,
+            }
+        emit(f"shared baseline staging ready on {staging_cfg.host}:{staging_cfg.port}")
+
+        if _enable_wal_io_timing(staging_cfg):
+            emit("enabled track_wal_io_timing on staging")
+
+        image_name = ""
+        baseline_container = container
+        if snapshot is not None and snapshot_key:
+            image_name = _snapshot_image_name(
+                run_id, profile.tables, profile.rows_per_table
+            )
+
+            def _on_prepared() -> None:
+                ok, message = commit_staging_db(baseline_container, image_name)
+                if ok:
+                    snapshot.register(snapshot_key, image_name)
+                    emit(f"snapshot ready: {image_name}")
+                else:
+                    emit(
+                        "snapshot commit failed (continuing without "
+                        f"snapshot): {message}"
+                    )
+
+            on_prepared = _on_prepared
+        else:
+            on_prepared = None
+
+        emit("running shared baseline measurement...")
+        t0 = time.monotonic()
+        baseline = runner(
+            staging_cfg,
+            profile,
+            workdir,
+            progress=emit,
+            prepare=True,
+            on_prepared=on_prepared,
+        )
+        timings["baseline_seconds"] = round(time.monotonic() - t0, 3)
+        timings["prepare_seconds"] = baseline.prepare_seconds
+        artifacts["timings"] = timings
+        artifacts["shared_baseline"] = write_artifact(
+            run_dir, f"{label}-shared-baseline", baseline.model_dump()
+        )
+        if baseline.status != "ok":
+            reasons.append(
+                f"shared baseline measurement status is '{baseline.status}'"
+                + (f": {baseline.error}" if baseline.error else "")
+            )
+            return {
+                "status": "error",
+                "baseline": baseline,
+                "reasons": reasons,
+                "artifacts": artifacts,
+                "snapshot_key": snapshot_key,
+                "snapshot_image": snapshot.get(snapshot_key)
+                if snapshot is not None and snapshot_key
+                else None,
+            }
+        emit(
+            f"shared baseline done: median TPS={baseline.tps:.2f} "
+            f"({len(baseline.per_run_tps)} reps)"
+        )
+        return {
+            "status": "ok",
+            "baseline": baseline,
+            "reasons": reasons,
+            "artifacts": artifacts,
+            "snapshot_key": snapshot_key,
+            "snapshot_image": snapshot.get(snapshot_key)
+            if snapshot is not None and snapshot_key
+            else None,
+        }
+    finally:
+        if container:
+            emit("tearing down shared-baseline staging container...")
+            try:
+                stop_staging_db(container)
+            except Exception:
+                pass
+
+
 def validate_plan(
     *,
     run_id: str,
@@ -520,6 +657,9 @@ def validate_plan(
     progress: Callable[[str], None] | None = None,
     snapshot: SnapshotRegistry | None = None,
     reversal: bool = True,
+    shared_baseline: SysbenchMeasurement | dict[str, Any] | None = None,
+    baseline_only: bool = False,
+    early_stop_min_reps: int | None = None,
 ) -> dict[str, Any]:
     """Validate a knob plan end-to-end against an isolated staging database.
 
@@ -550,6 +690,21 @@ def validate_plan(
             snapshot and re-apply their knobs instead of re-preparing.
         reversal: When True (default) measure the A/B/A baseline reversal. Set
             False for cheap screening passes; confirmation keeps the reversal.
+            Ignored when ``shared_baseline`` is given (no per-candidate
+            reversal; the shared baseline is measured once).
+        shared_baseline: Optional already-measured baseline
+            :class:`SysbenchMeasurement` (or its dict form) reused across
+            candidates. When given, the internal baseline and reversal are
+            skipped and ``paired`` is evaluated against it.
+        baseline_only: When True, only provision, prepare, and measure the
+            baseline (snapshotting it for later candidates); no plan is
+            applied and no tuned/reversal arms run. Returns a dict with
+            ``status`` (``"ok"``/``"error"``), ``baseline``, ``reasons``,
+            ``artifacts``, ``snapshot_key`` and ``snapshot_image``.
+        early_stop_min_reps: When set (and a shared baseline is available),
+            stop the tuned arm early for futility once this many reps ran and
+            the 95% upper bound is below zero. Winners always run the full
+            repetition count, so early stopping cannot manufacture a PASS.
 
     Returns:
         A structured dict with ``status``, ``attestation``, ``paired``,
@@ -591,6 +746,29 @@ def validate_plan(
         else ""
     )
     snapshot_image = snapshot.get(snapshot_key) if snapshot is not None and snapshot_key else None
+
+    if isinstance(shared_baseline, dict):
+        try:
+            shared_baseline = SysbenchMeasurement.model_validate(shared_baseline)
+        except Exception:
+            shared_baseline = None
+
+    if baseline_only:
+        return _measure_shared_baseline(
+            run_id=run_id,
+            run_dir=run_dir,
+            budget=budget,
+            profile=profile,
+            db_type=db_type,
+            db_version=db_version,
+            database=database,
+            runner=runner,
+            label=label,
+            snapshot=snapshot,
+            snapshot_key=snapshot_key,
+            emit=emit,
+        )
+
     emit(
         f"benchmark runner: {label} "
         f"(re-prepare per arm: {'yes' if mutates_dataset else 'no'}"
@@ -702,43 +880,59 @@ def validate_plan(
         # 3. Baseline measurement. When a snapshot is reused the dataset is
         #    already loaded and settled, so the prepare/settle is skipped; when
         #    loading fresh, the cleanly prepared dataset is snapshotted for the
-        #    rest of the run via the on_prepared hook.
+        #    rest of the run via the on_prepared hook. When a shared baseline
+        #    was measured once for the whole run, it is reused directly and no
+        #    per-candidate baseline (or reversal) runs at all.
         baseline_on_prepared: Callable[[], None] | None = None
-        if snapshot is not None and snapshot_key and not snapshot_image:
-            image_name = _snapshot_image_name(
-                run_id, profile.tables, profile.rows_per_table
+        if shared_baseline is not None:
+            baseline = shared_baseline
+            emit(
+                "reusing shared baseline "
+                f"(median TPS={baseline.tps:.2f}, "
+                f"{len(baseline.per_run_tps)} reps)"
             )
-            baseline_container = container
+            artifacts["baseline"] = write_artifact(
+                run_dir, f"{label}-baseline-shared", baseline.model_dump()
+            )
+            # No baseline window on this container; the tuned window below is
+            # compared against the shared baseline's own evidence.
+            wal_baseline_after = {}
+        else:
+            if snapshot is not None and snapshot_key and not snapshot_image:
+                image_name = _snapshot_image_name(
+                    run_id, profile.tables, profile.rows_per_table
+                )
+                baseline_container = container
 
-            def baseline_on_prepared() -> None:
-                ok, message = commit_staging_db(baseline_container, image_name)
-                if ok:
-                    snapshot.register(snapshot_key, image_name)
-                    emit(f"snapshot ready: {image_name}")
-                else:
-                    emit(
-                        "snapshot commit failed (continuing without "
-                        f"snapshot): {message}"
-                    )
+                def baseline_on_prepared() -> None:
+                    ok, message = commit_staging_db(baseline_container, image_name)
+                    if ok:
+                        snapshot.register(snapshot_key, image_name)
+                        emit(f"snapshot ready: {image_name}")
+                    else:
+                        emit(
+                            "snapshot commit failed (continuing without "
+                            f"snapshot): {message}"
+                        )
 
-        emit("running baseline measurement...")
-        wal_before = _collect_pg_write_stats(staging_cfg)
-        t0 = time.monotonic()
-        baseline = runner(
-            staging_cfg,
-            profile,
-            workdir,
-            progress=emit,
-            prepare=not bool(snapshot_image),
-            on_prepared=baseline_on_prepared,
-        )
-        timings["baseline_seconds"] = round(time.monotonic() - t0, 3)
-        timings["prepare_seconds"] = baseline.prepare_seconds
-        artifacts["baseline"] = write_artifact(
-            run_dir, f"{label}-baseline", baseline.model_dump()
-        )
-        # Baseline window must be measured on one container before any restore.
-        wal_baseline_after = _collect_pg_write_stats(staging_cfg)
+            emit("running baseline measurement...")
+            wal_before = _collect_pg_write_stats(staging_cfg)
+            t0 = time.monotonic()
+            baseline = runner(
+                staging_cfg,
+                profile,
+                workdir,
+                progress=emit,
+                prepare=not bool(snapshot_image),
+                on_prepared=baseline_on_prepared,
+            )
+            timings["baseline_seconds"] = round(time.monotonic() - t0, 3)
+            timings["prepare_seconds"] = baseline.prepare_seconds
+            artifacts["baseline"] = write_artifact(
+                run_dir, f"{label}-baseline", baseline.model_dump()
+            )
+            # Baseline window must be measured on one container before any restore.
+            wal_baseline_after = _collect_pg_write_stats(staging_cfg)
 
         # 3b. A mutating workload must start the tuned arm from the same clean
         #     dataset the baseline saw. Restore it from the snapshot instead of
@@ -811,18 +1005,49 @@ def validate_plan(
 
         # 7. Tuned measurement. A mutating workload restores the dataset from
         #    the snapshot above (or re-prepares on fallback); a read-only
-        #    benchmark runs against the exact dataset the baseline used.
+        #    benchmark runs against the exact dataset the baseline used. In
+        #    shared-baseline mode the container boots from the snapshot, so no
+        #    prepare is needed unless no snapshot image exists.
         emit("running tuned measurement...")
         wal_tuned_before = _collect_pg_write_stats(staging_cfg)
+        if shared_baseline is not None and not snapshot_image:
+            tuned_prepare = True
+        else:
+            tuned_prepare = mutates_dataset and not tuned_restored
+        on_rep_hook: Callable[[list[float]], bool] | None = None
+        stopped_early = False
+        if (
+            early_stop_min_reps is not None
+            and shared_baseline is not None
+            and list(shared_baseline.per_run_tps)
+        ):
+            shared_tps = [float(x) for x in shared_baseline.per_run_tps]
+            min_reps = max(2, int(early_stop_min_reps))
+            hook_fired: list[bool] = []
+
+            def on_rep_hook(tuned_so_far: list[float]) -> bool:
+                stop, _stats = futility_stop(shared_tps, tuned_so_far, min_reps)
+                if stop:
+                    hook_fired.append(True)
+                return stop
+
         t0 = time.monotonic()
         tuned = runner(
             staging_cfg,
             profile,
             workdir,
             progress=emit,
-            prepare=(mutates_dataset and not tuned_restored),
+            prepare=tuned_prepare,
+            on_rep=on_rep_hook,
         )
         timings["measurement_seconds"] = round(time.monotonic() - t0, 3)
+        timings["measured_repetitions"] = len(tuned.per_run_tps)
+        if on_rep_hook is not None and hook_fired:
+            stopped_early = True
+            emit(
+                f"tuned arm stopped early after {len(tuned.per_run_tps)}/"
+                f"{profile.repetitions} reps (futility)"
+            )
         artifacts["tuned"] = write_artifact(
             run_dir, f"{label}-tuned", tuned.model_dump()
         )
@@ -854,7 +1079,12 @@ def validate_plan(
         #    instead of only in a reason string that can be overwritten later.
         pooled_baseline = baseline
         reversal: SysbenchMeasurement | None = None
-        if not reversal_enabled:
+        if shared_baseline is not None:
+            baseline_reversal = {
+                "measured": False,
+                "reason": "shared baseline reused across candidates",
+            }
+        elif not reversal_enabled:
             baseline_reversal = {
                 "measured": False,
                 "reason": "baseline reversal disabled for this pass",
@@ -998,6 +1228,7 @@ def validate_plan(
             wal_evidence,
             baseline_reversal,
             ignored_errors,
+            stopped_early,
         )
     except Exception as e:
         status = TuningStatus.FAIL

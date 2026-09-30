@@ -2,7 +2,12 @@
 
 import pytest
 
-from src.knob_tuner.tools.stats import estimate_multi_fidelity, t_crit, welch_delta
+from src.knob_tuner.tools.stats import (
+    estimate_multi_fidelity,
+    futility_stop,
+    t_crit,
+    welch_delta,
+)
 
 
 def test_welch_delta_reports_sample_counts_and_sufficiency():
@@ -129,3 +134,25 @@ def test_estimate_multi_fidelity_enabled_boundary():
     )
     assert below_pct["estimated_saving_pct"] < 20.0
     assert below_pct["enabled"] is False
+
+
+def test_futility_stop_fires_only_for_clear_losers_after_min_reps():
+    baseline = [100.0] * 10
+    # Too few reps: never stop, even when behind.
+    stop, stats = futility_stop(baseline, [80.0, 82.0, 81.0], min_reps=4)
+    assert stop is False
+    # Clear loser with enough reps: upper bound below zero.
+    stop, stats = futility_stop(baseline, [80.0, 82.0, 81.0, 79.0], min_reps=4)
+    assert stop is True
+    assert stats["sufficient"] is True
+    assert stats["ucb_pct"] < 0
+
+
+def test_futility_stop_never_stops_winners_or_tossups():
+    baseline = [100.0] * 10
+    stop, _ = futility_stop(baseline, [105.0] * 10, min_reps=4)
+    assert stop is False
+    # Noisy but positive mean with an upper bound above zero: keep running.
+    stop, stats = futility_stop(baseline, [106.0, 95.0, 110.0, 104.0], min_reps=4)
+    assert stop is False
+    assert stats["ucb_pct"] >= 0

@@ -8,7 +8,7 @@ from google.adk.models import BaseLlm
 from google.genai import types
 
 from src.knob_tuner.sub_agents.knob_recommender import prompt, tools
-from src.knob_tuner.sub_agents.knob_recommender.models import KnobRecommenderOutput
+from src.knob_tuner.sub_agents.knob_recommender.models import ExperimentProposal
 
 
 def make_buffer_callback(buffer_time: float = 0.0):
@@ -31,9 +31,11 @@ def create_knob_recommender_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash
             tools.get_knob_strategies,
             tools.read_knob_details,
             tools.write_selected_knobs,
+            tools.write_experiment_protocol,
+            tools.write_next_experiment,
         ],
-        output_schema=KnobRecommenderOutput,
-        output_key="knob_recommender_output",
+        output_schema=ExperimentProposal,
+        output_key="experiment_design_output",
         generate_content_config=types.GenerateContentConfig(
             temperature=0.0,
         ),

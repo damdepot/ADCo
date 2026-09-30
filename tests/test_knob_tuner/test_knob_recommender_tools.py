@@ -10,6 +10,7 @@ from src.knob_tuner.sub_agents.knob_recommender.agent import (
     create_knob_recommender_agent,
 )
 from src.knob_tuner.sub_agents.knob_recommender.models import (
+    ExperimentProposal,
     KnobRecommendation,
     KnobRecommenderOutput,
 )
@@ -89,14 +90,16 @@ def test_knob_recommender_output_validates():
 def test_create_knob_recommender_agent():
     agent = create_knob_recommender_agent()
     assert agent.name == "knob_recommender"
-    assert agent.output_key == "knob_recommender_output"
-    assert agent.output_schema == KnobRecommenderOutput
+    assert agent.output_key == "experiment_design_output"
+    assert agent.output_schema == ExperimentProposal
     assert agent.generate_content_config.temperature == 0.0
-    assert len(agent.tools) == 3
+    assert len(agent.tools) == 5
     tool_names = [t.__name__ for t in agent.tools]
     assert "read_knob_details" in tool_names
     assert "write_selected_knobs" in tool_names
     assert "get_knob_strategies" in tool_names
+    assert "write_experiment_protocol" in tool_names
+    assert "write_next_experiment" in tool_names
 
 
 def test_knob_recommender_prompt_guardrails():

@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import sys
+import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -147,10 +148,47 @@ def test_validate_budget_node_valid():
 # ===========================================================================
 
 
-def _recommender(state_update):
-    def node(ctx, node_input=None):
-        ctx.state["knob_recommender_output"] = state_update
+def _exp_levels(pairs):
+    return [
+        {"knob": knob, "value": value, "reasoning": "test"}
+        for knob, value in pairs
+    ]
 
+
+def _exp_design(
+    name="exp-1",
+    phase="screen",
+    pairs=(("work_mem", "256MB"),),
+    rationale="test rationale",
+    objective="test objective",
+):
+    return {
+        "name": name,
+        "phase": phase,
+        "levels": _exp_levels(pairs),
+        "rationale": rationale,
+        "objective": objective,
+    }
+
+
+def _experiment_node(design, key="experiment_design_output"):
+    """Mimic the LLM proposing ONE experiment via the given state key."""
+
+    def node(ctx, node_input=None):
+        ctx.state[key] = design
+
+    return node
+
+
+def _scripted_experiment_node(designs, key="experiment_design_output"):
+    """Serve one experiment design per attempt; repeat the last when exhausted."""
+    inputs: list = []
+
+    def node(ctx, node_input=None):
+        inputs.append(node_input)
+        ctx.state[key] = designs[min(len(inputs) - 1, len(designs) - 1)]
+
+    node.inputs = inputs
     return node
 
 
@@ -199,9 +237,14 @@ def _base_loop_state(**overrides):
         "db_type": "postgres",
         "database": "testdb",
         "max_validation_attempts": 4,
+        "max_experiments": 6,
         "durability_profile": "strict",
         "knobs_info": inventory,
         "available_knob_names": [k["name"] for k in inventory],
+        # Test inventory holds 7 knobs; keep the production default (20) out
+        # of unit tests so they exercise gating, not the cap. Dedicated
+        # cap tests override this explicitly.
+        "max_set_knobs": 99,
     }
     state.update(overrides)
     return state
@@ -212,6 +255,14 @@ def _paired(baseline, tuned):
         "status": "PASS",
         "baseline": {"per_run_tps": list(baseline)},
         "tuned": {"per_run_tps": list(tuned)},
+    }
+
+
+def _shared_baseline_result(baseline=(100.0,) * 10):
+    return {
+        "status": "ok",
+        "baseline": {"per_run_tps": list(baseline)},
+        "reasons": [],
     }
 
 
@@ -230,11 +281,462 @@ def test_recommendation_instruction_omits_empty_hint():
     assert "workload context" not in instruction.lower()
 
 
+def test_recommendation_instruction_retry_bans_repeating_rejected_values():
+    reasons = [
+        "checkpoint_completion_target: '0.9' equals the current value (no-op, nothing to change)"
+    ]
+    instruction = _recommendation_instruction(
+        3, reasons, {}, ["work_mem"], "strict", ""
+    )
+    assert "Do NOT repeat" in instruction
+    assert reasons[0] in instruction
+    assert "read_knob_details" in _recommendation_instruction(
+        1, [], {}, ["work_mem"], "strict", ""
+    )
+    assert "exceed 20 distinct knobs" in _recommendation_instruction(
+        1, [], {}, ["work_mem"], "strict", ""
+    )
+
+
+def test_recommendation_instruction_frames_single_experiment():
+    instruction = _recommendation_instruction(
+        1, [], {}, ["work_mem"], "strict", ""
+    )
+    assert "ONE" in instruction
+    assert "screen" in instruction
+    assert "interaction" in instruction
+    assert "refinement" in instruction
+
+
+def test_tune_loop_retry_feedback_accumulates_rejections():
+    script = [
+        _exp_design("stale", "screen", [("work_mem", "4MB")]),
+        {"name": "empty", "phase": "screen", "levels": [], "rationale": ""},
+        _exp_design("fresh", "screen", [("work_mem", "256MB")]),
+    ]
+    node = _scripted_experiment_node(script)
+
+    def validator(**kwargs):
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0] * 10, [105.0] * 10),
+            "reasons": [],
+        }
+
+    ctx = _FakeContext(_base_loop_state())
+    events = asyncio.run(_drive(make_tune_loop(node, validator)(ctx)))
+
+    delta = events[-1].actions.state_delta
+    assert delta["result_status"] == "PASS"
+    # Attempt 1's no-op rejection must still reach attempt 3 even though
+    # attempt 2 came back empty (empty results must not wipe the history).
+    assert len(node.inputs) == 3
+    assert "no-op" in (node.inputs[2] or "")
+    assert "no usable knobs" in (node.inputs[2] or "")
+
+
+def test_tune_loop_rejects_oversized_set_without_validating():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0] * 10, [105.0] * 10),
+            "reasons": [],
+        }
+
+    design = _exp_design(
+        "big-screen",
+        "screen",
+        [
+            ("work_mem", "256MB"),
+            ("shared_buffers", "1GB"),
+            ("effective_cache_size", "8GB"),
+            ("max_worker_processes", "8"),
+        ],
+    )
+    ctx = _FakeContext(_base_loop_state(max_set_knobs=3, max_validation_attempts=2))
+    events = asyncio.run(
+        _drive(
+            make_tune_loop(_experiment_node(design), validator)(ctx)
+        )
+    )
+
+    delta = events[-1].actions.state_delta
+    # Only the shared baseline runs; the 4-knob experiment is rejected
+    # as above the distinct-knob cap without spending a benchmark run.
+    assert len(calls) == 1
+    assert calls[0].get("baseline_only") is True
+    assert delta["result_status"] == "INCONCLUSIVE"
+    assert delta["knob_plan"]["knobs"] == []
+    assert any("above cap" in r for r in delta["staging_issues"])
+    assert delta["candidate_archive"]["experiments_run"] == 0
+    assert delta["candidate_archive"]["experiment_history"] == []
+
+
+def test_tune_loop_validates_set_within_cap():
+    def validator(**kwargs):
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0] * 10, [105.0] * 10),
+            "reasons": [],
+        }
+
+    design = _exp_design(
+        "full-screen",
+        "screen",
+        [
+            ("work_mem", "256MB"),
+            ("shared_buffers", "1GB"),
+            ("effective_cache_size", "8GB"),
+        ],
+    )
+    ctx = _FakeContext(_base_loop_state(max_set_knobs=3))
+    events = asyncio.run(
+        _drive(make_tune_loop(_experiment_node(design), validator)(ctx))
+    )
+
+    delta = events[-1].actions.state_delta
+    assert delta["result_status"] == "PASS"
+    assert {k["name"] for k in delta["knob_plan"]["knobs"]} == {
+        "shared_buffers",
+        "effective_cache_size",
+        "work_mem",
+    }
+    assert delta["candidate_archive"]["experiments_run"] == 1
+    assert len(delta["candidate_archive"]["experiment_history"]) == 1
+    assert "protocol_summary" not in delta["candidate_archive"]
+    assert "arms_executed" not in delta["candidate_archive"]
+
+
+def test_tune_loop_reads_design_output_directly():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0] * 10, [105.0] * 10),
+            "reasons": [],
+        }
+
+    design = _exp_design(
+        "direct-screen",
+        "screen",
+        [
+            ("work_mem", "256MB"),
+            ("shared_buffers", "1GB"),
+            ("effective_cache_size", "8GB"),
+        ],
+    )
+    ctx = _FakeContext(_base_loop_state(max_set_knobs=3))
+    events = asyncio.run(
+        _drive(make_tune_loop(_experiment_node(design), validator)(ctx))
+    )
+
+    delta = events[-1].actions.state_delta
+    # The design output alone drives validation (baseline + 1 experiment).
+    assert len(calls) == 2
+    assert delta["result_status"] == "PASS"
+    assert {k["name"] for k in delta["knob_plan"]["knobs"]} == {
+        "shared_buffers",
+        "effective_cache_size",
+        "work_mem",
+    }
+
+
+def test_tune_loop_reads_next_experiment_key():
+    def validator(**kwargs):
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0] * 10, [105.0] * 10),
+            "reasons": [],
+        }
+
+    design = _exp_design("via-next", "interaction", [("work_mem", "256MB")])
+    ctx = _FakeContext(_base_loop_state(max_set_knobs=99))
+    events = asyncio.run(
+        _drive(
+            make_tune_loop(_experiment_node(design, key="next_experiment"), validator)(
+                ctx
+            )
+        )
+    )
+
+    delta = events[-1].actions.state_delta
+    assert delta["result_status"] == "PASS"
+    assert [k["name"] for k in delta["knob_plan"]["knobs"]] == ["work_mem"]
+
+
+def test_tune_loop_reads_design_output_object():
+    def validator(**kwargs):
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0] * 10, [105.0] * 10),
+            "reasons": [],
+        }
+
+    design = types.SimpleNamespace(
+        name="object-screen",
+        phase="Screen",
+        levels=[
+            types.SimpleNamespace(knob="work_mem", value="256MB", reasoning="t"),
+            types.SimpleNamespace(knob="shared_buffers", value="1GB", reasoning="t"),
+            types.SimpleNamespace(
+                knob="effective_cache_size", value="8GB", reasoning="t"
+            ),
+        ],
+        rationale="object rationale",
+        objective="object objective",
+    )
+    ctx = _FakeContext(_base_loop_state(max_set_knobs=3))
+    events = asyncio.run(
+        _drive(make_tune_loop(_experiment_node(design), validator)(ctx))
+    )
+
+    delta = events[-1].actions.state_delta
+    assert delta["result_status"] == "PASS"
+    assert {k["name"] for k in delta["knob_plan"]["knobs"]} == {
+        "shared_buffers",
+        "effective_cache_size",
+        "work_mem",
+    }
+
+
+def test_tune_loop_sequential_loser_then_winner():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        plan = kwargs.get("plan")
+        names = {spec.name for spec in plan.knobs}
+        if "work_mem" in names:
+            return {
+                "status": "FAIL",
+                "paired": _paired([100.0] * 3, [80.0] * 3),
+                "reasons": ["regression"],
+            }
+        return {
+            "status": "PASS",
+            "attestation": {"run_id": "run-1"},
+            "paired": _paired([100.0] * 3, [105.0] * 3),
+            "reasons": [],
+        }
+
+    script = [
+        _exp_design("loser", "screen", [("work_mem", "256MB")]),
+        _exp_design("champion", "screen", [("shared_buffers", "1GB")]),
+    ]
+    ctx = _FakeContext(
+        _base_loop_state(max_set_knobs=99, max_experiments=2, max_validation_attempts=4)
+    )
+    events = asyncio.run(
+        _drive(make_tune_loop(_scripted_experiment_node(script), validator)(ctx))
+    )
+
+    delta = events[-1].actions.state_delta
+    # Shared baseline + two sequential experiments; the FAIL experiment loses.
+    assert len(calls) == 3
+    assert delta["result_status"] == "PASS"
+    assert [k["name"] for k in delta["knob_plan"]["knobs"]] == ["shared_buffers"]
+    arm_names = [
+        entry.get("arm")
+        for entry in delta["validation_attempts"]
+        if entry.get("candidate") == "llm"
+    ]
+    assert arm_names == ["loser", "champion"]
+    assert delta["candidate_archive"]["experiments_run"] == 2
+    assert [h["name"] for h in delta["candidate_archive"]["experiment_history"]] == [
+        "loser",
+        "champion",
+    ]
+
+
+def test_tune_loop_strong_win_stops_early():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "attestation": {"run_id": "run-1"},
+            "paired": _paired([100.0] * 10, [105.0] * 10),
+            "reasons": [],
+        }
+
+    design = _exp_design("strong", "screen", [("work_mem", "256MB")])
+    ctx = _FakeContext(_base_loop_state(max_set_knobs=99, max_experiments=6))
+    events = asyncio.run(
+        _drive(make_tune_loop(_experiment_node(design), validator)(ctx))
+    )
+
+    delta = events[-1].actions.state_delta
+    candidate_calls = [c for c in calls if not c.get("baseline_only")]
+    # A strong win (healthy PASS, LCB above the minimum) stops after attempt 1.
+    assert len(candidate_calls) == 1
+    assert len(calls) == 2
+    assert delta["result_status"] == "PASS"
+    assert delta["candidate_archive"]["experiments_run"] == 1
+
+
+def test_tune_loop_budget_exhaustion_all_reject_inconclusive():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0] * 10, [105.0] * 10),
+            "reasons": [],
+        }
+
+    design = {"name": "empty", "phase": "screen", "levels": [], "rationale": ""}
+    ctx = _FakeContext(
+        _base_loop_state(max_set_knobs=99, max_experiments=2, max_validation_attempts=2)
+    )
+    events = asyncio.run(
+        _drive(make_tune_loop(_experiment_node(design), validator)(ctx))
+    )
+
+    delta = events[-1].actions.state_delta
+    # Every attempt rejects before validation: only the baseline runs.
+    assert len(calls) == 1
+    assert calls[0].get("baseline_only") is True
+    assert delta["result_status"] == "INCONCLUSIVE"
+    assert delta["knob_plan"]["knobs"] == []
+    assert delta["candidate_archive"]["experiments_run"] == 0
+
+
+def test_tune_loop_rejects_unknown_phase():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0] * 10, [105.0] * 10),
+            "reasons": [],
+        }
+
+    design = _exp_design("weird", "bogus", [("work_mem", "256MB")])
+    ctx = _FakeContext(
+        _base_loop_state(max_set_knobs=99, max_experiments=2, max_validation_attempts=2)
+    )
+    events = asyncio.run(
+        _drive(make_tune_loop(_experiment_node(design), validator)(ctx))
+    )
+
+    delta = events[-1].actions.state_delta
+    assert len(calls) == 1
+    assert calls[0].get("baseline_only") is True
+    assert delta["result_status"] == "INCONCLUSIVE"
+    assert delta["knob_plan"]["knobs"] == []
+    assert any("unknown phase" in r for r in delta["staging_issues"])
+    assert delta["candidate_archive"]["experiment_history"] == []
+
+
+def test_tune_loop_experiment_drops_unknown_knob_level():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0] * 3, [105.0] * 3),
+            "reasons": [],
+        }
+
+    design = _exp_design(
+        "mixed",
+        "screen",
+        [("made_up_knob", "1"), ("work_mem", "256MB")],
+    )
+    ctx = _FakeContext(_base_loop_state(max_set_knobs=99))
+    events = asyncio.run(
+        _drive(make_tune_loop(_experiment_node(design), validator)(ctx))
+    )
+
+    delta = events[-1].actions.state_delta
+    # The unknown-knob level is dropped at the inventory gate; the valid
+    # level still spends one benchmark run.
+    assert len(calls) == 2
+    assert delta["result_status"] == "PASS"
+    assert [k["name"] for k in delta["knob_plan"]["knobs"]] == ["work_mem"]
+    arm_names = [
+        entry.get("arm")
+        for entry in delta["validation_attempts"]
+        if entry.get("candidate") == "llm"
+    ]
+    assert arm_names == ["mixed"]
+
+
+def test_tune_loop_cap_applies_to_all_phases():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0] * 3, [105.0] * 3),
+            "reasons": [],
+        }
+
+    design = _exp_design(
+        "big-interaction",
+        "interaction",
+        [
+            ("work_mem", "256MB"),
+            ("shared_buffers", "1GB"),
+            ("effective_cache_size", "8GB"),
+            ("max_worker_processes", "8"),
+        ],
+    )
+    ctx = _FakeContext(_base_loop_state(max_set_knobs=3, max_validation_attempts=1))
+    events = asyncio.run(
+        _drive(make_tune_loop(_experiment_node(design), validator)(ctx))
+    )
+
+    delta = events[-1].actions.state_delta
+    # The cap binds every phase: only the shared baseline runs.
+    assert len(calls) == 1
+    assert calls[0].get("baseline_only") is True
+    assert delta["result_status"] == "INCONCLUSIVE"
+    assert delta["knob_plan"]["knobs"] == []
+    assert any("above cap" in r for r in delta["staging_issues"])
+
+
 def test_tune_loop_threads_screening_benchmark_to_validator():
     calls = []
 
     def validator(**kwargs):
         calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         return {
             "status": "PASS",
             "attestation": {"run_id": "run-1"},
@@ -242,13 +744,12 @@ def test_tune_loop_threads_screening_benchmark_to_validator():
             "reasons": [],
         }
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
-    )
+    design = _exp_design("bench", "screen", [("work_mem", "256MB")])
     ctx = _FakeContext(_base_loop_state(screening_benchmark="pgbench"))
-    asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     assert calls
+    assert calls[0].get("baseline_only") is True
     assert all(call["benchmark_kind"] == "pgbench" for call in calls)
 
 
@@ -257,18 +758,17 @@ def test_tune_loop_defaults_screening_benchmark_to_sysbench():
 
     def validator(**kwargs):
         calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         return {
             "status": "PASS",
-            "attestation": {"run_id": "run-1"},
             "paired": _paired([100.0, 100.0, 100.0], [105.0, 105.0, 105.0]),
             "reasons": [],
         }
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "64MB"}]}
-    )
+    design = _exp_design("bench", "screen", [("work_mem", "64MB")])
     ctx = _FakeContext(_base_loop_state())
-    asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     assert calls
     assert all(call["benchmark_kind"] == "sysbench" for call in calls)
@@ -279,6 +779,8 @@ def test_tune_loop_passes_first_attempt():
 
     def validator(**kwargs):
         calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         return {
             "status": "PASS",
             "attestation": {"run_id": "run-1"},
@@ -286,27 +788,27 @@ def test_tune_loop_passes_first_attempt():
             "reasons": [],
         }
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "shared_buffers", "recommended_value": "1GB"}]}
-    )
+    design = _exp_design("first", "screen", [("shared_buffers", "1GB")])
     ctx = _FakeContext(_base_loop_state())
-    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    events = asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     delta = events[-1].actions.state_delta
-    # Single LLM candidate: screened once, then confirmed with a fresh,
-    # independent measurement (never the screening result itself).
+    # Shared baseline measured once, then the single LLM experiment is
+    # validated against it with a fresh, independent measurement.
     assert len(calls) == 2
+    assert calls[0].get("baseline_only") is True
     assert delta["result_status"] == "PASS"
     assert delta["staging_validated"] is True
-    assert delta["validation_attempts"][0]["candidate"] == "llm"
+    assert delta["validation_attempts"][0]["phase"] == "baseline"
+    assert delta["validation_attempts"][1]["candidate"] == "llm"
     assert delta["knob_plan"]["knobs"][0]["name"] == "shared_buffers"
-    assert "multi_fidelity" in delta["candidate_archive"]
-    confirm_entries = [
+    assert "single_fidelity" in delta["candidate_archive"]
+    candidate_entries = [
         entry
         for entry in delta["validation_attempts"]
-        if entry.get("phase") == "confirm"
+        if entry.get("candidate") == "llm"
     ]
-    assert confirm_entries and confirm_entries[0]["confirmed"] is True
+    assert candidate_entries and candidate_entries[0]["confirmed"] is True
 
 
 def test_tune_loop_no_valid_plan_is_inconclusive():
@@ -314,15 +816,20 @@ def test_tune_loop_no_valid_plan_is_inconclusive():
 
     def validator(**kwargs):
         calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         return {"status": "PASS", "paired": _paired([100.0], [100.0]), "reasons": []}
 
+    design = {"name": "empty", "phase": "screen", "levels": [], "rationale": ""}
     ctx = _FakeContext(_base_loop_state(max_validation_attempts=2))
     events = asyncio.run(
-        _drive(make_tune_loop(_recommender({"recommendations": []}), validator)(ctx))
+        _drive(make_tune_loop(_experiment_node(design), validator)(ctx))
     )
 
     delta = events[-1].actions.state_delta
-    assert calls == []
+    # Only the shared baseline runs; no experiment is ever validated.
+    assert len(calls) == 1
+    assert calls[0].get("baseline_only") is True
     assert delta["result_status"] == "INCONCLUSIVE"
     assert delta["staging_validated"] is False
     assert delta["knob_plan"]["knobs"] == []
@@ -335,11 +842,9 @@ def test_tune_loop_environment_failure_is_fail():
         calls.append(kwargs)
         return {"status": "FAIL", "paired": None, "reasons": ["env error"]}
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "shared_buffers", "recommended_value": "1GB"}]}
-    )
+    design = _exp_design("env", "screen", [("shared_buffers", "1GB")])
     ctx = _FakeContext(_base_loop_state())
-    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    events = asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     assert len(calls) == 1
     assert events[-1].actions.state_delta["result_status"] == "FAIL"
@@ -347,18 +852,18 @@ def test_tune_loop_environment_failure_is_fail():
 
 def test_tune_loop_rejects_likely_regression():
     def validator(**kwargs):
-        # Clear regression: upper bound well below zero → not eligible to confirm.
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        # Clear regression: mean well below zero → not confirmed.
         return {
             "status": "FAIL",
             "paired": _paired([100.0, 100.0, 100.0], [80.0, 85.0, 82.0]),
             "reasons": [],
         }
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
-    )
+    design = _exp_design("reg", "screen", [("work_mem", "256MB")])
     ctx = _FakeContext(_base_loop_state())
-    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    events = asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     delta = events[-1].actions.state_delta
     assert delta["result_status"] == "INCONCLUSIVE"
@@ -367,6 +872,8 @@ def test_tune_loop_rejects_likely_regression():
 
 def test_tune_loop_noisy_positive_mean_is_promoted():
     def validator(**kwargs):
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         # Noisy improvement: positive mean, negative LCB; health check passes.
         # Non-negative rule: tuned is not worse, so it promotes (LCB is info).
         return {
@@ -375,14 +882,13 @@ def test_tune_loop_noisy_positive_mean_is_promoted():
             "reasons": [],
         }
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
-    )
+    design = _exp_design("noisy", "screen", [("work_mem", "256MB")])
     ctx = _FakeContext(_base_loop_state())
-    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    events = asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     delta = events[-1].actions.state_delta
-    # Mean delta is positive and health passes: promoted even though LCB < 0.
+    # Mean delta is positive and health passes: promoted at budget exhaustion
+    # even though LCB < 0 (no strong win).
     assert delta["result_status"] == "PASS"
     assert delta["staging_validated"] is True
     assert delta["improvement_confident"] is False
@@ -390,6 +896,8 @@ def test_tune_loop_noisy_positive_mean_is_promoted():
 
 def test_tune_loop_small_positive_mean_is_promoted():
     def validator(**kwargs):
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         # +1% with zero spread: LCB below the 2% default minimum, but the
         # mean is non-negative and health passes, so it promotes.
         return {
@@ -398,11 +906,9 @@ def test_tune_loop_small_positive_mean_is_promoted():
             "reasons": [],
         }
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
-    )
+    design = _exp_design("small", "screen", [("work_mem", "256MB")])
     ctx = _FakeContext(_base_loop_state())
-    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    events = asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     delta = events[-1].actions.state_delta
     assert delta["result_status"] == "PASS"
@@ -411,19 +917,19 @@ def test_tune_loop_small_positive_mean_is_promoted():
 
 def test_tune_loop_negative_mean_is_not_promoted():
     def validator(**kwargs):
-        # Negative mean with a wide interval (ucb >= 0 passes screening
-        # eligibility), but health alone is not enough: tuned is worse.
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
+        # Negative mean: health passes but tuned is worse, so it is rejected
+        # on every attempt and the run stays INCONCLUSIVE.
         return {
             "status": "PASS",
             "paired": _paired([100.0, 100.0, 100.0], [90.0, 100.0, 105.0]),
             "reasons": [],
         }
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
-    )
+    design = _exp_design("neg", "screen", [("work_mem", "256MB")])
     ctx = _FakeContext(_base_loop_state())
-    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    events = asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     delta = events[-1].actions.state_delta
     assert delta["result_status"] == "INCONCLUSIVE"
@@ -432,6 +938,8 @@ def test_tune_loop_negative_mean_is_not_promoted():
 
 def test_tune_loop_lcb_above_minimum_is_promoted():
     def validator(**kwargs):
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         # +3% with zero spread: LCB clears the default 2% minimum.
         return {
             "status": "PASS",
@@ -439,11 +947,9 @@ def test_tune_loop_lcb_above_minimum_is_promoted():
             "reasons": [],
         }
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
-    )
+    design = _exp_design("confident", "screen", [("work_mem", "256MB")])
     ctx = _FakeContext(_base_loop_state())
-    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    events = asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     delta = events[-1].actions.state_delta
     assert delta["result_status"] == "PASS"
@@ -457,15 +963,17 @@ def test_tune_loop_rejects_unknown_knob():
 
     def validator(**kwargs):
         calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         return {"status": "PASS", "paired": _paired([100.0], [100.0]), "reasons": []}
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "made_up_knob", "recommended_value": "1"}]}
-    )
+    design = _exp_design("mystery", "screen", [("made_up_knob", "1")])
     ctx = _FakeContext(_base_loop_state(max_validation_attempts=2))
-    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    events = asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
-    assert calls == []
+    # Only the shared baseline runs; the unknown knob never validates.
+    assert len(calls) == 1
+    assert calls[0].get("baseline_only") is True
     delta = events[-1].actions.state_delta
     assert delta["result_status"] == "INCONCLUSIVE"
     assert any("not in available knob inventory" in r for r in delta["staging_issues"])
@@ -476,17 +984,19 @@ def test_tune_loop_rejects_noop_recommendation():
 
     def validator(**kwargs):
         calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         return {"status": "PASS", "paired": _paired([100.0], [100.0]), "reasons": []}
 
     # work_mem's inventory current value is 4MB, so this changes nothing and must
     # not be promoted as if it did.
-    recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}
-    )
+    design = _exp_design("noop", "screen", [("work_mem", "4MB")])
     ctx = _FakeContext(_base_loop_state(max_validation_attempts=2))
-    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    events = asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
-    assert calls == []
+    # Only the shared baseline runs; the no-op never validates.
+    assert len(calls) == 1
+    assert calls[0].get("baseline_only") is True
     delta = events[-1].actions.state_delta
     assert delta["result_status"] == "INCONCLUSIVE"
     assert any("no-op" in r for r in delta["staging_issues"])
@@ -494,17 +1004,19 @@ def test_tune_loop_rejects_noop_recommendation():
 
 def test_tune_loop_durability_policy_gates_synchronous_commit():
     def validator(**kwargs):
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         return {
             "status": "PASS",
             "paired": _paired([100.0, 100.0, 100.0], [105.0, 104.0, 106.0]),
             "reasons": [],
         }
 
-    rec = {"recommendations": [{"knob": "synchronous_commit", "recommended_value": "off"}]}
+    design = _exp_design("dur", "screen", [("synchronous_commit", "off")])
 
     strict_ctx = _FakeContext(_base_loop_state(max_validation_attempts=2))
     strict_events = asyncio.run(
-        _drive(make_tune_loop(_recommender(rec), validator)(strict_ctx))
+        _drive(make_tune_loop(_experiment_node(design), validator)(strict_ctx))
     )
     strict_delta = strict_events[-1].actions.state_delta
     assert strict_delta["result_status"] == "INCONCLUSIVE"
@@ -514,7 +1026,7 @@ def test_tune_loop_durability_policy_gates_synchronous_commit():
         _base_loop_state(durability_profile="relaxed")
     )
     relaxed_events = asyncio.run(
-        _drive(make_tune_loop(_recommender(rec), validator)(relaxed_ctx))
+        _drive(make_tune_loop(_experiment_node(design), validator)(relaxed_ctx))
     )
     relaxed_delta = relaxed_events[-1].actions.state_delta
     assert relaxed_delta["result_status"] == "PASS"
@@ -525,6 +1037,8 @@ def _pass_validator(captured=None):
     def validator(**kwargs):
         if captured is not None:
             captured.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         return {
             "status": "PASS",
             "paired": _paired([100.0, 100.0, 100.0], [105.0, 105.0, 105.0]),
@@ -536,6 +1050,7 @@ def _pass_validator(captured=None):
 
 def test_tune_loop_derives_realistic_dataset_from_schema_info():
     captured = []
+    design = _exp_design("data", "screen", [("work_mem", "256MB")])
     ctx = _FakeContext(
         _base_loop_state(
             schema_info=[
@@ -547,7 +1062,7 @@ def test_tune_loop_derives_realistic_dataset_from_schema_info():
     events = asyncio.run(
         _drive(
             make_tune_loop(
-                _recommender({"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}),
+                _experiment_node(design),
                 _pass_validator(captured),
             )(ctx)
         )
@@ -564,11 +1079,12 @@ def test_tune_loop_derives_realistic_dataset_from_schema_info():
 
 
 def test_tune_loop_dataset_falls_back_without_schema_info():
+    design = _exp_design("data", "screen", [("work_mem", "4MB")])
     ctx = _FakeContext(_base_loop_state())
     events = asyncio.run(
         _drive(
             make_tune_loop(
-                _recommender({"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}),
+                _experiment_node(design),
                 _pass_validator(),
             )(ctx)
         )
@@ -578,6 +1094,7 @@ def test_tune_loop_dataset_falls_back_without_schema_info():
 
 def test_tune_loop_screen_total_rows_override():
     captured = []
+    design = _exp_design("data", "screen", [("work_mem", "4MB")])
     ctx = _FakeContext(
         _base_loop_state(
             schema_info=[{"approximate_row_count": 600000}],
@@ -587,7 +1104,7 @@ def test_tune_loop_screen_total_rows_override():
     events = asyncio.run(
         _drive(
             make_tune_loop(
-                _recommender({"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}),
+                _experiment_node(design),
                 _pass_validator(captured),
             )(ctx)
         )
@@ -601,22 +1118,26 @@ def test_tune_loop_preserves_restart_required_for_unknown_scope():
     captured = {}
 
     def validator(**kwargs):
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         captured["plan"] = kwargs["plan"]
         return {"status": "PASS", "paired": {"delta_pct": 1.0}, "reasons": []}
 
-    recommender = _recommender(
-        {
-            "recommendations": [
-                {
-                    "knob": "shared_buffers",
-                    "recommended_value": "1GB",
-                    "restart_required": True,
-                }
-            ]
-        }
-    )
+    design = {
+        "name": "restart",
+        "phase": "screen",
+        "levels": [
+            {
+                "knob": "shared_buffers",
+                "value": "1GB",
+                "reasoning": "test",
+                "restart_required": True,
+            }
+        ],
+        "rationale": "test",
+    }
     ctx = _FakeContext(_base_loop_state())
-    asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     spec = captured["plan"].knobs[0]
     assert spec.restart_required is True
@@ -629,11 +1150,9 @@ def test_tune_loop_dry_run_calls_validator_with_dry_run():
         captured.update(kwargs)
         return {"status": "INCONCLUSIVE", "paired": None, "reasons": ["dry-run"]}
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "shared_buffers", "recommended_value": "1GB"}]}
-    )
+    design = _exp_design("dry", "screen", [("shared_buffers", "1GB")])
     ctx = _FakeContext(_base_loop_state(dry_run=True, max_validation_attempts=1))
-    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    events = asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     assert captured["dry_run"] is True
     assert events[-1].actions.state_delta["staging_validated"] is False
@@ -643,19 +1162,20 @@ def test_tune_loop_emits_progress_to_log_file(tmp_path: Path):
     log_file = tmp_path / "progress.log"
 
     def validator(**kwargs):
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         return {"status": "PASS", "paired": {"delta_pct": 1.0}, "reasons": []}
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "shared_buffers", "recommended_value": "1GB"}]}
-    )
+    design = _exp_design("logged", "screen", [("shared_buffers", "1GB")])
     ctx = _FakeContext(
         _base_loop_state(verbose=True, log_file=str(log_file))
     )
-    asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+    asyncio.run(_drive(make_tune_loop(_experiment_node(design), validator)(ctx)))
 
     content = log_file.read_text(encoding="utf-8")
     assert "Attempt 1/" in content
-    assert "Recommendation received:" in content
+    assert "Experiment received:" in content
+
 
 
 # ===========================================================================
@@ -1621,11 +2141,13 @@ def test_run_pipeline_exception_triggers_cleanup(tmp_path: Path):
         mock_cleanup.assert_called_once()
 
 
-def test_tune_loop_screen_is_time_fidelity_and_reversal_disabled():
+def test_tune_loop_single_fidelity_shared_baseline_no_reversal():
     calls: list[dict] = []
 
     def validator(**kwargs):
         calls.append(kwargs)
+        if kwargs.get("baseline_only"):
+            return _shared_baseline_result()
         snapshot = kwargs.get("snapshot")
         if snapshot is not None and not snapshot.images():
             snapshot.register("key", "adco-staging-ready:test")
@@ -1636,23 +2158,29 @@ def test_tune_loop_screen_is_time_fidelity_and_reversal_disabled():
             "reasons": [],
         }
 
-    recommender = _recommender(
-        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
+    recommender = _experiment_node(
+        _exp_design("fidelity", "screen", [("work_mem", "256MB")])
     )
     ctx = _FakeContext(_base_loop_state())
     with patch("src.knob_tuner.workflow.cleanup_snapshot_image") as m_clean:
         asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
 
-    assert len(calls) >= 2
-    screen, confirm = calls[0], calls[-1]
-    # Screening runs a shorter window without the A/B/A reversal; confirmation
-    # keeps the full window and the reversal.
-    assert screen["reversal"] is False
-    assert confirm["reversal"] is True
-    assert screen["profile"].measurement_seconds == 10
-    assert screen["profile"].warmup_seconds == 2
-    assert confirm["profile"].measurement_seconds == 30
-    assert isinstance(screen["snapshot"], SnapshotRegistry)
-    assert screen["snapshot"] is confirm["snapshot"]
+    assert len(calls) == 2
+    baseline, candidate = calls[0], calls[-1]
+    # One shared baseline, then the candidate reuses it: same short window,
+    # no per-candidate reversal, same run-scoped snapshot registry.
+    assert baseline.get("baseline_only") is True
+    assert baseline["reversal"] is False
+    assert candidate["reversal"] is False
+    assert candidate.get("shared_baseline") is not None
+    assert candidate["profile"].repetitions == 10
+    assert candidate["profile"].measurement_seconds == 10
+    assert candidate["profile"].warmup_seconds == 2
+    assert (
+        baseline["profile"].measurement_seconds
+        == candidate["profile"].measurement_seconds
+    )
+    assert isinstance(candidate["snapshot"], SnapshotRegistry)
+    assert baseline["snapshot"] is candidate["snapshot"]
     # The run-scoped snapshot is deleted before the loop returns.
     m_clean.assert_any_call("adco-staging-ready:test")

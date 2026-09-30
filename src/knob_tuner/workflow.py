@@ -42,17 +42,21 @@ from src.knob_tuner.tools.docker_tools import (
     cleanup_snapshot_image,
     resolve_docker_image,
 )
+from src.knob_tuner.tools.experiments import (
+    format_protocol_feedback,
+    pick_winner,
+    run_experiment_arms,
+)
 from src.knob_tuner.tools.knob_scope import fetch_pg_settings_context
 from src.knob_tuner.tools.knobs import (
     build_plan,
     coerce_apply_mode,
     coerce_db_config,
     coerce_profile,
-    load_raw_knobs,
 )
 from src.knob_tuner.tools.progress import make_progress_callback
 from src.knob_tuner.tools.run_artifacts import application_code_hash, write_artifact
-from src.knob_tuner.tools.stats import estimate_multi_fidelity, welch_delta
+from src.knob_tuner.tools.stats import welch_delta
 from src.knob_tuner.tools.validation import SnapshotRegistry, validate_plan
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
@@ -66,15 +70,37 @@ def _recommendation_instruction(
     durability_profile: str,
     workload_hint: str = "",
 ) -> str:
-    """Build the retry-aware instruction handed to the knob_recommender agent."""
+    """Build the single-experiment instruction handed to the knob_recommender agent."""
     parts = [
-        "Recommend database configuration knobs for the target database.",
+        "Propose ONE database configuration experiment for this attempt.",
         "Select ONLY from these available knob names: "
         + (", ".join(knob_names) if knob_names else "(none available)"),
         f"Durability policy for this run: {durability_profile}.",
-        "Use the workload, resource budget, inspector summary, and knowledge-base "
-        "strategies in session state. Fetch details for your shortlist with "
-        "read_knob_details before choosing values.",
+        (
+            "Write your design as a single experiment to state keys "
+            "next_experiment / experiment_design_output with shape "
+            "{name, phase, levels: [{knob, value, reasoning}], rationale, "
+            "objective}: exactly one experiment per attempt."
+        ),
+        (
+            "Phase must be one of screen, interaction, refinement "
+            "(case-insensitive; anything else is rejected): screen explores "
+            "a broad set of knobs; interaction tests combinations of known "
+            "movers; refinement fine-tunes known movers. No experiment may "
+            "exceed 20 distinct knobs (larger sets are rejected) — keep each "
+            "experiment attributable and cheap."
+        ),
+        (
+            "Budget: at most 6 experiments per run (state max_experiments); "
+            "each attempt proposes exactly one next experiment — do not "
+            "propose multi-arm batches."
+        ),
+        (
+            "Use the workload, resource budget, inspector summary, and knowledge-base "
+            "strategies in session state. You MUST fetch details for your shortlist with "
+            "read_knob_details before choosing values — never guess a current value "
+            "and never copy a default from the guardrails as the current value."
+        ),
     ]
     if workload_hint:
         parts.append(
@@ -82,16 +108,25 @@ def _recommendation_instruction(
             + workload_hint.strip()
         )
     parts.append(
-        "Call write_selected_knobs with your chosen recommendations; if none are "
-        "justified, return an empty list."
+        "If no experiment is justified, return an empty design "
+        "(no usable knobs)."
     )
-    if attempt > 1:
-        parts.append(f"This is validation retry attempt {attempt}.")
+    if attempt > 1 or last_reasons:
+        parts.append(f"This is experiment attempt {attempt}.")
         if last_reasons:
             parts.append(
-                "The previous attempt failed for these reasons: "
+                "Accumulated experiment history and rejections so far "
+                "(full history — every prior experiment and every rejected "
+                "value, live current value shown where known): "
                 + "; ".join(str(reason) for reason in last_reasons)
                 + "."
+            )
+            parts.append(
+                "Do NOT repeat a rejected value: a recommendation identical to "
+                "its live current value is a no-op and will be rejected again. "
+                "Do not repeat a tested experiment: vary failed/rejected "
+                "experiments with fresh knobs or values. Either pick a different "
+                "knob or a value that differs from the live current value shown above."
             )
         paired = (last_result or {}).get("paired") or {}
         if paired:
@@ -105,10 +140,42 @@ def _recommendation_instruction(
                 )
             )
         parts.append(
-            "Revise the recommendations to remediate the failures and avoid "
+            "Revise the single next experiment to remediate the failures and avoid "
             "over-allocating memory."
         )
     return " ".join(parts)
+
+
+_VALID_EXPERIMENT_PHASES = ("screen", "interaction", "refinement")
+
+
+def _read_next_experiment(state: Any) -> Any | None:
+    """Return the raw single-experiment design from session state, if any.
+
+    Reads ``state["next_experiment"]`` first, then
+    ``state["experiment_design_output"]``. Both accept a dict with keys
+    name/phase/levels/rationale/objective or an object with those
+    attributes. Returns ``None`` when neither key holds a single-experiment
+    design (legacy multi-arm ``arms`` payloads do not count).
+    """
+    for key in ("next_experiment", "experiment_design_output"):
+        try:
+            raw = state.get(key)
+        except AttributeError:
+            return None
+        if raw is None:
+            continue
+        if isinstance(raw, dict):
+            if "arms" in raw and "levels" not in raw and "name" not in raw:
+                continue
+            if any(k in raw for k in ("name", "phase", "levels")):
+                return raw
+            if key == "next_experiment":
+                return raw
+            continue
+        if any(hasattr(raw, attr) for attr in ("name", "phase", "levels")):
+            return raw
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +333,17 @@ def make_tune_loop(recommender_node: Any, validator: Any):
 
         budget = ResourceBudget(**(state.get("resource_budget") or {}))
         profile = coerce_profile(state.get("sysbench_profile"))
-        max_attempts = int(state.get("max_validation_attempts", 4) or 4)
+        max_experiments = max(1, int(state.get("max_experiments", 6) or 6))
+        _raw_max_attempts = state.get("max_validation_attempts", None)
+        if _raw_max_attempts is None:
+            max_attempts = max_experiments
+        else:
+            try:
+                max_attempts = min(
+                    max_experiments, max(1, int(_raw_max_attempts or max_experiments))
+                )
+            except (TypeError, ValueError):
+                max_attempts = max_experiments
         dry_run = bool(state.get("dry_run", False))
         run_id = state.get("run_id", "") or ""
         run_dir = state.get("run_dir", "") or ""
@@ -280,17 +357,23 @@ def make_tune_loop(recommender_node: Any, validator: Any):
         )
         benchmark_kind = str(state.get("screening_benchmark", "sysbench") or "sysbench")
         workload_hint = str(state.get("workload_hint", "") or "")
-        screen_reps = max(2, int(state.get("screen_repetitions", 3) or 3))
-        # Default confirmation to the hard cap so the escalation ladder is a
-        # single rung. A 3-rep confirmation measurably fails by chance on a
-        # working set larger than RAM (its early reps run cold), which then
-        # escalates to 5 and wastes a whole screening pass; starting at 5 is
-        # deterministic and costs no more than the escalated path.
-        confirm_reps = max(
-            screen_reps,
-            int(state.get("confirm_repetitions", 5) or 5),
+        # Single-fidelity short runs: many 10s repetitions give the Welch
+        # screen more degrees of freedom than a few long ones, and losers
+        # stop early for futility instead of paying a full confirmation.
+        candidate_reps = max(2, int(state.get("candidate_repetitions", 10) or 10))
+        candidate_seconds = max(
+            1, int(state.get("candidate_measurement_seconds", 10) or 10)
         )
-        min_seconds = float(state.get("multi_fidelity_min_seconds", 300) or 300)
+        candidate_warmup = max(
+            0, int(state.get("candidate_warmup_seconds", 2) or 2)
+        )
+        early_stop_min_reps = max(
+            2, int(state.get("early_stop_min_reps", 4) or 4)
+        )
+        # Candidates are validated as single-knob-set experiments: sets with
+        # more distinct knobs than this cap are rejected without spending a
+        # benchmark run, keeping each experiment attributable and cheap.
+        max_set_knobs = max(1, int(state.get("max_set_knobs", 20) or 20))
         min_improvement_pct = float(
             getattr(profile, "min_improvement_pct", 2.0)
         )
@@ -336,22 +419,16 @@ def make_tune_loop(recommender_node: Any, validator: Any):
             + ")"
         )
 
-        # Time-fidelity: the screening pass measures a shorter window than the
-        # full confirmation so a rejected candidate is failed faster. Both share
-        # the same dataset size, so the prepared-dataset snapshot serves both.
-        screen_seconds = int(state.get("screen_measurement_seconds", 10) or 10)
-        screen_warmup = int(state.get("screen_warmup_seconds", 2) or 2)
-        screen_run_profile = screen_profile.model_copy(
+        # One short-run profile for every arm of the run: the shared baseline
+        # and each candidate measure the same window, so samples are directly
+        # comparable. The prepared-dataset snapshot serves all of them.
+        candidate_run_profile = screen_profile.model_copy(
             update={
-                "measurement_seconds": max(
-                    1, min(screen_seconds, screen_profile.measurement_seconds)
-                ),
-                "warmup_seconds": max(
-                    0, min(screen_warmup, screen_profile.warmup_seconds)
-                ),
+                "repetitions": candidate_reps,
+                "measurement_seconds": max(1, candidate_seconds),
+                "warmup_seconds": max(0, candidate_warmup),
             }
         )
-        confirm_run_profile = screen_profile
 
         # One prepared-dataset snapshot per dataset profile, reused by every
         # screening/confirmation pass in this run; deleted before the run ends.
@@ -366,19 +443,18 @@ def make_tune_loop(recommender_node: Any, validator: Any):
 
         def _validate(
             plan: KnobPlan,
-            reps: int,
             attempt: int,
             *,
             run_profile: SysbenchProfile,
-            reversal: bool,
+            shared_baseline: Any = None,
+            baseline_only: bool = False,
         ) -> dict[str, Any]:
-            profile_for_run = run_profile.model_copy(update={"repetitions": reps})
             result = validator(
                 run_id=run_id,
                 run_dir=run_dir,
                 plan=plan,
                 budget=budget,
-                profile=profile_for_run,
+                profile=run_profile,
                 db_type=db_type,
                 db_version=db_version,
                 database=database,
@@ -391,12 +467,25 @@ def make_tune_loop(recommender_node: Any, validator: Any):
                 benchmark_kind=benchmark_kind,
                 progress=progress,
                 snapshot=snapshots,
-                reversal=reversal,
+                reversal=False,
+                shared_baseline=shared_baseline,
+                baseline_only=baseline_only,
+                early_stop_min_reps=early_stop_min_reps,
             )
             return result or {}
 
         archive: list[dict[str, Any]] = []
         last_reasons: list[str] = []
+        candidates: list[dict[str, Any]] = []
+        # Rejections accumulate across attempts so the recommender keeps seeing
+        # every stale/no-op value (with its live current value), instead of the
+        # feedback being wiped whenever an attempt comes back empty.
+        rejected_history: list[str] = []
+        # Sequential experimental design: one executed experiment per attempt.
+        experiment_history: list[dict[str, Any]] = []
+        # Every executed single-arm validation row, across attempts.
+        all_rows: list[dict[str, Any]] = []
+        experiments_run = 0
 
         # The inspector's inventory is the trust boundary for the LLM selection.
         inventory = _inventory_by_name(state)
@@ -407,260 +496,504 @@ def make_tune_loop(recommender_node: Any, validator: Any):
             str(state.get("durability_profile", "strict") or "strict").strip().lower()
         )
 
-        # One LLM candidate, retried on an invalid/empty selection. There is no
-        # deterministic fallback: an empty result means the run is INCONCLUSIVE.
-        candidates: list[dict[str, Any]] = []
-        for attempt in range(1, max_attempts + 1):
-            yield Event(
-                state={
-                    "validation_attempt_count": attempt,
-                    "last_failure": last_reasons,
-                }
-            )
-            progress(
-                f"Attempt {attempt}/{max_attempts} — requesting knob recommendation... "
-                f"({len(knob_names)} available knobs, durability={durability_profile})"
-            )
-            await ctx.run_node(
-                recommender_node,
-                node_input=_recommendation_instruction(
-                    attempt,
-                    last_reasons,
-                    {},
-                    knob_names,
-                    durability_profile,
-                    workload_hint,
-                ),
-            )
-            raw_knobs = load_raw_knobs(state)
-            valid_knobs, rejected = _validate_recommendations(
-                raw_knobs, inventory, durability_profile
-            )
-            if rejected:
-                last_reasons = rejected
-                progress(
-                    "Recommendation rejected: " + "; ".join(rejected)
-                )
-            plan = build_plan(valid_knobs, context_map) if valid_knobs else KnobPlan(knobs=[])
-            if plan.knobs:
-                candidates.append(
-                    {"source": "llm", "plan": plan, "rationale": "inventory-validated"}
-                )
-                progress(
-                    f"Recommendation received: {len(plan.knobs)} knobs "
-                    f"({', '.join(spec.name for spec in plan.knobs)})"
-                )
-                break
-            if not rejected:
-                last_reasons = ["recommender returned no usable knobs"]
-            progress("Recommendation received: no usable knobs")
-
-        # Multi-fidelity is enabled only on measured economics (recorded below).
-        n_confirm = 1 if candidates else 0
-        gate = estimate_multi_fidelity(
-            n_candidates=len(candidates),
-            n_confirm=n_confirm,
-            measurement_seconds=float(screen_profile.measurement_seconds),
-            screen_repetitions=screen_reps,
-            confirm_repetitions=confirm_reps,
-            minimum_seconds=min_seconds,
-            screen_seconds=float(screen_run_profile.measurement_seconds),
-            confirm_seconds=float(confirm_run_profile.measurement_seconds),
-        )
-        multi_fidelity = bool(gate["enabled"])
-        screen_reps_used = screen_reps if multi_fidelity else confirm_reps
-        progress(
-            f"screening {len(candidates)} candidate(s) at {screen_reps_used} rep(s) "
-            f"× {screen_run_profile.measurement_seconds}s; "
-            f"multi-fidelity={'on' if multi_fidelity else 'off'} "
-            f"(est. saving {gate['estimated_saving_seconds']}s)"
-        )
-
+        # Single-fidelity short runs: measure the shared baseline once, then
+        # run sequential single-knob-set experiments against it. Losers stop
+        # early for futility; strong winners break early. Anything confirmed
+        # but not strong keeps the loop going until the budget is exhausted,
+        # when the best confirmed experiment wins. There is no deterministic
+        # fallback: no usable evidence means the run is INCONCLUSIVE (or FAIL
+        # when no paired evidence was ever produced) and nothing is applied.
+        winner: dict[str, Any] | None = None
+        status = TuningStatus.INCONCLUSIVE
+        shared_baseline: Any = None
         try:
-            for cand in candidates:
-                plan = cand["plan"]
-                t0 = time.monotonic()
-                result = _validate(
-                    plan,
-                    screen_reps_used,
-                    len(archive) + 1,
-                    run_profile=screen_run_profile,
-                    reversal=False,
+            progress(
+                f"measuring shared baseline at {candidate_reps} rep(s) "
+                f"× {candidate_run_profile.measurement_seconds}s..."
+            )
+            baseline_result = _validate(
+                KnobPlan(knobs=[]),
+                0,
+                run_profile=candidate_run_profile,
+                baseline_only=True,
+            )
+            shared_baseline = baseline_result.get("baseline")
+            if isinstance(shared_baseline, dict):
+                baseline_tps = list(shared_baseline.get("per_run_tps") or [])
+            else:
+                baseline_tps = list(
+                    getattr(shared_baseline, "per_run_tps", None) or []
                 )
-                stats = _screen_stats(result)
-                cand["screen_result"] = result
-                cand["screen_stats"] = stats
-                entry = {
-                    "candidate": cand["source"],
-                    "plan_hash": plan.plan_hash(),
-                    "screen": stats,
-                    "screen_status": result.get("status"),
-                    "screen_phase": "screen" if multi_fidelity else "full",
-                    "paired": result.get("paired"),
-                    "reasons": list(result.get("reasons", []) or []),
-                    "wall_seconds": round(time.monotonic() - t0, 3),
+            archive.append(
+                {
+                    "phase": "baseline",
+                    "status": baseline_result.get("status"),
+                    "repetitions": len(baseline_tps),
+                    "reasons": list(baseline_result.get("reasons", []) or []),
                 }
-                archive.append(entry)
-                progress(
-                    f"screen {cand['source']}: delta={stats['mean_delta_pct']:.2f}% "
-                    f"lcb={stats['lcb_pct']:.2f}% ucb={stats['ucb_pct']:.2f}%"
-                )
-
-            # Promotion: confirm only candidates whose upper bound does not
-            # indicate likely regression; an interval entirely below zero means
-            # the candidate is rejected rather than defaulted.
-            eligible = [
-                c for c in candidates
-                if c["screen_stats"]["df"] >= 1 and c["screen_stats"]["ucb_pct"] >= 0
-            ]
-            eligible.sort(key=lambda c: c["screen_stats"]["lcb_pct"], reverse=True)
-            for cand in eligible:
-                cand["rationale"] = "screen_lcb"
-            confirm_list = eligible
-
-            # Pre-registered predicate: a valid LLM candidate is promising when
-            # its mean moved up and its upper bound does not exclude zero.
-            screening_promising = any(
-                c["source"] == "llm"
-                and c["screen_stats"]["mean_delta_pct"] > 0
-                and c["screen_stats"]["ucb_pct"] >= 0
-                and c.get("screen_result", {}).get("paired")
-                for c in candidates
             )
-            any_paired = any(
-                c.get("screen_result", {}).get("paired") for c in candidates
-            )
-
-            # Escalation ladder: if screening is promising but nothing confirms,
-            # raise the confirmation sample count up to the hard cap before
-            # concluding INCONCLUSIVE.
-            cap = max(
-                screen_reps,
-                int(state.get("confirmation_max_repetitions", 5) or 5),
-            )
-            reps_ladder = sorted({confirm_reps, cap})
-            for reps in reps_ladder:
-                for cand in confirm_list:
-                    plan = cand["plan"]
-                    # Confirmation is always a fresh, independent measurement:
-                    # reusing the screening result would leave no independent
-                    # evidence for promotion.
-                    t0 = time.monotonic()
-                    result = _validate(
-                        plan,
-                        reps,
-                        len(archive) + 1,
-                        run_profile=confirm_run_profile,
-                        reversal=True,
-                    )
-                    stats = _screen_stats(result)
-                    wall = round(time.monotonic() - t0, 3)
-                    cand["confirm_result"] = result
-                    cand["confirm_stats"] = stats
-                    # Promotion requires BOTH the paired health check (PASS) and
-                    # a non-negative result (mean delta >= 0). The ignored-error
-                    # mismatch is a warning only and never blocks promotion;
-                    # health failures (non-ok measurements, reconnects,
-                    # unverified knobs, failed applies) still block via the
-                    # non-PASS status. The LCB-vs-threshold figure is retained
-                    # in the archive as information only.
-                    improvement_confident = (
-                        stats["df"] >= 1
-                        and stats["lcb_pct"] > min_improvement_pct
-                    )
-                    not_worse = (
-                        stats["df"] >= 1
-                        and stats["mean_delta_pct"] >= 0
-                    )
-                    healthy = (
-                        str(result.get("status", "")).upper()
-                        == TuningStatus.PASS.value
-                    )
-                    cand["confirmed"] = healthy and not_worse
-                    cand["improvement_confident"] = improvement_confident
-                    archive.append(
-                        {
-                            "candidate": cand["source"],
-                            "plan_hash": plan.plan_hash(),
-                            "phase": "confirm",
-                            "repetitions": reps,
-                            "confirm": stats,
-                            "gate_a_positive_lcb": improvement_confident,
-                            "gate_b_paired_pass": healthy,
-                            "confirmed": cand["confirmed"],
-                            "improvement_confident": improvement_confident,
-                            "paired": result.get("paired"),
-                            "reasons": list(result.get("reasons", []) or []),
-                            "wall_seconds": wall,
+            if baseline_result.get("status") != "ok" or not baseline_tps:
+                last_reasons = list(baseline_result.get("reasons", []) or []) or [
+                    "shared baseline produced no usable evidence"
+                ]
+                progress("shared baseline failed — failing the run")
+                status = TuningStatus.FAIL
+            elif dry_run:
+                last_reasons = ["dry-run: validation skipped (no mutations)"]
+                progress("dry-run: skipping candidate validation")
+                status = TuningStatus.INCONCLUSIVE
+            else:
+                for attempt in range(1, max_attempts + 1):
+                    yield Event(
+                        state={
+                            "validation_attempt_count": attempt,
+                            "last_failure": last_reasons,
                         }
                     )
                     progress(
-                        f"confirm {cand['source']} @{reps} reps: "
-                        f"lcb={stats['lcb_pct']:.2f}% "
-                        f"improvement_confident={improvement_confident} "
-                        f"healthy={healthy} → "
-                        f"{'CONFIRMED (apply)' if cand['confirmed'] else 'rejected'}"
+                        f"Attempt {attempt}/{max_attempts} — requesting single experiment... "
+                        f"({len(knob_names)} available knobs, durability={durability_profile})"
                     )
-                # Escalate only while screening is genuinely promising; a
-                # negative mean is not worth more samples.
-                if (
-                    any(c.get("confirmed") for c in confirm_list)
-                    or not screening_promising
-                    or not any_paired
-                ):
-                    break
-        except Exception as exc:
-            progress(f"tune loop error: {exc}")
-            last_reasons = [f"tune loop error: {exc}"]
-            status = TuningStatus.FAIL
-            winner = candidates[0] if candidates else None
-            archive_payload: dict[str, Any] = {
-                "dataset": dataset_meta,
-                "durability_profile": durability_profile,
-                "multi_fidelity": gate,
-                "candidates": archive,
-                "error": str(exc),
-            }
-        else:
-            confirmed = [c for c in confirm_list if c.get("confirmed")]
-            any_paired = any(c.get("screen_result", {}).get("paired") for c in candidates)
-            if not candidates or dry_run:
-                # No valid LLM plan (or dry-run): fail closed, apply nothing.
-                status = TuningStatus.INCONCLUSIVE
-                winner = None
-            elif not any_paired:
-                # Screening produced no usable benchmark evidence.
-                status = TuningStatus.FAIL
-                winner = None
-            elif not confirm_list:
-                status = TuningStatus.INCONCLUSIVE
-                winner = None
-            elif confirmed:
-                # Prefer the strongest proven improvement (highest 95% LCB),
-                # not the noisiest high-mean candidate.
-                winner = max(
-                    confirmed, key=lambda c: c["confirm_stats"]["lcb_pct"]
-                )
-                status = TuningStatus.PASS
-            else:
-                # Screened but not healthy (or not confirmed): fail closed.
-                status = TuningStatus.INCONCLUSIVE
-                winner = candidates[0]
+                    history_lines = [
+                        "Experiment {} [{}]: n_knobs={} mean={:+.2f}% "
+                        "lcb={:+.2f}% status={} confirmed={}".format(
+                            h.get("name"),
+                            h.get("phase"),
+                            h.get("n_knobs"),
+                            float(h.get("mean_delta_pct", 0.0)),
+                            float(h.get("lcb_pct", 0.0)),
+                            h.get("status"),
+                            bool(h.get("confirmed", False)),
+                        )
+                        for h in experiment_history
+                    ]
+                    combined_reasons = list(rejected_history) + history_lines
+                    await ctx.run_node(
+                        recommender_node,
+                        node_input=_recommendation_instruction(
+                            attempt,
+                            combined_reasons or last_reasons,
+                            {},
+                            knob_names,
+                            durability_profile,
+                            workload_hint,
+                        ),
+                    )
+                    # Each attempt the LLM proposes ONE experiment, read
+                    # DIRECTLY from state — never depend on any tool having
+                    # run. `next_experiment` wins; `experiment_design_output`
+                    # (dict or attribute object) is the fallback.
+                    design = _read_next_experiment(state)
+                    if design is None:
+                        note = (
+                            "recommender returned no usable knobs "
+                            "(no experiment design)"
+                        )
+                        if note not in rejected_history:
+                            rejected_history.append(note)
+                        last_reasons = list(rejected_history)
+                        progress(
+                            "Experiment received: no usable knobs "
+                            "(no experiment design)"
+                        )
+                        continue
+                    if isinstance(design, dict):
+                        exp_name = str(
+                            design.get("name") or f"experiment-{attempt}"
+                        )
+                        phase_raw = design.get("phase") or ""
+                        raw_levels = design.get("levels") or []
+                        exp_rationale = str(design.get("rationale") or "")
+                        exp_objective = str(
+                            design.get("objective")
+                            or design.get("summary")
+                            or ""
+                        )
+                    else:
+                        exp_name = str(
+                            getattr(design, "name", "")
+                            or f"experiment-{attempt}"
+                        )
+                        phase_raw = getattr(design, "phase", "") or ""
+                        raw_levels = getattr(design, "levels", []) or []
+                        exp_rationale = str(
+                            getattr(design, "rationale", "") or ""
+                        )
+                        exp_objective = str(
+                            getattr(design, "objective", None)
+                            or getattr(design, "summary", None)
+                            or ""
+                        )
+                    norm_levels: list[dict[str, Any]] = []
+                    for lvl in raw_levels or []:
+                        if isinstance(lvl, dict):
+                            if lvl.get("value") is not None:
+                                lvl_value = lvl.get("value")
+                            else:
+                                lvl_value = lvl.get("recommended_value")
+                            lvl_knob = lvl.get(
+                                "knob",
+                                lvl.get("name", lvl.get("knob_name", "")),
+                            )
+                            lvl_reasoning = str(
+                                lvl.get("reasoning", "") or ""
+                            )
+                            lvl_restart = bool(lvl.get("restart_required", False))
+                        else:
+                            lvl_knob = getattr(
+                                lvl,
+                                "knob",
+                                getattr(
+                                    lvl, "name", getattr(lvl, "knob_name", "")
+                                ),
+                            )
+                            lvl_value = getattr(
+                                lvl,
+                                "value",
+                                getattr(lvl, "recommended_value", None),
+                            )
+                            lvl_reasoning = str(
+                                getattr(lvl, "reasoning", "") or ""
+                            )
+                            lvl_restart = bool(
+                                getattr(lvl, "restart_required", False)
+                            )
+                        if not lvl_knob or lvl_value is None:
+                            continue
+                        norm_levels.append(
+                            {
+                                "knob": str(lvl_knob),
+                                "value": lvl_value,
+                                "reasoning": lvl_reasoning,
+                                "restart_required": lvl_restart,
+                            }
+                        )
+                    if not norm_levels:
+                        note = (
+                            f"experiment {exp_name!r}: no usable knobs "
+                            "(empty levels)"
+                        )
+                        if note not in rejected_history:
+                            rejected_history.append(note)
+                        last_reasons = list(rejected_history)
+                        progress(
+                            f"Experiment {exp_name!r} received: no usable knobs "
+                            "(empty levels)"
+                        )
+                        continue
+                    phase = str(phase_raw or "").strip().lower()
+                    if phase not in _VALID_EXPERIMENT_PHASES:
+                        note = (
+                            f"experiment {exp_name!r}: unknown phase "
+                            f"{phase_raw!r}"
+                        )
+                        if note not in rejected_history:
+                            rejected_history.append(note)
+                        last_reasons = list(rejected_history)
+                        progress(
+                            f"Experiment {exp_name!r} rejected: unknown phase "
+                            f"{phase_raw!r}"
+                        )
+                        continue
+                    distinct = {
+                        str(lvl["knob"]).lower() for lvl in norm_levels
+                    }
+                    if len(distinct) > max_set_knobs:
+                        note = (
+                            f"experiment {exp_name!r}: distinct knobs "
+                            f"{len(distinct)} above cap {max_set_knobs}"
+                        )
+                        if note not in rejected_history:
+                            rejected_history.append(note)
+                        last_reasons = list(rejected_history)
+                        progress(
+                            f"Experiment {exp_name!r} rejected: " + note
+                        )
+                        continue
+                    raw_for_validation = [
+                        {
+                            "name": lvl["knob"],
+                            "value": lvl["value"],
+                            "restart_required": lvl.get("restart_required", False),
+                        }
+                        for lvl in norm_levels
+                    ]
+                    valid_knobs, inv_rejected = _validate_recommendations(
+                        raw_for_validation, inventory, durability_profile
+                    )
+                    if inv_rejected:
+                        for reason in inv_rejected:
+                            if str(reason) not in rejected_history:
+                                rejected_history.append(str(reason))
+                    if not valid_knobs:
+                        last_reasons = list(rejected_history) or [
+                            f"experiment {exp_name!r}: no usable knobs"
+                        ]
+                        progress(
+                            f"Experiment {exp_name!r} received: no usable knobs"
+                        )
+                        continue
+                    plan = build_plan(valid_knobs, context_map)
+                    if not plan.knobs:
+                        note = f"experiment {exp_name!r}: no usable knobs"
+                        if note not in rejected_history:
+                            rejected_history.append(note)
+                        last_reasons = list(rejected_history)
+                        progress(
+                            f"Experiment {exp_name!r} received: no usable knobs"
+                        )
+                        continue
+                    progress(
+                        f"Experiment received: {exp_name} [{phase}] "
+                        f"{len(plan.knobs)} knobs "
+                        f"({', '.join(spec.name for spec in plan.knobs)})"
+                    )
+
+                    def _arm_validate(
+                        *,
+                        plan: KnobPlan,
+                        run_profile: Any,
+                        shared_baseline: Any,
+                        attempt: int,
+                        early_stop_min_reps: Any = None,
+                        **_kwargs: Any,
+                    ) -> dict[str, Any]:
+                        return _validate(
+                            plan,
+                            attempt,
+                            run_profile=run_profile,
+                            shared_baseline=shared_baseline,
+                        )
+
+                    t0 = time.monotonic()
+                    rows = run_experiment_arms(
+                        arms=[(plan, phase, exp_name)],
+                        shared_baseline=shared_baseline,
+                        validate_fn=_arm_validate,
+                        run_profile=candidate_run_profile,
+                        attempt_base=len(archive),
+                        early_stop_min_reps=early_stop_min_reps,
+                        progress=progress,
+                        min_improvement_pct=min_improvement_pct,
+                    )
+                    wall = round(time.monotonic() - t0, 3)
+                    for row in rows:
+                        row_stats = {
+                            "mean_delta_pct": float(
+                                row.get("mean_delta_pct", 0.0)
+                            ),
+                            "lcb_pct": float(row.get("lcb_pct", 0.0)),
+                            "ucb_pct": float(row.get("ucb_pct", 0.0)),
+                            "df": float(row.get("df", 0.0)),
+                        }
+                        row_healthy = (
+                            str(row.get("status", "")).upper()
+                            == TuningStatus.PASS.value
+                        )
+                        tuned_reps = int(row.get("reps", 0) or 0)
+                        archive.append(
+                            {
+                                "candidate": "llm",
+                                "plan_hash": row.get("plan_hash"),
+                                "phase": row.get("phase"),
+                                "status": row.get("status"),
+                                "stats": row_stats,
+                                "repetitions": tuned_reps,
+                                "stopped_early": bool(
+                                    row.get("stopped_early", False)
+                                ),
+                                "gate_a_positive_lcb": bool(
+                                    row.get("improvement_confident", False)
+                                ),
+                                "gate_b_paired_pass": row_healthy,
+                                "confirmed": bool(row.get("confirmed", False)),
+                                "improvement_confident": bool(
+                                    row.get("improvement_confident", False)
+                                ),
+                                "paired": row.get("paired"),
+                                "reasons": list(row.get("reasons", []) or []),
+                                "wall_seconds": wall,
+                                "arm": row.get("arm"),
+                            }
+                        )
+                        candidates.append(
+                            {
+                                "source": "llm",
+                                "plan": row.get("plan"),
+                                "rationale": exp_rationale or "single-experiment",
+                                "result": row.get("result"),
+                                "stats": row_stats,
+                                "confirmed": bool(row.get("confirmed", False)),
+                                "improvement_confident": bool(
+                                    row.get("improvement_confident", False)
+                                ),
+                            }
+                        )
+                        experiment_history.append(
+                            {
+                                "name": exp_name,
+                                "phase": phase,
+                                "n_knobs": len(plan.knobs),
+                                "mean_delta_pct": row_stats["mean_delta_pct"],
+                                "lcb_pct": row_stats["lcb_pct"],
+                                "status": row.get("status"),
+                                "confirmed": bool(row.get("confirmed", False)),
+                            }
+                        )
+                        progress(
+                            f"arm {row.get('arm')} [{row.get('phase')}] "
+                            f"@{tuned_reps} reps: "
+                            f"delta={row_stats['mean_delta_pct']:.2f}% "
+                            f"lcb={row_stats['lcb_pct']:.2f}% "
+                            f"improvement_confident="
+                            f"{bool(row.get('improvement_confident', False))} "
+                            f"healthy={row_healthy} → "
+                            f"{'CONFIRMED (apply)' if row.get('confirmed') else 'rejected'}"
+                        )
+                    all_rows.extend(rows)
+                    experiments_run += 1
+                    row_reasons = [
+                        str(r)
+                        for row in rows
+                        for r in (row.get("reasons") or [])
+                    ]
+                    for reason in row_reasons:
+                        if reason not in rejected_history:
+                            rejected_history.append(reason)
+                    feedback = format_protocol_feedback(
+                        exp_objective or exp_name, rows
+                    )
+                    if feedback not in rejected_history:
+                        rejected_history.append(feedback)
+                    last_reasons = list(rejected_history)
+                    # STRONG WIN: healthy PASS with LCB above the minimum
+                    # improvement stops the loop immediately.
+                    strong_win: dict[str, Any] | None = None
+                    for row in rows:
+                        try:
+                            row_lcb = float(row.get("lcb_pct", 0.0))
+                        except (TypeError, ValueError):
+                            row_lcb = 0.0
+                        if (
+                            str(row.get("status", "")).upper()
+                            == TuningStatus.PASS.value
+                            and bool(row.get("confirmed", False))
+                            and row_lcb > min_improvement_pct
+                        ):
+                            strong_win = row
+                            break
+                    if strong_win is not None:
+                        winner = next(
+                            (
+                                c
+                                for c in candidates
+                                if c.get("plan") is strong_win.get("plan")
+                            ),
+                            None,
+                        )
+                        if winner is None:
+                            win_stats = {
+                                "mean_delta_pct": float(
+                                    strong_win.get("mean_delta_pct", 0.0)
+                                ),
+                                "lcb_pct": float(
+                                    strong_win.get("lcb_pct", 0.0)
+                                ),
+                                "ucb_pct": float(
+                                    strong_win.get("ucb_pct", 0.0)
+                                ),
+                                "df": float(strong_win.get("df", 0.0)),
+                            }
+                            winner = {
+                                "source": "llm",
+                                "plan": strong_win.get("plan"),
+                                "rationale": exp_rationale or "single-experiment",
+                                "result": strong_win.get("result"),
+                                "stats": win_stats,
+                                "confirmed": True,
+                                "improvement_confident": bool(
+                                    strong_win.get(
+                                        "improvement_confident", False
+                                    )
+                                ),
+                            }
+                        status = TuningStatus.PASS
+                        break
+                else:
+                    # Budget exhausted without a strong win: the best
+                    # confirmed experiment (by mean delta) wins.
+                    best_row = pick_winner(
+                        [row for row in all_rows if row.get("confirmed")]
+                    )
+                    if best_row is not None:
+                        winner = next(
+                            (
+                                c
+                                for c in candidates
+                                if c.get("plan") is best_row.get("plan")
+                            ),
+                            None,
+                        )
+                        if winner is None:
+                            win_stats = {
+                                "mean_delta_pct": float(
+                                    best_row.get("mean_delta_pct", 0.0)
+                                ),
+                                "lcb_pct": float(
+                                    best_row.get("lcb_pct", 0.0)
+                                ),
+                                "ucb_pct": float(
+                                    best_row.get("ucb_pct", 0.0)
+                                ),
+                                "df": float(best_row.get("df", 0.0)),
+                            }
+                            winner = {
+                                "source": "llm",
+                                "plan": best_row.get("plan"),
+                                "rationale": "single-experiment",
+                                "result": best_row.get("result"),
+                                "stats": win_stats,
+                                "confirmed": True,
+                                "improvement_confident": bool(
+                                    best_row.get(
+                                        "improvement_confident", False
+                                    )
+                                ),
+                            }
+                        status = TuningStatus.PASS
+                    else:
+                        ever_paired = bool(baseline_tps) or any(
+                            row.get("paired") is not None for row in all_rows
+                        )
+                        if ever_paired:
+                            status = TuningStatus.INCONCLUSIVE
+                        else:
+                            last_reasons = list(rejected_history) or [
+                                "no paired evidence produced"
+                            ]
+                            status = TuningStatus.FAIL
+
+            def _cand_paired(cand: dict[str, Any]) -> Any:
+                res = cand.get("result")
+                if isinstance(res, dict):
+                    return res.get("paired")
+                return getattr(res, "paired", None)
 
             measurement_problem = bool(
                 not dry_run
                 and candidates
-                and any(
-                    c.get("screen_result", {}).get("paired") is None
-                    for c in candidates
-                )
+                and any(_cand_paired(c) is None for c in candidates)
             )
-            archive_payload = {
+            archive_payload: dict[str, Any] = {
                 "dataset": dataset_meta,
                 "durability_profile": durability_profile,
-                "multi_fidelity": gate,
-                "escalation_ladder": reps_ladder,
-                "screening_promising": screening_promising,
+                "single_fidelity": {
+                    "enabled": True,
+                    "candidate_repetitions": candidate_reps,
+                    "candidate_seconds": candidate_run_profile.measurement_seconds,
+                    "candidate_warmup_seconds": candidate_run_profile.warmup_seconds,
+                    "early_stop_min_reps": early_stop_min_reps,
+                },
                 "min_improvement_pct": min_improvement_pct,
                 "candidates": archive,
                 "winner": winner["plan"].plan_hash() if winner else "",
@@ -668,15 +1001,41 @@ def make_tune_loop(recommender_node: Any, validator: Any):
                 "winner_improvement_confident": bool(
                     winner and winner.get("improvement_confident")
                 ),
+                "experiment_history": experiment_history,
+                "experiments_run": experiments_run,
+            }
+        except Exception as exc:
+            progress(f"tune loop error: {exc}")
+            last_reasons = [f"tune loop error: {exc}"]
+            status = TuningStatus.FAIL
+            winner = candidates[0] if candidates else None
+            archive_payload = {
+                "dataset": dataset_meta,
+                "durability_profile": durability_profile,
+                "single_fidelity": {
+                    "enabled": True,
+                    "candidate_repetitions": candidate_reps,
+                    "candidate_seconds": candidate_run_profile.measurement_seconds,
+                    "candidate_warmup_seconds": candidate_run_profile.warmup_seconds,
+                    "early_stop_min_reps": early_stop_min_reps,
+                },
+                "min_improvement_pct": min_improvement_pct,
+                "candidates": archive,
+                "winner": winner["plan"].plan_hash() if winner else "",
+                "measurement_problem": False,
+                "winner_improvement_confident": bool(
+                    winner and winner.get("improvement_confident")
+                ),
+                "experiment_history": experiment_history,
+                "experiments_run": experiments_run,
+                "error": str(exc),
             }
 
         archive_payload["snapshot_images"] = snapshots.images()
-        archive_payload["screen_measurement_seconds"] = (
-            screen_run_profile.measurement_seconds
+        archive_payload["candidate_measurement_seconds"] = (
+            candidate_run_profile.measurement_seconds
         )
-        archive_payload["confirm_measurement_seconds"] = (
-            confirm_run_profile.measurement_seconds
-        )
+        archive_payload["candidate_repetitions"] = candidate_reps
         archive_payload["screen_reversal"] = False
 
         last_reasons = [
@@ -694,28 +1053,20 @@ def make_tune_loop(recommender_node: Any, validator: Any):
         _cleanup_snapshots()
 
         attestation = (
-            (winner.get("confirm_result") or {}).get("attestation") if winner else None
+            (winner.get("result") or {}).get("attestation") if winner else None
         )
-        winner_stats = (
-            (winner.get("confirm_stats") or winner.get("screen_stats") or {})
-            if winner
-            else {}
-        )
+        winner_stats = (winner.get("stats") or {}) if winner else {}
         winner_plan = winner["plan"] if winner else KnobPlan(knobs=[])
         summary = {
             "status": status.value,
             "run_id": run_id,
             "plan_hash": winner_plan.plan_hash(),
-            "attempt_count": len(candidates),
+            "attempt_count": experiments_run,
             "reasons": last_reasons,
             "paired": (
-                (winner.get("confirm_result") or winner.get("screen_result") or {}).get(
-                    "paired"
-                )
-                if winner
-                else None
+                (winner.get("result") or {}).get("paired") if winner else None
             ),
-            "multi_fidelity": archive_payload.get("multi_fidelity"),
+            "single_fidelity": archive_payload.get("single_fidelity"),
             "improvement_confident": archive_payload.get(
                 "winner_improvement_confident"
             ),
@@ -734,7 +1085,7 @@ def make_tune_loop(recommender_node: Any, validator: Any):
                 "validation_attempts": archive,
                 "staging_issues": last_reasons,
                 "candidate_archive": archive_payload,
-                "multi_fidelity": archive_payload.get("multi_fidelity"),
+                "single_fidelity": archive_payload.get("single_fidelity"),
                 "confirmed_delta_pct": winner_stats.get("mean_delta_pct"),
                 "improvement_confident": archive_payload.get(
                     "winner_improvement_confident"

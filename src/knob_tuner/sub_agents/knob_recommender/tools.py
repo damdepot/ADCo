@@ -14,6 +14,8 @@ from src.knob_tuner.tools.kb_planner import get_knob_strategies
 __all__ = [
     "read_knob_details",
     "write_selected_knobs",
+    "write_experiment_protocol",
+    "write_next_experiment",
     "get_knob_strategies",
 ]
 
@@ -282,3 +284,210 @@ def write_selected_knobs(tool_context: ToolContext) -> str:
         return f"OK: wrote {len(recs)} selected knobs to {out_file}"
     except Exception as e:
         return f"ERROR: failed to write selected knobs file: {e}"
+
+
+_VALID_PHASES = ("screen", "interaction", "refinement")
+
+
+def _norm_level(lvl: Any) -> dict[str, Any] | None:
+    if hasattr(lvl, "knob") or hasattr(lvl, "value"):
+        knob = getattr(lvl, "knob", getattr(lvl, "name", ""))
+        value = getattr(lvl, "value", getattr(lvl, "recommended_value", None))
+        reasoning = str(getattr(lvl, "reasoning", "") or "")
+    elif isinstance(lvl, dict):
+        knob = lvl.get("knob", lvl.get("name", lvl.get("knob_name", "")))
+        value = lvl.get("value", lvl.get("recommended_value"))
+        reasoning = str(lvl.get("reasoning", "") or "")
+    else:
+        return None
+    if not knob or value is None:
+        return None
+    return {"knob": str(knob), "value": value, "reasoning": reasoning}
+
+
+def write_experiment_protocol(tool_context: ToolContext) -> str:
+    """Write the designed experiment protocol to ``{knob_path}/experiment-protocol.json``.
+
+    Reads the design from ``tool_context.state['experiment_design_output']``
+    (object with ``.arms``, dict with ``"arms"`` key, or list under
+    ``"designs"``), normalizes arms, drops invalid-phase arms, clamps memory
+    levels, and persists the protocol.
+
+    Returns:
+        Status message with per-phase arm counts.
+    """
+    raw = tool_context.state.get("experiment_design_output")
+    arms_raw: Any = []
+    if raw is None:
+        return "ERROR: no experiment design found in state['experiment_design_output']"
+    if hasattr(raw, "arms"):
+        arms_raw = raw.arms
+    elif isinstance(raw, dict):
+        if isinstance(raw.get("arms"), list):
+            arms_raw = raw["arms"]
+        elif isinstance(raw.get("designs"), list):
+            arms_raw = raw["designs"]
+        elif isinstance(raw, dict) and raw.get("arms") is None and raw.get("designs") is None:
+            arms_raw = []
+    elif isinstance(raw, list):
+        arms_raw = raw
+    if hasattr(raw, "designs") and not arms_raw:
+        try:
+            arms_raw = raw.designs  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - best-effort attr read, fall through to error path
+            arms_raw = []
+    # Fallback: bare list stored under state["designs"].
+    if not arms_raw:
+        alt = tool_context.state.get("designs")
+        if isinstance(alt, list) and alt:
+            arms_raw = alt
+    if not arms_raw:
+        return "ERROR: no experiment design found in state['experiment_design_output']"
+
+    valid: list[dict[str, Any]] = []
+    invalid: list[str] = []
+    for i, entry in enumerate(arms_raw):
+        if hasattr(entry, "name") or hasattr(entry, "phase"):
+            name = str(getattr(entry, "name", "") or f"arm_{i}")
+            phase_raw = getattr(entry, "phase", "")
+            levels_raw = getattr(entry, "levels", []) or []
+            rationale = str(getattr(entry, "rationale", "") or "")
+        elif isinstance(entry, dict):
+            name = str(entry.get("name", f"arm_{i}"))
+            phase_raw = entry.get("phase", "")
+            levels_raw = entry.get("levels", []) or []
+            rationale = str(entry.get("rationale", "") or "")
+        else:
+            invalid.append(f"arm_{i}:<non-dict>")
+            continue
+        phase = str(phase_raw).strip().lower()
+        if phase not in _VALID_PHASES:
+            invalid.append(f"{name}:{phase_raw!r}")
+            continue
+        levels = []
+        for lvl in levels_raw:
+            norm = _norm_level(lvl)
+            if norm is not None:
+                levels.append(norm)
+        if not levels:
+            invalid.append(f"{name}:empty-levels")
+            continue
+        valid.append({"name": name, "phase": phase, "levels": levels, "rationale": rationale})
+
+    if not valid:
+        detail = f" (invalid: {', '.join(invalid)})" if invalid else ""
+        return f"ERROR: no valid arms to write{detail}"
+
+    memory_gb_raw = tool_context.state.get("memory_gb", 1.0)
+    try:
+        memory_gb = float(memory_gb_raw)
+    except (ValueError, TypeError):
+        memory_gb = 1.0
+
+    # Clamp globally so max_connections-aware work_mem limits apply across arms.
+    flat = [{"knob": lv["knob"], "recommended_value": lv["value"]} for arm in valid for lv in arm["levels"]]
+    clamped = _clamp_memory_knobs(flat, memory_gb)
+    idx = 0
+    for arm in valid:
+        for lv in arm["levels"]:
+            lv["value"] = clamped[idx].get("recommended_value", lv["value"])
+            idx += 1
+
+    tool_context.state["experiment_protocol"] = valid
+
+    knob_path = tool_context.state.get("knob_path") or tool_context.state.get("target") or "."
+    out_file = os.path.join(knob_path, "experiment-protocol.json")
+    try:
+        write_json_file(out_file, valid)
+    except Exception as e:  # noqa: BLE001 - report any persistence failure as message
+        return f"ERROR: failed to write experiment protocol file: {e}"
+
+    s = sum(1 for a in valid if a["phase"] == "screen")
+    ia = sum(1 for a in valid if a["phase"] == "interaction")
+    r = sum(1 for a in valid if a["phase"] == "refinement")
+    msg = f"OK: wrote {len(valid)} arms ({s} screen / {ia} interaction / {r} refinement) to {out_file}"
+    if invalid:
+        msg += f"; skipped invalid: {', '.join(invalid)}"
+    return msg
+
+
+def write_next_experiment(tool_context: ToolContext) -> str:
+    """Write the single next sequential experiment to ``experiment-protocol.json``.
+
+    Reads the proposal from ``tool_context.state['experiment_design_output']``
+    (object with attributes, dict with keys, or ``{"experiment": {...}}``
+    wrapper), normalizes levels, validates the phase, clamps memory levels,
+    and persists the normalized experiment.
+    """
+    raw = tool_context.state.get("experiment_design_output")
+    if raw is None:
+        return "ERROR: no experiment proposal found in state['experiment_design_output']"
+    # Unwrap {"experiment": {...}} envelope.
+    if isinstance(raw, dict) and raw.get("experiment") is not None:
+        inner = raw["experiment"]
+        if isinstance(inner, dict) or hasattr(inner, "name") or hasattr(inner, "phase"):
+            raw = inner
+    elif hasattr(raw, "experiment"):
+        inner_attr = getattr(raw, "experiment", None)
+        if inner_attr is not None and (
+            isinstance(inner_attr, dict)
+            or hasattr(inner_attr, "name")
+            or hasattr(inner_attr, "phase")
+        ):
+            raw = inner_attr
+
+    if hasattr(raw, "name") or hasattr(raw, "phase"):
+        name = str(getattr(raw, "name", "") or "next_experiment")
+        phase_raw = getattr(raw, "phase", "")
+        levels_raw = getattr(raw, "levels", []) or []
+        rationale = str(getattr(raw, "rationale", "") or "")
+        objective = str(getattr(raw, "objective", "") or "")
+    elif isinstance(raw, dict):
+        name = str(raw.get("name", "next_experiment"))
+        phase_raw = raw.get("phase", "")
+        levels_raw = raw.get("levels", []) or []
+        rationale = str(raw.get("rationale", "") or "")
+        objective = str(raw.get("objective", "") or "")
+    else:
+        return "ERROR: no experiment proposal found in state['experiment_design_output']"
+
+    phase = str(phase_raw).strip().lower()
+    if phase not in _VALID_PHASES:
+        return f"ERROR: invalid phase {phase_raw!r}: must be one of {list(_VALID_PHASES)}"
+
+    levels: list[dict[str, Any]] = []
+    for lvl in levels_raw:
+        norm = _norm_level(lvl)
+        if norm is not None:
+            levels.append(norm)
+    if not levels:
+        return "ERROR: no valid levels to write"
+
+    memory_gb_raw = tool_context.state.get("memory_gb", 1.0)
+    try:
+        memory_gb = float(memory_gb_raw)
+    except (ValueError, TypeError):
+        memory_gb = 1.0
+
+    # Clamp via same adapt pattern as write_experiment_protocol.
+    flat = [{"knob": lv["knob"], "recommended_value": lv["value"]} for lv in levels]
+    clamped = _clamp_memory_knobs(flat, memory_gb)
+    for lv, cl in zip(levels, clamped):
+        lv["value"] = cl.get("recommended_value", lv["value"])
+
+    normalized = {
+        "name": name,
+        "phase": phase,
+        "levels": levels,
+        "rationale": rationale,
+        "objective": objective,
+    }
+    tool_context.state["next_experiment"] = normalized
+
+    knob_path = tool_context.state.get("knob_path") or tool_context.state.get("target") or "."
+    out_file = os.path.join(knob_path, "experiment-protocol.json")
+    try:
+        write_json_file(out_file, normalized)
+    except Exception as e:  # noqa: BLE001 - report persistence failure as message
+        return f"ERROR: failed to write experiment protocol file: {e}"
+    return f"OK: wrote experiment '{name}' ({phase}, {len(levels)} knob(s)) to {out_file}"

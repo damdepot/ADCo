@@ -375,6 +375,7 @@ def run_sysbench_measurement(
     progress: Callable[[str], None] | None = None,
     prepare: bool = True,
     on_prepared: Callable[[], None] | None = None,
+    on_rep: Callable[[list[float]], bool] | None = None,
 ) -> SysbenchMeasurement:
     """Run a deterministic, repeated sysbench OLTP measurement.
 
@@ -400,6 +401,11 @@ def run_sysbench_measurement(
             warmup/measured runs. Used to snapshot the cleanly loaded dataset.
             A failing callback is reported and otherwise ignored so a snapshot
             failure never fails the measurement.
+        on_rep: Optional per-repetition callback receiving the TPS samples
+            collected so far; return True to stop the arm early (futility).
+            The measurement is then aggregated over the completed reps and the
+            short sample is visible via ``per_run_tps``. A failing callback
+            never fails the measurement.
 
     Returns:
         A ``SysbenchMeasurement``; ``status`` is ``"ok"`` only when every
@@ -558,6 +564,17 @@ def run_sysbench_measurement(
             total_ignored_errors += int(metrics["ignored_errors"])
             total_reconnects += int(metrics["reconnects"])
 
+            if on_rep is not None:
+                try:
+                    if on_rep(list(per_run_tps)):
+                        emit(
+                            f"rep {repetition}/{profile.repetitions}: "
+                            "early stop (futility)"
+                        )
+                        break
+                except Exception as e:
+                    emit(f"on_rep hook failed (continuing): {e}")
+
         # ponytail: sysbench's pgsql driver reports no 95th percentile (always
         # 0.00), so fall back to avg latency to keep the latency gate meaningful.
         median_p95 = _median_or_zero(per_run_p95)
@@ -634,6 +651,7 @@ def run_pgbench_measurement(
     progress: Callable[[str], None] | None = None,
     prepare: bool = True,
     on_prepared: Callable[[], None] | None = None,
+    on_rep: Callable[[list[float]], bool] | None = None,
 ) -> SysbenchMeasurement:
     """Run a repeated, host-side pgbench measurement of the sort/hash workload.
 
@@ -660,6 +678,9 @@ def run_pgbench_measurement(
             fresh ``prepare`` and its settle have completed and before the
             warmup/measured runs (used to snapshot the loaded dataset). A
             failing callback is reported and otherwise ignored.
+        on_rep: Optional per-repetition callback receiving the TPS samples
+            collected so far; return True to stop the arm early (futility).
+            A failing callback never fails the measurement.
 
     Returns:
         A ``SysbenchMeasurement`` whose ``tps`` is the median of the per-run
@@ -829,6 +850,17 @@ def run_pgbench_measurement(
             per_run_tps.append(tps)
             per_run_avg.append(float(metrics["latency_avg_ms"]))
             total_failed += int(metrics["failed_transactions"])
+
+            if on_rep is not None:
+                try:
+                    if on_rep(list(per_run_tps)):
+                        emit(
+                            f"rep {repetition}/{profile.repetitions}: "
+                            "early stop (futility)"
+                        )
+                        break
+                except Exception as e:
+                    emit(f"on_rep hook failed (continuing): {e}")
 
         measurement = SysbenchMeasurement(
             status="ok",

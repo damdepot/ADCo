@@ -302,6 +302,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Warmup seconds for screening (default: 2)",
     )
     parser.add_argument(
+        "--candidate-repetitions",
+        type=int,
+        default=10,
+        help=(
+            "Repetitions per arm in single-fidelity mode: one shared baseline "
+            "plus one arm per candidate, each with this many short runs "
+            "(default: 10)"
+        ),
+    )
+    parser.add_argument(
+        "--candidate-seconds",
+        type=int,
+        default=10,
+        help="Measured seconds per candidate repetition (default: 10)",
+    )
+    parser.add_argument(
+        "--candidate-warmup-seconds",
+        type=int,
+        default=2,
+        help="Warmup seconds per candidate arm (default: 2)",
+    )
+    parser.add_argument(
+        "--early-stop-min-reps",
+        type=int,
+        default=4,
+        help=(
+            "Minimum reps before a candidate arm may stop early for futility "
+            "(95%% upper bound below zero); winners always run the full count "
+            "(default: 4)"
+        ),
+    )
+    parser.add_argument(
+        "--max-set-knobs",
+        type=int,
+        default=20,
+        help=(
+            "Maximum distinct knobs per experiment; larger sets are rejected "
+            "without spending a benchmark run (default: 20)"
+        ),
+    )
+    parser.add_argument(
         "--workload-hint",
         default="",
         help=(
@@ -423,6 +464,11 @@ def build_initial_state(
     durability_profile: str = "strict",
     screening_benchmark: str = "sysbench",
     workload_hint: str = "",
+    candidate_repetitions: int = 10,
+    candidate_measurement_seconds: int = 10,
+    candidate_warmup_seconds: int = 2,
+    early_stop_min_reps: int = 4,
+    max_set_knobs: int = 20,
 ) -> dict[str, Any]:
     """Construct the initial session state for the knob tuner workflow."""
     profile = profile or SysbenchProfile()
@@ -460,6 +506,13 @@ def build_initial_state(
         "durability_profile": durability_profile,
         "screening_benchmark": str(screening_benchmark or "sysbench"),
         "workload_hint": str(workload_hint or ""),
+        "candidate_repetitions": max(2, int(candidate_repetitions or 10)),
+        "candidate_measurement_seconds": max(
+            1, int(candidate_measurement_seconds or 10)
+        ),
+        "candidate_warmup_seconds": max(0, int(candidate_warmup_seconds or 0)),
+        "early_stop_min_reps": max(2, int(early_stop_min_reps or 4)),
+        "max_set_knobs": max(1, int(max_set_knobs or 20)),
     }
 
     if os.path.isfile(db_config_path):
@@ -619,6 +672,11 @@ async def run_pipeline(
     durability_profile: str = "strict",
     screening_benchmark: str = "sysbench",
     workload_hint: str = "",
+    candidate_repetitions: int = 10,
+    candidate_measurement_seconds: int = 10,
+    candidate_warmup_seconds: int = 2,
+    early_stop_min_reps: int = 4,
+    max_set_knobs: int = 20,
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using the ADK Runner and session service."""
     # 1. Resource contract FIRST: fail before any side effect.
@@ -679,6 +737,11 @@ async def run_pipeline(
         durability_profile=durability_profile,
         screening_benchmark=screening_benchmark,
         workload_hint=workload_hint,
+        candidate_repetitions=candidate_repetitions,
+        candidate_measurement_seconds=candidate_measurement_seconds,
+        candidate_warmup_seconds=candidate_warmup_seconds,
+        early_stop_min_reps=early_stop_min_reps,
+        max_set_knobs=max_set_knobs,
     )
 
     initial_state["verbose"] = verbose
@@ -859,6 +922,11 @@ def main() -> None:
                 durability_profile=args.durability_profile,
                 screening_benchmark=args.screening_benchmark,
                 workload_hint=args.workload_hint,
+                candidate_repetitions=args.candidate_repetitions,
+                candidate_measurement_seconds=args.candidate_seconds,
+                candidate_warmup_seconds=args.candidate_warmup_seconds,
+                early_stop_min_reps=args.early_stop_min_reps,
+                max_set_knobs=args.max_set_knobs,
             )
         )
     except Exception as exc:

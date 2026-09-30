@@ -1390,7 +1390,7 @@ def test_snapshot_miss_commits_clean_dataset_then_recreates_arms(
     committed: dict[str, str] = {}
 
     def fake_runner(
-        cfg, prof, workdir=None, progress=None, prepare=True, on_prepared=None
+        cfg, prof, workdir=None, progress=None, prepare=True, on_rep=None, on_prepared=None
     ):
         if prepare and on_prepared is not None:
             on_prepared()
@@ -1447,7 +1447,7 @@ def test_snapshot_commit_failure_falls_back_to_prepare(
     registry = SnapshotRegistry()
 
     def fake_runner(
-        cfg, prof, workdir=None, progress=None, prepare=True, on_prepared=None
+        cfg, prof, workdir=None, progress=None, prepare=True, on_rep=None, on_prepared=None
     ):
         if prepare and on_prepared is not None:
             on_prepared()
@@ -1484,3 +1484,97 @@ def test_snapshot_commit_failure_falls_back_to_prepare(
         True,
     ]
     m_rec.assert_not_called()
+
+
+def test_baseline_only_measures_without_applying_plan(budget, profile, plan, staging_cfg):
+    baseline = _measurement([100.0] * 10)
+    with (
+        patch(f"{_VALIDATION}.start_staging_db", return_value=("stg-container", staging_cfg)),
+        patch(f"{_VALIDATION}.run_sysbench_measurement", return_value=baseline) as m_bench,
+        patch(f"{_VALIDATION}.apply_knobs") as m_apply,
+        patch(f"{_VALIDATION}.restart_docker_db") as m_restart,
+        patch(f"{_VALIDATION}.write_artifact", return_value="/tmp/artifact.json"),
+        patch(f"{_VALIDATION}.stop_staging_db", return_value=(True, "stopped")),
+    ):
+        result = validate_plan(
+            **_call_kwargs(budget, profile, plan),
+            apply_mode=ApplyMode.DYNAMIC,
+            baseline_only=True,
+        )
+
+    assert result["status"] == "ok"
+    assert result["baseline"].tps == baseline.tps
+    assert len(result["baseline"].per_run_tps) == 10
+    m_bench.assert_called_once()
+    m_apply.assert_not_called()
+    m_restart.assert_not_called()
+
+
+def test_shared_baseline_skips_baseline_and_reversal(budget, profile, plan, staging_cfg):
+    shared = _measurement([100.0, 100.0], ignored_errors=20)
+    tuned = _measurement([112.0, 110.0], ignored_errors=38)
+    with (
+        patch(f"{_VALIDATION}.start_staging_db", return_value=("stg-container", staging_cfg)),
+        patch(
+            f"{_VALIDATION}.run_sysbench_measurement", return_value=tuned
+        ) as m_bench,
+        patch(f"{_VALIDATION}.apply_knobs", return_value=_apply_results()),
+        patch(f"{_VALIDATION}.verify_active_knobs", return_value=_verify()),
+        patch(f"{_VALIDATION}.snapshot_settings", side_effect=_settings_seq()),
+        patch(f"{_VALIDATION}.write_artifact", return_value="/tmp/artifact.json"),
+        patch(f"{_VALIDATION}.stop_staging_db", return_value=(True, "stopped")),
+    ):
+        result = validate_plan(
+            **_call_kwargs(budget, profile, plan),
+            apply_mode=ApplyMode.DYNAMIC,
+            shared_baseline=shared,
+            early_stop_min_reps=4,
+        )
+
+    # Only the tuned arm runs: no internal baseline, no reversal.
+    m_bench.assert_called_once()
+    assert result["status"] == "PASS"
+    assert result["stopped_early"] is False
+    assert result["ignored_errors"]["mismatch"] is True
+    assert any(
+        reason.startswith("warning:") and "ignored-error mismatch" in reason
+        for reason in result["reasons"]
+    )
+    assert result["baseline_reversal"]["measured"] is False
+    assert result["baseline_reversal"]["reason"] == (
+        "shared baseline reused across candidates"
+    )
+
+
+def test_early_stop_futility_short_circuits_loser(budget, profile, plan, staging_cfg):
+    shared = _measurement([100.0] * 10)
+
+    def fake_runner(cfg, prof, workdir, progress=None, prepare=True, on_rep=None, on_prepared=None):
+        assert on_rep is not None
+        collected: list[float] = []
+        for sample in (70.0, 72.0, 71.0, 69.0, 68.0, 67.0):
+            collected.append(sample)
+            if on_rep(list(collected)):
+                break
+        return _measurement(collected)
+
+    with (
+        patch(f"{_VALIDATION}.start_staging_db", return_value=("stg-container", staging_cfg)),
+        patch(f"{_VALIDATION}.run_sysbench_measurement", side_effect=fake_runner),
+        patch(f"{_VALIDATION}.apply_knobs", return_value=_apply_results()),
+        patch(f"{_VALIDATION}.verify_active_knobs", return_value=_verify()),
+        patch(f"{_VALIDATION}.snapshot_settings", side_effect=_settings_seq()),
+        patch(f"{_VALIDATION}.write_artifact", return_value="/tmp/artifact.json"),
+        patch(f"{_VALIDATION}.stop_staging_db", return_value=(True, "stopped")),
+    ):
+        result = validate_plan(
+            **_call_kwargs(budget, profile, plan),
+            apply_mode=ApplyMode.DYNAMIC,
+            shared_baseline=shared,
+            early_stop_min_reps=4,
+        )
+
+    assert result["stopped_early"] is True
+    assert len(result["paired"]["tuned"]["per_run_tps"]) == 4
+    # A futility-stopped loser is never reported as a win.
+    assert result["status"] == "FAIL"

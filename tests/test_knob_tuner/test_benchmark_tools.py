@@ -1000,3 +1000,57 @@ def test_on_prepared_failure_is_not_fatal(mock_db_config_pg, tmp_path):
         )
 
     assert result.status == "ok"
+
+
+def test_on_rep_early_stop_truncates_sysbench_reps(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(
+        tables=1,
+        rows_per_table=10,
+        threads=1,
+        warmup_seconds=0,
+        measurement_seconds=1,
+        repetitions=10,
+        seed=42,
+    )
+    side_effect, calls = _make_runner(
+        run_outputs=[_output_with(50.0, 1000.0) for _ in range(10)]
+    )
+    seen: list[list[float]] = []
+
+    def on_rep(samples: list[float]) -> bool:
+        seen.append(list(samples))
+        return len(samples) >= 4
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(
+            mock_db_config_pg, profile, workdir=str(tmp_path), prepare=False, on_rep=on_rep
+        )
+
+    assert result.status == "ok"
+    assert len(result.per_run_tps) == 4
+    assert seen[-1] == [50.0] * 4
+    assert len([cmd for cmd, _ in calls if cmd[-1] == "run"]) == 4
+
+
+def test_on_rep_hook_failure_never_fails_measurement(mock_db_config_pg, tmp_path):
+    profile = SysbenchProfile(
+        tables=1,
+        rows_per_table=10,
+        threads=1,
+        warmup_seconds=0,
+        measurement_seconds=1,
+        repetitions=2,
+        seed=42,
+    )
+    side_effect, _ = _make_runner()
+
+    def on_rep(samples: list[float]) -> bool:
+        raise RuntimeError("hook exploded")
+
+    with patch(DB_CONN_PATCH), patch(RUN_PATCH, side_effect=side_effect):
+        result = run_sysbench_measurement(
+            mock_db_config_pg, profile, workdir=str(tmp_path), prepare=False, on_rep=on_rep
+        )
+
+    assert result.status == "ok"
+    assert len(result.per_run_tps) == 2

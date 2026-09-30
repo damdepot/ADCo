@@ -112,6 +112,31 @@ def welch_delta(
     }
 
 
+def futility_stop(
+    baseline: list[float],
+    tuned_so_far: list[float],
+    min_reps: int = 4,
+) -> tuple[bool, dict[str, Any]]:
+    """Decide whether a candidate arm should stop early for futility.
+
+    Returns ``(stop, stats)`` where ``stats`` is the current
+    :func:`welch_delta` interval. Stopping fires only once at least
+    ``min_reps`` tuned samples exist **and** the 95% upper confidence bound
+    is below zero — i.e. the candidate is statistically unlikely to be
+    non-worse even if all remaining reps ran. This stops losers early only;
+    winners always run to completion, so early stopping cannot manufacture a
+    false PASS (it can only turn a slow rejection into a fast one).
+    """
+    stats = welch_delta(
+        [float(x) for x in baseline], [float(x) for x in tuned_so_far]
+    )
+    if len(tuned_so_far) < max(2, int(min_reps)):
+        return False, stats
+    if not stats.get("sufficient"):
+        return False, stats
+    return bool(stats["ucb_pct"] < 0), stats
+
+
 def estimate_multi_fidelity(
     *,
     n_candidates: int,

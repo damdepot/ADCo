@@ -163,6 +163,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Warmup seconds for screening (default: 2)",
     )
     p.add_argument(
+        "--candidate-repetitions",
+        type=int,
+        default=10,
+        help=(
+            "Repetitions per arm in single-fidelity mode: one shared baseline "
+            "plus one arm per candidate, each with this many short runs "
+            "(default: 10)"
+        ),
+    )
+    p.add_argument(
+        "--candidate-seconds",
+        type=int,
+        default=10,
+        help="Measured seconds per candidate repetition (default: 10)",
+    )
+    p.add_argument(
+        "--candidate-warmup-seconds",
+        type=int,
+        default=2,
+        help="Warmup seconds per candidate arm (default: 2)",
+    )
+    p.add_argument(
+        "--early-stop-min-reps",
+        type=int,
+        default=4,
+        help=(
+            "Minimum reps before a candidate arm may stop early for futility "
+            "(default: 4)"
+        ),
+    )
+    p.add_argument(
+        "--max-set-knobs",
+        type=int,
+        default=20,
+        help=(
+            "Maximum distinct knobs per experiment; larger sets are rejected "
+            "without spending a benchmark run (default: 20)"
+        ),
+    )
+    p.add_argument(
         "--screening-benchmark",
         choices=["sysbench", "pgbench"],
         default="sysbench",
@@ -239,6 +279,11 @@ async def run_pipeline(
     screen_warmup_seconds: int = 2,
     screening_benchmark: str = "sysbench",
     workload_hint: str = "",
+    candidate_repetitions: int = 10,
+    candidate_measurement_seconds: int = 10,
+    candidate_warmup_seconds: int = 2,
+    early_stop_min_reps: int = 4,
+    max_set_knobs: int = 20,
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
 
@@ -341,6 +386,13 @@ async def run_pipeline(
         tuner_extra_state["screening_benchmark"] = screening_benchmark
         if workload_hint:
             tuner_extra_state["workload_hint"] = workload_hint
+        tuner_extra_state["candidate_repetitions"] = candidate_repetitions
+        tuner_extra_state["candidate_measurement_seconds"] = (
+            candidate_measurement_seconds
+        )
+        tuner_extra_state["candidate_warmup_seconds"] = candidate_warmup_seconds
+        tuner_extra_state["early_stop_min_reps"] = early_stop_min_reps
+        tuner_extra_state["max_set_knobs"] = max_set_knobs
 
         tuner_state = await tuner_pipeline(
             target=sandbox,
@@ -459,6 +511,13 @@ def main() -> None:
                 screen_warmup_seconds=getattr(args, "screen_warmup_seconds", 2),
                 screening_benchmark=getattr(args, "screening_benchmark", "sysbench"),
                 workload_hint=getattr(args, "workload_hint", ""),
+                candidate_repetitions=getattr(args, "candidate_repetitions", 10),
+                candidate_measurement_seconds=getattr(args, "candidate_seconds", 10),
+                candidate_warmup_seconds=getattr(
+                    args, "candidate_warmup_seconds", 2
+                ),
+                early_stop_min_reps=getattr(args, "early_stop_min_reps", 4),
+                max_set_knobs=getattr(args, "max_set_knobs", 20),
             )
         )
     except Exception as exc:
