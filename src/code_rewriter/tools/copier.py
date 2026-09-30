@@ -14,21 +14,97 @@ SANDBOX_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..", "out")
 
 _CODE_EXTENSIONS = {".py", ".pyx", ".pyi"}
 
+_SANDBOX_MARKER_NAME = ".adco_sandbox"
+_SANDBOX_MARKER_CONTENT = "adco-managed-sandbox-v1"
+
+
+class SandboxSafetyError(RuntimeError):
+    """Raised when a sandbox destination is unsafe to delete."""
+
+
+def _is_empty_dir(path: str) -> bool:
+    """True when *path* is a directory with no entries."""
+    try:
+        with os.scandir(path) as entries:
+            return not any(entries)
+    except OSError:
+        return False
+
+
+def _is_managed_sandbox(dest: str) -> bool:
+    """True when *dest* contains the marker written by this module."""
+    marker = os.path.join(dest, _SANDBOX_MARKER_NAME)
+    try:
+        content = Path(marker).read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return content == _SANDBOX_MARKER_CONTENT
+
+
+def _protected_paths() -> list[str]:
+    """Paths that must never be removed by sandbox recreation."""
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    return [project_root, os.getcwd(), os.path.abspath(SANDBOX_ROOT)]
+
+
+def _contains_protected_path(dest: str) -> str | None:
+    """Return a protected path that *dest* equals or contains, if any."""
+    dest_real = os.path.realpath(dest)
+    for candidate in _protected_paths():
+        candidate_real = os.path.realpath(candidate)
+        if dest_real == candidate_real:
+            return candidate_real
+        try:
+            if os.path.commonpath([dest_real, candidate_real]) == dest_real:
+                return candidate_real
+        except ValueError:
+            continue
+    return None
+
 
 def copy_entire(source_root: str, sandbox_id: str | None = None, dest_override: str | None = None) -> str:
-    """Copy entire *source_root* into a sandbox."""
+    """Copy entire *source_root* into a sandbox.
+
+    An existing destination is only replaced when it is an empty directory or a
+    sandbox previously created by this module (recognised by the
+    ``.adco_sandbox`` marker file). Any other existing directory is left
+    untouched and a :class:`SandboxSafetyError` is raised instead.
+    """
     if dest_override:
         dest = dest_override
     else:
         sid = sandbox_id or uuid.uuid4().hex[:12]
         dest = os.path.join(SANDBOX_ROOT, sid)
 
-    if os.path.exists(dest):
-        shutil.rmtree(dest)
+    dest = os.path.abspath(dest)
 
-    shutil.copytree(source_root, dest, ignore=shutil.ignore_patterns(
+    if os.path.exists(dest):
+        if not os.path.isdir(dest):
+            raise SandboxSafetyError(
+                f"refusing to overwrite non-directory sandbox path: {dest}"
+            )
+        if not _is_empty_dir(dest):
+            if not _is_managed_sandbox(dest):
+                raise SandboxSafetyError(
+                    f"refusing to delete existing directory {dest!r}: it is not a "
+                    f"recognised ADCo sandbox (no {_SANDBOX_MARKER_NAME} marker). "
+                    f"Remove it manually or choose a fresh sandbox directory."
+                )
+            blocked = _contains_protected_path(dest)
+            if blocked:
+                raise SandboxSafetyError(
+                    f"refusing to delete {dest!r}: it contains the protected path {blocked!r}"
+                )
+            shutil.rmtree(dest)
+
+    os.makedirs(dest, exist_ok=True)
+    Path(os.path.join(dest, _SANDBOX_MARKER_NAME)).write_text(
+        _SANDBOX_MARKER_CONTENT, encoding="utf-8"
+    )
+    shutil.copytree(source_root, dest, dirs_exist_ok=True, ignore=shutil.ignore_patterns(
         ".git", "__pycache__", ".venv", "venv", "node_modules",
-        "*.pyc", ".mypy_cache", ".pytest_cache", "sandbox", "output_sandbox", "out"
+        "*.pyc", ".mypy_cache", ".pytest_cache", "sandbox", "output_sandbox", "out",
+        _SANDBOX_MARKER_NAME,
     ))
 
     return os.path.abspath(dest)
@@ -125,7 +201,10 @@ def copy_to_sandbox(tool_context: ToolContext) -> str:
     if not target:
         return "ERROR: target path not set in state"
     dest_override = tool_context.state.get("sandbox_dir") or tool_context.state.get("dest_override")
-    sandbox = copy_entire(target, dest_override=dest_override)
+    try:
+        sandbox = copy_entire(target, dest_override=dest_override)
+    except SandboxSafetyError as e:
+        return f"ERROR: {e}"
     n = rewrite_imports(sandbox, target)
     tool_context.state["sandbox"] = sandbox
     return f"OK: sandbox created at {sandbox} ({n} files had imports rewritten)"

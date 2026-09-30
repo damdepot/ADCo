@@ -21,6 +21,7 @@ from .kb_planner import (
     plan_knob_tuning,
 )
 from .benchmark_tools import (
+    run_pgbench_measurement,
     run_sysbench_benchmark,
 )
 from .docker_tools import (
@@ -51,6 +52,7 @@ __all__ = [
     "plan_knob_tuning",
     "KnobStrategyDef",
     "run_sysbench_benchmark",
+    "run_pgbench_measurement",
     "is_docker_available",
     "resolve_docker_image",
     "start_staging_db",

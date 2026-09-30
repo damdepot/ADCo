@@ -14,7 +14,7 @@ from src.knob_tuner.sub_agents.knob_recommender.models import (
     KnobRecommenderOutput,
 )
 from src.knob_tuner.sub_agents.knob_recommender.tools import (
-    read_knobs_file,
+    read_knob_details,
     write_selected_knobs,
 )
 
@@ -107,7 +107,7 @@ def test_create_knob_recommender_agent():
     assert agent.generate_content_config.temperature == 0.0
     assert len(agent.tools) == 3
     tool_names = [t.__name__ for t in agent.tools]
-    assert "read_knobs_file" in tool_names
+    assert "read_knob_details" in tool_names
     assert "write_selected_knobs" in tool_names
     assert "get_knob_strategies" in tool_names
 
@@ -123,29 +123,50 @@ def test_knob_recommender_prompt_guardrails():
     assert "wal_buffers" in KNOB_RECOMMENDER_PROMPT
     assert "max_wal_size >= 4GB" in KNOB_RECOMMENDER_PROMPT
     assert "checkpoint_completion_target = 0.9" in KNOB_RECOMMENDER_PROMPT
+    # names-first selection + inventory grounding
+    assert "LIST OF AVAILABLE KNOB NAMES" in KNOB_RECOMMENDER_PROMPT
+    assert "read_knob_details" in KNOB_RECOMMENDER_PROMPT
+    assert "Never" in KNOB_RECOMMENDER_PROMPT
+    # durability policy is explicit
+    assert "strict" in KNOB_RECOMMENDER_PROMPT
+    assert "relaxed" in KNOB_RECOMMENDER_PROMPT
+    assert "synchronous_commit" in KNOB_RECOMMENDER_PROMPT
 
 
 
 # ===========================================================================
-# 3. read_knobs_file Tool Tests
+# 3. read_knob_details Tool Tests
 # ===========================================================================
 
-def test_read_knobs_file_from_disk_list():
+def test_read_knob_details_from_disk_list():
     with tempfile.TemporaryDirectory() as tmpdir:
         knobs_data = [
             {
                 "name": "shared_buffers",
-                "current_value": "128MB",
+                "current_value": "128",
                 "unit": "MB",
-                "category": "Resource Usage / Memory",
+                "context": "user",
+                "vartype": "integer",
+                "min_val": 16,
+                "max_val": 16384,
+                "pending_restart": False,
                 "description": "Sets memory for shared buffers",
             },
             {
                 "name": "work_mem",
-                "current_value": "4MB",
+                "current_value": "4",
                 "unit": "MB",
-                "category": "Resource Usage / Memory",
+                "context": "user",
+                "vartype": "integer",
+                "pending_restart": False,
                 "description": "Sets memory for query workspaces",
+            },
+            {
+                "name": "random_page_cost",
+                "current_value": "4",
+                "unit": "",
+                "context": "user",
+                "description": "Cost of a non-sequential page fetch",
             },
         ]
         knobs_path = os.path.join(tmpdir, "knobs.json")
@@ -153,54 +174,53 @@ def test_read_knobs_file_from_disk_list():
             json.dump(knobs_data, f)
 
         tc = MockToolContext({"knob_path": tmpdir})
-        result = read_knobs_file(tc)
+        result = read_knob_details("shared_buffers, work_mem", tc)
 
-        assert "Read 2 tunable knobs" in result
         assert "shared_buffers" in result
         assert "work_mem" in result
-        assert "knobs_info" in tc.state
-        assert len(tc.state["knobs_info"]) == 2
+        assert "128 MB" in result
+        assert "4 MB" in result
+        assert "context=user" in result
+        assert "range=16..16384" in result
+        assert "random_page_cost" not in result
 
 
-def test_read_knobs_file_from_disk_dict():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        knobs_data = {
-            "available_knobs": [
-                {
-                    "name": "innodb_buffer_pool_size",
-                    "current_value": "134217728",
-                    "unit": "",
-                    "category": "InnoDB",
-                }
-            ]
-        }
-        knobs_path = os.path.join(tmpdir, "knobs.json")
-        with open(knobs_path, "w", encoding="utf-8") as f:
-            json.dump(knobs_data, f)
-
-        tc = MockToolContext({"target": tmpdir})
-        result = read_knobs_file(tc)
-
-        assert "Read 1 tunable knobs" in result
-        assert "innodb_buffer_pool_size" in result
-        assert len(tc.state["knobs_info"]) == 1
-
-
-def test_read_knobs_file_fallback_to_state():
+def test_read_knob_details_fallback_to_state():
     knobs_state = [
-        {"name": "max_wal_size", "current_value": "1GB", "category": "WAL"}
+        {
+            "name": "max_wal_size",
+            "current_value": "1",
+            "unit": "GB",
+            "context": "sighup",
+            "description": "Maximum size to let the WAL grow",
+        }
     ]
     tc = MockToolContext({"knob_path": "/nonexistent/dir", "knobs_info": knobs_state})
-    result = read_knobs_file(tc)
+    result = read_knob_details("max_wal_size", tc)
 
-    assert "Read 1 tunable knobs" in result
     assert "max_wal_size" in result
+    assert "1 GB" in result
+    assert "context=sighup" in result
 
 
-def test_read_knobs_file_missing_everywhere():
+def test_read_knob_details_missing_name():
+    knobs_state = [
+        {"name": "shared_buffers", "current_value": "128", "unit": "MB"}
+    ]
+    tc = MockToolContext(
+        {"knob_path": "/nonexistent/dir", "knobs_info": knobs_state}
+    )
+    result = read_knob_details("shared_buffers, bogus_knob", tc)
+
+    assert "shared_buffers" in result
+    assert "128 MB" in result
+    assert "Missing: bogus_knob" in result
+
+
+def test_read_knob_details_missing_everywhere():
     tc = MockToolContext({"knob_path": "/nonexistent/dir"})
-    result = read_knobs_file(tc)
-    assert "ERROR: knobs file not found" in result
+    result = read_knob_details("shared_buffers", tc)
+    assert result.startswith("ERROR:")
 
 
 # ===========================================================================

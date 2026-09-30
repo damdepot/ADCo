@@ -64,6 +64,48 @@ def test_copy_entire_excludes_pycache_and_git(temp_sandbox_root):
         assert not os.path.exists(os.path.join(dest, "sandbox"))
 
 
+def test_copy_entire_refuses_to_delete_unmanaged_directory(temp_sandbox_root):
+    with tempfile.TemporaryDirectory() as source:
+        Path(os.path.join(source, "app.py")).write_text("print('hello')")
+        with tempfile.TemporaryDirectory() as parent:
+            dest = os.path.join(parent, "existing")
+            os.makedirs(dest)
+            Path(os.path.join(dest, "keep.txt")).write_text("precious")
+
+            with pytest.raises(copier_mod.SandboxSafetyError):
+                copy_entire(source, dest_override=dest)
+
+            assert os.path.isfile(os.path.join(dest, "keep.txt"))
+
+
+def test_copy_entire_replaces_managed_sandbox(temp_sandbox_root):
+    with tempfile.TemporaryDirectory() as source:
+        Path(os.path.join(source, "app.py")).write_text("one")
+        with tempfile.TemporaryDirectory() as parent:
+            dest = os.path.join(parent, "sandbox")
+            copy_entire(source, dest_override=dest)
+            Path(os.path.join(dest, "stale.py")).write_text("stale")
+
+            again = copy_entire(source, dest_override=dest)
+
+            assert again == os.path.abspath(dest)
+            assert os.path.isfile(os.path.join(dest, "app.py"))
+            assert not os.path.exists(os.path.join(dest, "stale.py"))
+
+
+def test_copy_entire_allows_precreated_empty_directory(temp_sandbox_root):
+    with tempfile.TemporaryDirectory() as source:
+        Path(os.path.join(source, "app.py")).write_text("one")
+        with tempfile.TemporaryDirectory() as parent:
+            dest = os.path.join(parent, "sandbox")
+            os.makedirs(dest)
+
+            result = copy_entire(source, dest_override=dest)
+
+            assert result == os.path.abspath(dest)
+            assert os.path.isfile(os.path.join(dest, "app.py"))
+
+
 def test_rewrite_imports_from_pkg_sub_util(temp_sandbox_root):
     with tempfile.TemporaryDirectory() as project_root:
         project_root_path = Path(project_root)

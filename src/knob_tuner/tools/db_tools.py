@@ -8,6 +8,13 @@ from src.knob_tuner.contracts import ApplyMode, KnobScope
 from .db_connector import DBConfig, get_connection, run_safe_query
 
 
+def _sql_string_literal(value: Any) -> str:
+    """Escape a value for use inside a single-quoted SQL string literal."""
+    text = str(value)
+    text = text.replace("\\", "\\\\").replace("'", "''")
+    return f"'{text}'"
+
+
 def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any, restart_required: bool = False) -> str:
     """Format SQL statement for applying a knob depending on the database engine.
 
@@ -31,7 +38,7 @@ def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any, restart_requ
         elif val_str.lower() in ("on", "off", "true", "false") or val_str.isdigit():
             return f"ALTER SYSTEM SET {knob_name} = {val_str};"
         else:
-            return f"ALTER SYSTEM SET {knob_name} = '{val_str}';"
+            return f"ALTER SYSTEM SET {knob_name} = {_sql_string_literal(val_str)};"
 
     elif db_type_norm == "mysql":
         # For MySQL, SET GLOBAL <knob> = <value>; or SET PERSIST_ONLY <knob> = <value>;
@@ -41,7 +48,7 @@ def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any, restart_requ
         elif val_str.lower() in ("on", "off", "true", "false") or val_str.isdigit():
             return f"{cmd} {knob_name} = {val_str};"
         else:
-            return f"{cmd} {knob_name} = '{val_str}';"
+            return f"{cmd} {knob_name} = {_sql_string_literal(val_str)};"
 
     else:
         raise ValueError(f"Unsupported db_type for knob application: '{db_type}'")
@@ -454,9 +461,6 @@ def test_database(cfg: DBConfig) -> dict[str, Any]:
 test_database.__test__ = False  # type: ignore[attr-defined]
 
 
-test_database.__test__ = False  # type: ignore[attr-defined]
-
-
 _PG_MEMORY_UNITS = {"b", "kb", "mb", "gb", "tb", "8kb", "16kb", "32kb", "64kb"}
 _PG_TIME_UNITS = {"us", "ms", "s", "min", "h", "d"}
 
@@ -606,6 +610,40 @@ def _values_are_equivalent(expected_val: Any, actual_val: Any, unit: str = "", v
     else:
         return _compare_bool(exp_str, act_str) or _compare_numeric(exp_str, act_str, unit) or _compare_string(exp_str, act_str)
 
+
+
+_NOOP_CURRENT_KEYS = ("current_value", "setting")
+
+
+def is_noop_value(entry: dict[str, Any], value: Any) -> bool:
+    """True when ``value`` is value-equivalent to the knob's current effective value.
+
+    ``entry`` is a knob-inventory record: the current setting is read from
+    ``current_value`` (falling back to ``setting``) and the ``unit``,
+    ``vartype`` and ``enumvals`` enrichment fields drive the comparison, so
+    ``"4GB"``, ``"4096MB"`` and page counts such as ``"524288"`` (with an
+    ``8kB`` unit) all compare equal. Returns ``False`` whenever the current
+    value is missing or the values cannot be parsed, so an unprovable no-op
+    never blocks a recommendation.
+    """
+    current: Any = None
+    for key in _NOOP_CURRENT_KEYS:
+        candidate = entry.get(key)
+        if candidate not in (None, ""):
+            current = candidate
+            break
+    if current is None:
+        return False
+    try:
+        return _values_are_equivalent(
+            value,
+            current,
+            unit=str(entry.get("unit") or ""),
+            vartype=str(entry.get("vartype") or ""),
+            enumvals=entry.get("enumvals"),
+        )
+    except Exception:
+        return False
 
 
 # ponytail: PostgreSQL knobs whose value "-1" means "auto". pg_settings.setting

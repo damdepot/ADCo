@@ -38,7 +38,7 @@ from src.knob_tuner.contracts import (
     SysbenchProfile,
     TuningStatus,
 )
-from src.knob_tuner.tools.db_connector import load_db_config
+from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
 from src.knob_tuner.tools.docker_tools import (
     ACTIVE_CONTAINERS,
     cleanup_orphan_containers,
@@ -246,12 +246,85 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--apply-mode",
-        choices=["none", "dynamic", "persist-static"],
+        choices=[
+            "none",
+            "dynamic",
+            "persist-static",
+            "safe-auto",
+            "maintenance-assisted",
+        ],
         default="dynamic",
         help=(
-            "How validated knobs are applied live: 'dynamic' applies reloadable "
-            "knobs; 'persist-static' also persists restart-required knobs for a "
-            "manual restart (default: dynamic)"
+            "How validated knobs are applied live: 'safe-auto' (alias 'dynamic') "
+            "applies reloadable knobs only; 'maintenance-assisted' (alias "
+            "'persist-static') never mutates production and instead emits literal "
+            "manual SQL plus a restart procedure (default: dynamic/safe-auto)"
+        ),
+    )
+    parser.add_argument(
+        "--multi-fidelity-min-seconds",
+        type=float,
+        default=300.0,
+        help=(
+            "Minimum absolute time saving (seconds) required to enable multi-fidelity "
+            "cheap screening; recorded in every archive/report (default: 300)"
+        ),
+    )
+    parser.add_argument(
+        "--screen-total-rows",
+        type=int,
+        default=0,
+        help=(
+            "Total sysbench rows for the screening dataset; 0 derives it from the "
+            "inspected target's row estimates (default: 0)"
+        ),
+    )
+    parser.add_argument(
+        "--screen-max-rows",
+        type=int,
+        default=5_000_000,
+        help="Upper bound on the derived screening dataset size (default: 5000000)",
+    )
+    parser.add_argument(
+        "--screening-benchmark",
+        choices=["sysbench", "pgbench"],
+        default="sysbench",
+        help=(
+            "Measurement used by the screening gate: 'sysbench' OLTP (default) or "
+            "'pgbench' sort/hash analytical workload"
+        ),
+    )
+    parser.add_argument(
+        "--confirm-repetitions",
+        type=int,
+        default=5,
+        help=(
+            "Repetitions for the confirmation measurement (default: 5). Starting "
+            "at the escalation cap avoids a 3-rep rung that fails by chance and "
+            "then wastes a whole extra pass."
+        ),
+    )
+    parser.add_argument(
+        "--workload-hint",
+        default="",
+        help=(
+            "Free-text description of the production workload shown to the "
+            "recommender (e.g. an aggregate/sort-heavy analytical workload)"
+        ),
+    )
+    parser.add_argument(
+        "--rand-type",
+        default=None,
+        help="sysbench --rand-type (default: profile value, 'pareto')",
+    )
+    parser.add_argument(
+        "--durability-profile",
+        choices=["strict", "relaxed"],
+        default="strict",
+        help=(
+            "Durability policy for recommended knobs: 'strict' (default) forbids "
+            "relaxing synchronous_commit/full_page_writes/fsync; 'relaxed' permits "
+            "synchronous_commit=off and similar for commit-bound workloads"
         ),
     )
     parser.add_argument(
@@ -317,6 +390,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _redact_db_config(cfg: DBConfig) -> dict[str, Any]:
+    """Return a JSON-serializable view of *cfg* with the password removed.
+
+    Session state is persisted and may be sent to a remote session service, so
+    secrets must never be stored there. The real :class:`DBConfig` is
+    reconstructed from ``db_config_path`` by the nodes that connect.
+    """
+    return {
+        "host": cfg.host,
+        "port": cfg.port,
+        "user": cfg.user,
+        "database": cfg.database,
+        "db_type": cfg.db_type,
+        "env": cfg.env,
+        "restart_type": cfg.restart_type,
+        "restart_target": cfg.restart_target,
+        "restart_cmd": cfg.restart_cmd,
+        "remote_host": cfg.remote_host,
+        "remote_user": cfg.remote_user,
+    }
+
+
 def build_initial_state(
     target: str,
     db_type: str,
@@ -332,6 +427,13 @@ def build_initial_state(
     run_id: str = "",
     run_dir: str = "",
     apply_mode: str = "dynamic",
+    multi_fidelity_min_seconds: float = 300.0,
+    screen_total_rows: int = 0,
+    screen_max_rows: int = 5_000_000,
+    confirm_repetitions: int = 5,
+    durability_profile: str = "strict",
+    screening_benchmark: str = "sysbench",
+    workload_hint: str = "",
 ) -> dict[str, Any]:
     """Construct the initial session state for the knob tuner workflow."""
     profile = profile or SysbenchProfile()
@@ -361,17 +463,25 @@ def build_initial_state(
         "dry_run": dry_run,
         "validation_attempt_count": 0,
         "max_validation_attempts": 4,
+        "multi_fidelity_min_seconds": float(multi_fidelity_min_seconds),
+        "screen_total_rows": int(screen_total_rows),
+        "screen_max_rows": int(screen_max_rows),
+        "confirm_repetitions": int(confirm_repetitions),
+        "durability_profile": durability_profile,
+        "screening_benchmark": str(screening_benchmark or "sysbench"),
+        "workload_hint": str(workload_hint or ""),
     }
 
     if os.path.isfile(db_config_path):
         try:
             cfg = load_db_config(db_config_path, db_type=db_type, db_override=db_name)
-            state["db_config"] = cfg
+            redacted = _redact_db_config(cfg)
+            state["db_config"] = redacted
             state["database"] = cfg.database
             state["dbname"] = cfg.database
             if production_db:
-                state["production_db_config"] = cfg
-                state["prod_db_config"] = cfg
+                state["production_db_config"] = redacted
+                state["prod_db_config"] = redacted
         except Exception:
             pass
 
@@ -509,6 +619,14 @@ async def run_pipeline(
     results_dir: str = "results/dco",
     sysbench_profile: Any = None,
     extra_initial_state: dict[str, Any] | None = None,
+    multi_fidelity_min_seconds: float = 300.0,
+    screen_total_rows: int = 0,
+    screen_max_rows: int = 5_000_000,
+    confirm_repetitions: int = 5,
+    rand_type: str | None = None,
+    durability_profile: str = "strict",
+    screening_benchmark: str = "sysbench",
+    workload_hint: str = "",
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using the ADK Runner and session service."""
     register_cleanup_handlers()
@@ -516,6 +634,8 @@ async def run_pipeline(
     # 1. Resource contract FIRST: fail before any side effect.
     budget = _parse_budget(cpu_cores_arg, memory_arg)
     profile = _load_profile(sysbench_profile)
+    if rand_type:
+        profile.rand_type = rand_type
 
     target_abs = os.path.abspath(target)
     db_config_abs = os.path.abspath(db_config)
@@ -535,8 +655,10 @@ async def run_pipeline(
         try:
             orphans = cleanup_orphan_containers()
             if orphans:
+                # cleanup_orphan_containers returns an int count; tolerate a list too.
+                count = orphans if isinstance(orphans, int) else len(orphans)
                 _log_event(
-                    f"Cleaned up {len(orphans)} stale orphan container(s): {', '.join(orphans)}",
+                    f"Cleaned up {count} stale orphan container(s)",
                     log_file=log_file_abs,
                     verbose=verbose,
                 )
@@ -558,6 +680,13 @@ async def run_pipeline(
         run_id=run_id,
         run_dir=run_dir,
         apply_mode=apply_mode,
+        multi_fidelity_min_seconds=multi_fidelity_min_seconds,
+        screen_total_rows=screen_total_rows,
+        screen_max_rows=screen_max_rows,
+        confirm_repetitions=confirm_repetitions,
+        durability_profile=durability_profile,
+        screening_benchmark=screening_benchmark,
+        workload_hint=workload_hint,
     )
 
     initial_state["verbose"] = verbose
@@ -729,6 +858,16 @@ def main() -> None:
                 apply_mode=args.apply_mode,
                 results_dir=args.results_dir,
                 sysbench_profile=args.sysbench_profile,
+                multi_fidelity_min_seconds=getattr(
+                    args, "multi_fidelity_min_seconds", 300.0
+                ),
+                screen_total_rows=getattr(args, "screen_total_rows", 0),
+                screen_max_rows=getattr(args, "screen_max_rows", 5_000_000),
+                confirm_repetitions=getattr(args, "confirm_repetitions", 5),
+                rand_type=getattr(args, "rand_type", None),
+                durability_profile=getattr(args, "durability_profile", "strict"),
+                screening_benchmark=getattr(args, "screening_benchmark", "sysbench"),
+                workload_hint=getattr(args, "workload_hint", ""),
             )
         )
     except Exception as exc:
@@ -763,6 +902,13 @@ def main() -> None:
         or result.get("prod_restart_required_knobs", [])
         or manifest.get("pending_restart_knobs", [])
     )
+    manual_sql = live_out.get("manual_sql") or []
+    if manual_sql:
+        print("\n=== Manual SQL (maintenance-assisted) ===")
+        for statement in manual_sql:
+            print(f"  {statement}")
+        print("Apply these during your maintenance window, then restart the database.")
+
     print("\n=== Next Steps ===")
     if restart_knobs:
         knob_names = [

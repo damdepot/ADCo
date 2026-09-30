@@ -29,7 +29,7 @@ def create_knob_recommender_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash
         before_model_callback=make_buffer_callback(buffer_time),
         tools=[
             tools.get_knob_strategies,
-            tools.read_knobs_file,
+            tools.read_knob_details,
             tools.write_selected_knobs,
         ],
         output_schema=KnobRecommenderOutput,

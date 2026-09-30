@@ -39,6 +39,8 @@ def test_build_parser():
     assert args.mode == "all"
     assert args.apply_mode == "dynamic"
     assert args.buffer_time == 0.0
+    assert args.screening_benchmark == "sysbench"
+    assert args.workload_hint == ""
 
 
 def test_build_parser_custom_options():
@@ -56,6 +58,8 @@ def test_build_parser_custom_options():
         "--mode", "tune-only",
         "--apply-mode", "persist-static",
         "--buffer-time", "2.5",
+        "--screening-benchmark", "pgbench",
+        "--workload-hint", "analytical sort spills",
     ])
     assert args.target == "my_target"
     assert args.db_name == "my_db"
@@ -69,6 +73,8 @@ def test_build_parser_custom_options():
     assert args.mode == "tune-only"
     assert args.apply_mode == "persist-static"
     assert args.buffer_time == 2.5
+    assert args.screening_benchmark == "pgbench"
+    assert args.workload_hint == "analytical sort spills"
 
 
 
@@ -182,6 +188,38 @@ def test_run_pipeline_tune_only(mock_tuner, mock_rewriter, mock_intent, tmp_path
     assert os.path.exists(out_file)
     assert res["mode"] == "tune-only"
     assert res["sandbox"] == str(target_dir.resolve())
+
+
+@patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.rewriter_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.tuner_pipeline", new_callable=AsyncMock)
+def test_run_pipeline_forwards_screening_config_to_tuner(
+    mock_tuner, mock_rewriter, mock_intent, tmp_path
+):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+
+    log_file = tmp_path / "adco.log"
+    out_file = tmp_path / "result.json"
+
+    mock_intent.return_value = {"workload_info": {"query_types": ["SELECT"]}}
+    mock_tuner.return_value = {"staging_validated": True}
+
+    asyncio.run(
+        run_pipeline(
+            target=str(target_dir),
+            mode="tune-only",
+            log_file=str(log_file),
+            output_path=str(out_file),
+            db_name="testdb",
+            screening_benchmark="pgbench",
+            workload_hint="Analytical GROUP BY spills to disk",
+        )
+    )
+
+    extra = mock_tuner.call_args.kwargs["extra_initial_state"]
+    assert extra["screening_benchmark"] == "pgbench"
+    assert extra["workload_hint"] == "Analytical GROUP BY spills to disk"
 
 
 @patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)

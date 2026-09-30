@@ -6,6 +6,7 @@ from src.knob_tuner.contracts import ApplyMode, KnobScope
 from src.knob_tuner.tools.db_connector import DBConfig
 from src.knob_tuner.tools.db_tools import (
     apply_knobs,
+    is_noop_value,
     snapshot_settings,
     test_database as run_test_database,
     verify_active_knobs,
@@ -56,6 +57,22 @@ def test_apply_knobs_dry_run_mysql(mock_db_config_mysql):
     assert results[0]["sql"] == "SET GLOBAL innodb_buffer_pool_size = 1073741824;"
     assert results[1]["sql"] == "SET GLOBAL max_connections = 200;"
     assert results[2]["sql"] == "SET GLOBAL autocommit = 1;"
+
+
+def test_apply_knobs_escapes_malicious_value_postgres(mock_db_config_pg):
+    knobs = [{"name": "work_mem", "value": "1'; DROP TABLE users; --"}]
+    results = apply_knobs(knobs, mock_db_config_pg, dry_run=True)
+    assert results[0]["sql"] == (
+        "ALTER SYSTEM SET work_mem = '1''; DROP TABLE users; --';"
+    )
+
+
+def test_apply_knobs_escapes_malicious_value_mysql(mock_db_config_mysql):
+    knobs = [{"name": "work_mem", "value": "1'; DROP TABLE users; --"}]
+    results = apply_knobs(knobs, mock_db_config_mysql, dry_run=True)
+    assert results[0]["sql"] == (
+        "SET GLOBAL work_mem = '1''; DROP TABLE users; --';"
+    )
 
 
 def test_apply_knobs_empty_list(mock_db_config_pg):
@@ -454,3 +471,50 @@ def test_verify_active_knobs_mysql(mock_db_config_mysql, mock_db_conn):
         assert res["all_verified"] is True
         for knob in res["knobs"]:
             assert knob["status"] == "VERIFIED"
+
+
+def test_is_noop_value_equivalent_memory_units():
+    entry = {"current_value": "524288", "unit": "8kB", "vartype": "integer"}
+    assert is_noop_value(entry, "4GB") is True
+    assert is_noop_value(entry, "4096MB") is True
+    assert is_noop_value(entry, "524288") is True
+
+
+def test_is_noop_value_rejects_genuine_change():
+    entry = {"current_value": "524288", "unit": "8kB", "vartype": "integer"}
+    assert is_noop_value(entry, "8GB") is False
+
+
+def test_is_noop_value_reads_setting_alias():
+    entry = {"setting": "4", "vartype": "integer"}
+    assert is_noop_value(entry, 4) is True
+    assert is_noop_value(entry, 5) is False
+
+
+def test_is_noop_value_missing_current_returns_false():
+    assert is_noop_value({}, "4GB") is False
+    assert is_noop_value({"current_value": ""}, "4GB") is False
+
+
+def test_is_noop_value_unknown_unit_falls_back_conservatively():
+    entry = {"current_value": "4", "unit": "furlongs", "vartype": ""}
+    assert is_noop_value(entry, "4") is True
+    assert is_noop_value(entry, "4xyz") is False
+
+
+def test_is_noop_value_bool_and_enum_equivalence():
+    assert is_noop_value({"current_value": "on", "vartype": "bool"}, "true") is True
+    assert (
+        is_noop_value(
+            {"current_value": "off", "vartype": "bool"},
+            "on",
+        )
+        is False
+    )
+    enum_entry = {
+        "current_value": "lz4",
+        "vartype": "enum",
+        "enumvals": ["off", "pglz", "lz4"],
+    }
+    assert is_noop_value(enum_entry, "lz4") is True
+    assert is_noop_value(enum_entry, "on") is False

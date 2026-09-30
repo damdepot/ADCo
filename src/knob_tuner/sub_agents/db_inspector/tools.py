@@ -8,13 +8,41 @@ from src.knob_tuner.sub_agents.db_inspector.models import (
     KnobInfo,
     TableInfo,
 )
-from src.knob_tuner.tools.db_connector import DBConfig, run_safe_query
+from src.knob_tuner.tools.db_connector import (
+    DBConfig,
+    analyze_database,
+    load_db_config,
+    run_safe_query,
+)
 from src.knob_tuner.tools.file_tools import write_json_file
 
 
 def _get_db_config(tool_context: ToolContext) -> DBConfig | None:
-    """Retrieve and parse DBConfig from tool context state."""
+    """Retrieve a usable DBConfig from tool context state.
+
+    Session state keeps only a redacted view of the config (no password), so
+    when the in-state copy has no secret the real config is rebuilt from the
+    recorded config path. A fully-populated config already in state (embedded
+    callers/tests) is honored first.
+    """
     state = tool_context.state
+
+    in_state = state.get("db_config")
+    has_secret = isinstance(in_state, DBConfig) or (
+        isinstance(in_state, dict) and bool(in_state.get("password"))
+    )
+    if not has_secret:
+        path = state.get("db_config_path") or state.get("config_path")
+        if isinstance(path, str) and os.path.isfile(path):
+            db_type = str(state.get("db_type", "postgres") or "postgres")
+            db_name = str(
+                state.get("database") or state.get("db_name") or state.get("dbname") or ""
+            ).strip()
+            try:
+                return load_db_config(path, db_type=db_type, db_override=db_name or None)
+            except Exception:
+                pass
+
     if "db_config" in state:
         cfg = state["db_config"]
         if isinstance(cfg, DBConfig):
@@ -69,6 +97,14 @@ def check_schema(tool_context: ToolContext) -> str:
             # PostgreSQL schema inspection
             ver_rows = run_safe_query(cfg, "SELECT version() AS version;")
             db_version = ver_rows[0].get("version", "") if ver_rows else ""
+
+            # Refresh planner statistics so reltuples reflects a freshly loaded
+            # dataset (a fresh bulk load leaves reltuples stale/zero). Best
+            # effort: a stale estimate only sizes the screen conservatively.
+            try:
+                analyze_database(cfg)
+            except Exception:
+                pass
 
             table_sql = """
                 SELECT
@@ -246,12 +282,45 @@ def extract_knobs(tool_context: ToolContext) -> str:
                     COALESCE(short_desc, '') AS description,
                     COALESCE(min_val, '') AS min_val,
                     COALESCE(max_val, '') AS max_val,
+                    COALESCE(context, '') AS context,
+                    COALESCE(vartype, '') AS vartype,
+                    COALESCE(enumvals, '{}') AS enumvals,
+                    COALESCE(pending_restart, false) AS pending_restart,
+                    COALESCE(boot_val, '') AS boot_val,
+                    COALESCE(reset_val, '') AS reset_val
+                FROM pg_settings
+                ORDER BY category, name;
+            """
+            fallback_sql = """
+                SELECT
+                    name,
+                    setting AS current_value,
+                    COALESCE(unit, '') AS unit,
+                    COALESCE(category, '') AS category,
+                    COALESCE(short_desc, '') AS description,
+                    COALESCE(min_val, '') AS min_val,
+                    COALESCE(max_val, '') AS max_val,
                     COALESCE(context, '') AS context
                 FROM pg_settings
                 ORDER BY category, name;
             """
-            rows = run_safe_query(cfg, sql)
+            try:
+                rows = run_safe_query(cfg, sql)
+            except Exception:
+                rows = run_safe_query(cfg, fallback_sql)
             for r in rows:
+                raw_enum = r.get("enumvals", [])
+                if isinstance(raw_enum, str):
+                    enumvals = [v.strip() for v in raw_enum.strip("{}").split(",") if v.strip()]
+                elif isinstance(raw_enum, (list, tuple)):
+                    enumvals = [str(v) for v in raw_enum]
+                else:
+                    enumvals = []
+                raw_pending = r.get("pending_restart", False)
+                if isinstance(raw_pending, str):
+                    pending_restart = raw_pending.strip().lower() in ("t", "true")
+                else:
+                    pending_restart = bool(raw_pending)
                 knobs.append(
                     KnobInfo(
                         name=str(r.get("name", "")),
@@ -262,6 +331,11 @@ def extract_knobs(tool_context: ToolContext) -> str:
                         min_val=str(r.get("min_val", "")),
                         max_val=str(r.get("max_val", "")),
                         context=str(r.get("context", "")),
+                        vartype=str(r.get("vartype", "")),
+                        enumvals=enumvals,
+                        pending_restart=pending_restart,
+                        boot_val=str(r.get("boot_val", "")),
+                        reset_val=str(r.get("reset_val", "")),
                     )
                 )
 
@@ -292,6 +366,9 @@ def extract_knobs(tool_context: ToolContext) -> str:
             return f"ERROR: Unsupported db_type '{cfg.db_type}'"
 
         tool_context.state["knobs_info"] = [k.model_dump() for k in knobs]
+        tool_context.state["available_knob_names"] = sorted(
+            k.name for k in knobs if k.context.strip().lower() != "internal"
+        )
 
         lines = [
             f"Extracted {len(knobs)} knobs from {cfg.db_type.upper()}.",

@@ -79,6 +79,14 @@ def test_sysbench_profile_defaults():
     assert profile.seed == 42
     assert profile.throughput_threshold_pct == 0.0
     assert profile.latency_threshold_pct == 5.0
+    assert profile.min_improvement_pct == 2.0
+
+
+def test_sysbench_profile_min_improvement_validation():
+    assert SysbenchProfile(min_improvement_pct=0.0).min_improvement_pct == 0.0
+    assert SysbenchProfile(min_improvement_pct=7.5).min_improvement_pct == 7.5
+    with pytest.raises(ValidationError):
+        SysbenchProfile(min_improvement_pct=-1.0)
 
 
 def test_sysbench_profile_hash_is_stable():
@@ -89,6 +97,8 @@ def test_sysbench_profile_hash_changes_with_field():
     base = SysbenchProfile()
     changed = SysbenchProfile(threads=8)
     assert base.profile_hash() != changed.profile_hash()
+    promotion_changed = SysbenchProfile(min_improvement_pct=5.0)
+    assert base.profile_hash() != promotion_changed.profile_hash()
 
 
 def test_knob_plan_hash_is_stable_and_order_independent():

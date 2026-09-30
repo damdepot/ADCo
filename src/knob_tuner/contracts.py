@@ -8,7 +8,7 @@ from enum import Enum
 from statistics import median
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TuningStatus(str, Enum):
@@ -68,6 +68,8 @@ class ResourceBudget(BaseModel):
 class SysbenchProfile(BaseModel):
     """Deterministic parameters for a sysbench benchmark."""
 
+    model_config = ConfigDict(extra="forbid")
+
     profile_type: str = "oltp_read_write"
     tables: int = Field(default=10, gt=0)
     rows_per_table: int = Field(default=10000, gt=0)
@@ -76,8 +78,17 @@ class SysbenchProfile(BaseModel):
     measurement_seconds: int = Field(default=30, gt=0)
     repetitions: int = Field(default=3, ge=1)
     seed: int = 42
+    rand_type: str = "pareto"
     throughput_threshold_pct: float = Field(default=0.0, ge=0)
     latency_threshold_pct: float = Field(default=5.0, ge=0)
+    min_improvement_pct: float = Field(
+        default=2.0,
+        ge=0,
+        description=(
+            "Minimum percentage the 95% lower confidence bound on throughput "
+            "must exceed for a candidate to be considered a real improvement."
+        ),
+    )
 
     def profile_hash(self) -> str:
         """Return a stable sha256 hash of the profile contents."""
@@ -130,6 +141,7 @@ class SysbenchMeasurement(BaseModel):
     seed: int = 0
     repetitions: int = 1
     per_run_tps: list[float] = Field(default_factory=list)
+    prepare_seconds: float = 0.0
     log_file: str = ""
     error: str | None = None
 

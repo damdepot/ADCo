@@ -251,6 +251,12 @@ def test_coerce_apply_mode_invalid_returns_dynamic():
     assert coerce_apply_mode("bogus") == ApplyMode.DYNAMIC
 
 
+def test_coerce_apply_mode_aliases():
+    assert coerce_apply_mode("safe-auto") == ApplyMode.DYNAMIC
+    assert coerce_apply_mode("maintenance-assisted") == ApplyMode.PERSIST_STATIC
+    assert coerce_apply_mode("unknown") == ApplyMode.DYNAMIC
+
+
 # ---------------------------------------------------------------------------
 # coerce_db_config
 # ---------------------------------------------------------------------------

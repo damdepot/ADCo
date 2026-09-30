@@ -111,6 +111,63 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--durability-profile",
+        choices=["strict", "relaxed"],
+        default="strict",
+        help=(
+            "Durability policy for tuner knobs: 'strict' (default) forbids "
+            "relaxing synchronous_commit/full_page_writes/fsync; 'relaxed' permits "
+            "synchronous_commit=off for commit-bound workloads"
+        ),
+    )
+    p.add_argument(
+        "--screen-total-rows",
+        type=int,
+        default=0,
+        help=(
+            "Total sysbench rows for the screening dataset; 0 (default) derives it "
+            "from the target database's row count"
+        ),
+    )
+    p.add_argument(
+        "--screen-max-rows",
+        type=int,
+        default=5_000_000,
+        help=(
+            "Upper bound on the derived screening dataset size (default: 5000000). "
+            "Raise it when the target's working set exceeds the instance memory, "
+            "otherwise the proxy dataset stays cache-resident and the gate cannot "
+            "detect memory-knob improvements."
+        ),
+    )
+    p.add_argument(
+        "--confirm-repetitions",
+        type=int,
+        default=5,
+        help=(
+            "Repetitions for the confirmation measurement (default: 5). Starting "
+            "at the escalation cap avoids a 3-rep rung that fails by chance and "
+            "then wastes a whole extra pass."
+        ),
+    )
+    p.add_argument(
+        "--screening-benchmark",
+        choices=["sysbench", "pgbench"],
+        default="sysbench",
+        help=(
+            "Measurement used by the screening gate: 'sysbench' OLTP (default) or "
+            "'pgbench' sort/hash analytical workload"
+        ),
+    )
+    p.add_argument(
+        "--workload-hint",
+        default="",
+        help=(
+            "Free-text description of the production workload shown to the "
+            "recommender (e.g. an aggregate/sort-heavy analytical workload)"
+        ),
+    )
+    p.add_argument(
         "--knob-path",
         default="out/adco/knobs",
         help="Directory to save generated knob configuration files",
@@ -162,6 +219,12 @@ async def run_pipeline(
     verbose: bool = False,
     buffer_time: float = 0.0,
     apply_mode: str = "dynamic",
+    durability_profile: str = "strict",
+    screen_total_rows: int = 0,
+    screen_max_rows: int = 5_000_000,
+    confirm_repetitions: int = 5,
+    screening_benchmark: str = "sysbench",
+    workload_hint: str = "",
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
 
@@ -255,6 +318,13 @@ async def run_pipeline(
         tuner_extra_state: dict[str, Any] = {}
         if workload_info:
             tuner_extra_state["workload_info"] = workload_info
+        if screen_total_rows > 0:
+            tuner_extra_state["screen_total_rows"] = screen_total_rows
+        tuner_extra_state["screen_max_rows"] = screen_max_rows
+        tuner_extra_state["confirm_repetitions"] = confirm_repetitions
+        tuner_extra_state["screening_benchmark"] = screening_benchmark
+        if workload_hint:
+            tuner_extra_state["workload_hint"] = workload_hint
 
         tuner_state = await tuner_pipeline(
             target=sandbox,
@@ -273,6 +343,7 @@ async def run_pipeline(
             extra_initial_state=tuner_extra_state,
             buffer_time=buffer_time,
             apply_mode=apply_mode,
+            durability_profile=durability_profile,
         )
     else:
         if verbose:
@@ -364,6 +435,12 @@ def main() -> None:
                 verbose=args.verbose,
                 buffer_time=getattr(args, "buffer_time", 0.0),
                 apply_mode=args.apply_mode,
+                durability_profile=getattr(args, "durability_profile", "strict"),
+                screen_total_rows=getattr(args, "screen_total_rows", 0),
+                screen_max_rows=getattr(args, "screen_max_rows", 5_000_000),
+                confirm_repetitions=getattr(args, "confirm_repetitions", 5),
+                screening_benchmark=getattr(args, "screening_benchmark", "sysbench"),
+                workload_hint=getattr(args, "workload_hint", ""),
             )
         )
     except Exception as exc:

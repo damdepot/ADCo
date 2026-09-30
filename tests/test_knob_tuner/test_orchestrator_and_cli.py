@@ -32,6 +32,8 @@ from src.knob_tuner.main import (
 )
 from src.knob_tuner.tools.db_connector import DBConfig
 from src.knob_tuner.workflow import (
+    _recommendation_instruction,
+    _resolve_db_config,
     apply_live_node,
     finalize_node,
     make_tune_loop,
@@ -150,7 +152,43 @@ def _recommender(state_update):
     return node
 
 
+def _inventory() -> list[dict]:
+    def knob(name, context, vartype="integer", enumvals=None, current="1"):
+        return {
+            "name": name,
+            "current_value": current,
+            "unit": "",
+            "category": "Test",
+            "description": "",
+            "min_val": "",
+            "max_val": "",
+            "context": context,
+            "vartype": vartype,
+            "enumvals": enumvals or [],
+            "pending_restart": False,
+            "boot_val": "",
+            "reset_val": "",
+        }
+
+    return [
+        knob("shared_buffers", "postmaster", current="128MB"),
+        knob("work_mem", "user", current="4MB"),
+        knob("effective_cache_size", "user", current="4GB"),
+        knob("max_worker_processes", "postmaster"),
+        knob("autovacuum_vacuum_scale_factor", "sighup", vartype="real", current="0.2"),
+        knob(
+            "synchronous_commit",
+            "user",
+            vartype="enum",
+            enumvals=["on", "off", "local", "remote_write", "remote_apply"],
+            current="on",
+        ),
+        knob("full_page_writes", "postmaster", vartype="bool", current="on"),
+    ]
+
+
 def _base_loop_state(**overrides):
+    inventory = _inventory()
     state = {
         "resource_budget": {"cpu_cores": 2, "memory_gb": 4.0},
         "sysbench_profile": {},
@@ -161,9 +199,79 @@ def _base_loop_state(**overrides):
         "db_type": "postgres",
         "database": "testdb",
         "max_validation_attempts": 4,
+        "durability_profile": "strict",
+        "knobs_info": inventory,
+        "available_knob_names": [k["name"] for k in inventory],
     }
     state.update(overrides)
     return state
+
+
+def _paired(baseline, tuned):
+    return {
+        "status": "PASS",
+        "baseline": {"per_run_tps": list(baseline)},
+        "tuned": {"per_run_tps": list(tuned)},
+    }
+
+
+def test_recommendation_instruction_includes_workload_hint():
+    instruction = _recommendation_instruction(
+        1, [], {}, ["work_mem", "shared_buffers"], "strict", "Analytical GROUP BY spills"
+    )
+    assert "Analytical GROUP BY spills" in instruction
+    assert "work_mem" in instruction
+
+
+def test_recommendation_instruction_omits_empty_hint():
+    instruction = _recommendation_instruction(
+        1, [], {}, ["work_mem"], "strict", ""
+    )
+    assert "workload context" not in instruction.lower()
+
+
+def test_tune_loop_threads_screening_benchmark_to_validator():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        return {
+            "status": "PASS",
+            "attestation": {"run_id": "run-1"},
+            "paired": _paired([1.0, 1.0, 1.0], [8.0, 8.0, 8.0]),
+            "reasons": [],
+        }
+
+    recommender = _recommender(
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
+    )
+    ctx = _FakeContext(_base_loop_state(screening_benchmark="pgbench"))
+    asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+
+    assert calls
+    assert all(call["benchmark_kind"] == "pgbench" for call in calls)
+
+
+def test_tune_loop_defaults_screening_benchmark_to_sysbench():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        return {
+            "status": "PASS",
+            "attestation": {"run_id": "run-1"},
+            "paired": _paired([100.0, 100.0, 100.0], [105.0, 105.0, 105.0]),
+            "reasons": [],
+        }
+
+    recommender = _recommender(
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "64MB"}]}
+    )
+    ctx = _FakeContext(_base_loop_state())
+    asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+
+    assert calls
+    assert all(call["benchmark_kind"] == "sysbench" for call in calls)
 
 
 def test_tune_loop_passes_first_attempt():
@@ -174,7 +282,7 @@ def test_tune_loop_passes_first_attempt():
         return {
             "status": "PASS",
             "attestation": {"run_id": "run-1"},
-            "paired": {"delta_pct": 5.0},
+            "paired": _paired([100.0, 100.0, 100.0], [105.0, 105.0, 105.0]),
             "reasons": [],
         }
 
@@ -185,55 +293,286 @@ def test_tune_loop_passes_first_attempt():
     events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
 
     delta = events[-1].actions.state_delta
-    assert len(calls) == 1
+    # Single LLM candidate: screened once, then confirmed with a fresh,
+    # independent measurement (never the screening result itself).
+    assert len(calls) == 2
     assert delta["result_status"] == "PASS"
     assert delta["staging_validated"] is True
-    assert delta["validation_attempts"][0]["status"] == "PASS"
+    assert delta["validation_attempts"][0]["candidate"] == "llm"
     assert delta["knob_plan"]["knobs"][0]["name"] == "shared_buffers"
+    assert "multi_fidelity" in delta["candidate_archive"]
+    confirm_entries = [
+        entry
+        for entry in delta["validation_attempts"]
+        if entry.get("phase") == "confirm"
+    ]
+    assert confirm_entries and confirm_entries[0]["confirmed"] is True
 
 
-def test_tune_loop_environment_failure_does_not_retry():
+def test_tune_loop_no_valid_plan_is_inconclusive():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        return {"status": "PASS", "paired": _paired([100.0], [100.0]), "reasons": []}
+
+    ctx = _FakeContext(_base_loop_state(max_validation_attempts=2))
+    events = asyncio.run(
+        _drive(make_tune_loop(_recommender({"recommendations": []}), validator)(ctx))
+    )
+
+    delta = events[-1].actions.state_delta
+    assert calls == []
+    assert delta["result_status"] == "INCONCLUSIVE"
+    assert delta["staging_validated"] is False
+    assert delta["knob_plan"]["knobs"] == []
+
+
+def test_tune_loop_environment_failure_is_fail():
     calls = []
 
     def validator(**kwargs):
         calls.append(kwargs)
         return {"status": "FAIL", "paired": None, "reasons": ["env error"]}
 
-    ctx = _FakeContext(_base_loop_state())
-    events = asyncio.run(
-        _drive(make_tune_loop(_recommender({"recommendations": []}), validator)(ctx))
+    recommender = _recommender(
+        {"recommendations": [{"knob": "shared_buffers", "recommended_value": "1GB"}]}
     )
+    ctx = _FakeContext(_base_loop_state())
+    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
 
     assert len(calls) == 1
     assert events[-1].actions.state_delta["result_status"] == "FAIL"
 
 
-def test_tune_loop_retries_then_passes_with_feedback():
-    instructions = []
-    counter = {"n": 0}
-
-    def recommender(ctx, node_input=None):
-        instructions.append(node_input)
-        ctx.state["knob_recommender_output"] = {
-            "recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]
-        }
-
+def test_tune_loop_rejects_likely_regression():
     def validator(**kwargs):
-        counter["n"] += 1
+        # Clear regression: upper bound well below zero → not eligible to confirm.
         return {
-            "status": "FAIL" if counter["n"] == 1 else "PASS",
-            "paired": {"delta_pct": -9.0} if counter["n"] == 1 else {"delta_pct": 3.0},
-            "reasons": ["tps dropped"] if counter["n"] == 1 else [],
+            "status": "FAIL",
+            "paired": _paired([100.0, 100.0, 100.0], [80.0, 85.0, 82.0]),
+            "reasons": [],
         }
 
+    recommender = _recommender(
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}
+    )
     ctx = _FakeContext(_base_loop_state())
     events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
 
-    assert counter["n"] == 2
-    assert len(instructions) == 2
-    assert "tps dropped" in instructions[1]
-    assert "delta_pct" in instructions[1]
-    assert events[-1].actions.state_delta["result_status"] == "PASS"
+    delta = events[-1].actions.state_delta
+    assert delta["result_status"] == "INCONCLUSIVE"
+    assert delta["knob_plan"]["knobs"] == []
+
+
+def test_tune_loop_negative_lcb_is_not_promoted():
+    def validator(**kwargs):
+        # Noisy improvement: positive mean, negative LCB; health check passes.
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0, 100.0, 100.0], [106.0, 95.0, 110.0]),
+            "reasons": [],
+        }
+
+    recommender = _recommender(
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}
+    )
+    ctx = _FakeContext(_base_loop_state())
+    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+
+    delta = events[-1].actions.state_delta
+    # A paired PASS alone is not enough: the 95% LCB is negative, so the
+    # candidate is not promoted.
+    assert delta["result_status"] == "INCONCLUSIVE"
+    assert delta["staging_validated"] is False
+    assert delta["improvement_confident"] is False
+
+
+def test_tune_loop_lcb_below_minimum_is_not_promoted():
+    def validator(**kwargs):
+        # +1% with zero spread: positive LCB, but below the 2% default minimum.
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0, 100.0, 100.0], [101.0, 101.0, 101.0]),
+            "reasons": [],
+        }
+
+    recommender = _recommender(
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}
+    )
+    ctx = _FakeContext(_base_loop_state())
+    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+
+    delta = events[-1].actions.state_delta
+    assert delta["result_status"] == "INCONCLUSIVE"
+    assert delta["staging_validated"] is False
+
+
+def test_tune_loop_lcb_above_minimum_is_promoted():
+    def validator(**kwargs):
+        # +3% with zero spread: LCB clears the default 2% minimum.
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0, 100.0, 100.0], [103.0, 103.0, 103.0]),
+            "reasons": [],
+        }
+
+    recommender = _recommender(
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}
+    )
+    ctx = _FakeContext(_base_loop_state())
+    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+
+    delta = events[-1].actions.state_delta
+    assert delta["result_status"] == "PASS"
+    assert delta["staging_validated"] is True
+    assert delta["improvement_confident"] is True
+    assert delta["knob_plan"]["knobs"][0]["name"] == "work_mem"
+
+
+def test_tune_loop_rejects_unknown_knob():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        return {"status": "PASS", "paired": _paired([100.0], [100.0]), "reasons": []}
+
+    recommender = _recommender(
+        {"recommendations": [{"knob": "made_up_knob", "recommended_value": "1"}]}
+    )
+    ctx = _FakeContext(_base_loop_state(max_validation_attempts=2))
+    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+
+    assert calls == []
+    delta = events[-1].actions.state_delta
+    assert delta["result_status"] == "INCONCLUSIVE"
+    assert any("not in available knob inventory" in r for r in delta["staging_issues"])
+
+
+def test_tune_loop_rejects_noop_recommendation():
+    calls = []
+
+    def validator(**kwargs):
+        calls.append(kwargs)
+        return {"status": "PASS", "paired": _paired([100.0], [100.0]), "reasons": []}
+
+    # work_mem's inventory current value is 4MB, so this changes nothing and must
+    # not be promoted as if it did.
+    recommender = _recommender(
+        {"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}
+    )
+    ctx = _FakeContext(_base_loop_state(max_validation_attempts=2))
+    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
+
+    assert calls == []
+    delta = events[-1].actions.state_delta
+    assert delta["result_status"] == "INCONCLUSIVE"
+    assert any("no-op" in r for r in delta["staging_issues"])
+
+
+def test_tune_loop_durability_policy_gates_synchronous_commit():
+    def validator(**kwargs):
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0, 100.0, 100.0], [105.0, 104.0, 106.0]),
+            "reasons": [],
+        }
+
+    rec = {"recommendations": [{"knob": "synchronous_commit", "recommended_value": "off"}]}
+
+    strict_ctx = _FakeContext(_base_loop_state(max_validation_attempts=2))
+    strict_events = asyncio.run(
+        _drive(make_tune_loop(_recommender(rec), validator)(strict_ctx))
+    )
+    strict_delta = strict_events[-1].actions.state_delta
+    assert strict_delta["result_status"] == "INCONCLUSIVE"
+    assert strict_delta["knob_plan"]["knobs"] == []
+
+    relaxed_ctx = _FakeContext(
+        _base_loop_state(durability_profile="relaxed")
+    )
+    relaxed_events = asyncio.run(
+        _drive(make_tune_loop(_recommender(rec), validator)(relaxed_ctx))
+    )
+    relaxed_delta = relaxed_events[-1].actions.state_delta
+    assert relaxed_delta["result_status"] == "PASS"
+    assert relaxed_delta["knob_plan"]["knobs"][0]["name"] == "synchronous_commit"
+
+
+def _pass_validator(captured=None):
+    def validator(**kwargs):
+        if captured is not None:
+            captured.append(kwargs)
+        return {
+            "status": "PASS",
+            "paired": _paired([100.0, 100.0, 100.0], [105.0, 105.0, 105.0]),
+            "reasons": [],
+        }
+
+    return validator
+
+
+def test_tune_loop_derives_realistic_dataset_from_schema_info():
+    captured = []
+    ctx = _FakeContext(
+        _base_loop_state(
+            schema_info=[
+                {"approximate_row_count": 600000},
+                {"approximate_row_count": 400000},
+            ]
+        )
+    )
+    events = asyncio.run(
+        _drive(
+            make_tune_loop(
+                _recommender({"recommendations": [{"knob": "work_mem", "recommended_value": "256MB"}]}),
+                _pass_validator(captured),
+            )(ctx)
+        )
+    )
+
+    delta = events[-1].actions.state_delta
+    dataset = delta["screen_dataset"]
+    assert dataset["source"] == "target_rows"
+    assert dataset["total_rows"] == 1_000_000
+    assert dataset["tables"] == 10
+    assert dataset["rows_per_table"] == 100_000
+    # The derived profile is what the validator actually measures.
+    assert captured[0]["profile"].rows_per_table == 100_000
+
+
+def test_tune_loop_dataset_falls_back_without_schema_info():
+    ctx = _FakeContext(_base_loop_state())
+    events = asyncio.run(
+        _drive(
+            make_tune_loop(
+                _recommender({"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}),
+                _pass_validator(),
+            )(ctx)
+        )
+    )
+    assert events[-1].actions.state_delta["screen_dataset"]["source"] == "default"
+
+
+def test_tune_loop_screen_total_rows_override():
+    captured = []
+    ctx = _FakeContext(
+        _base_loop_state(
+            schema_info=[{"approximate_row_count": 600000}],
+            screen_total_rows=200000,
+        )
+    )
+    events = asyncio.run(
+        _drive(
+            make_tune_loop(
+                _recommender({"recommendations": [{"knob": "work_mem", "recommended_value": "4MB"}]}),
+                _pass_validator(captured),
+            )(ctx)
+        )
+    )
+    dataset = events[-1].actions.state_delta["screen_dataset"]
+    assert dataset["source"] == "explicit"
+    assert dataset["total_rows"] == 200000
 
 
 def test_tune_loop_preserves_restart_required_for_unknown_scope():
@@ -268,10 +607,11 @@ def test_tune_loop_dry_run_calls_validator_with_dry_run():
         captured.update(kwargs)
         return {"status": "INCONCLUSIVE", "paired": None, "reasons": ["dry-run"]}
 
-    ctx = _FakeContext(_base_loop_state(dry_run=True, max_validation_attempts=1))
-    events = asyncio.run(
-        _drive(make_tune_loop(_recommender({"recommendations": []}), validator)(ctx))
+    recommender = _recommender(
+        {"recommendations": [{"knob": "shared_buffers", "recommended_value": "1GB"}]}
     )
+    ctx = _FakeContext(_base_loop_state(dry_run=True, max_validation_attempts=1))
+    events = asyncio.run(_drive(make_tune_loop(recommender, validator)(ctx)))
 
     assert captured["dry_run"] is True
     assert events[-1].actions.state_delta["staging_validated"] is False
@@ -361,6 +701,101 @@ def test_apply_live_node_applies_on_pass():
     assert event.actions.state_delta["applied_knobs"] == applied
 
 
+def test_apply_live_node_maintenance_assisted_emits_manual_sql():
+    cfg = DBConfig(
+        host="127.0.0.1",
+        port=5432,
+        user="u",
+        password="p",
+        database="d",
+        db_type="postgres",
+    )
+    ctx = _FakeContext(
+        {
+            "dry_run": False,
+            "result_status": "PASS",
+            "knob_plan": _plan_dump(),
+            "db_config": cfg,
+            "apply_mode": "maintenance-assisted",
+        }
+    )
+    sql_results = [
+        {
+            "knob": "shared_buffers",
+            "value": "1GB",
+            "status": "dry_run",
+            "sql": "ALTER SYSTEM SET shared_buffers = '1GB';",
+            "error": None,
+        }
+    ]
+    with patch(
+        "src.knob_tuner.workflow.apply_knobs", return_value=sql_results
+    ) as mock_apply:
+        event = apply_live_node(ctx)
+
+    assert event.output["status"] == "MANUAL_SQL"
+    assert event.output["manual_sql"] == ["ALTER SYSTEM SET shared_buffers = '1GB';"]
+    assert event.actions.state_delta["applied_knobs"] == []
+    # Manual SQL is not an applied success: the run must not stay PASS.
+    assert event.actions.state_delta["result_status"] == "INCONCLUSIVE"
+    # Production is never mutated: SQL is generated with dry_run only.
+    assert mock_apply.call_args.kwargs.get("dry_run") is True
+
+
+def test_apply_live_node_apply_failure_sets_result_status_fail():
+    cfg = DBConfig(
+        host="127.0.0.1",
+        port=5432,
+        user="u",
+        password="p",
+        database="d",
+        db_type="postgres",
+    )
+    ctx = _FakeContext(
+        {
+            "dry_run": False,
+            "result_status": "PASS",
+            "knob_plan": _plan_dump(),
+            "db_config": cfg,
+            "apply_mode": "dynamic",
+        }
+    )
+    with patch(
+        "src.knob_tuner.workflow.apply_knobs", side_effect=RuntimeError("boom")
+    ):
+        event = apply_live_node(ctx)
+
+    assert event.output["status"] == "FAILED"
+    assert event.actions.state_delta["result_status"] == "FAIL"
+
+
+def test_apply_live_node_maintenance_sql_failure_sets_result_status_fail():
+    cfg = DBConfig(
+        host="127.0.0.1",
+        port=5432,
+        user="u",
+        password="p",
+        database="d",
+        db_type="postgres",
+    )
+    ctx = _FakeContext(
+        {
+            "dry_run": False,
+            "result_status": "PASS",
+            "knob_plan": _plan_dump(),
+            "db_config": cfg,
+            "apply_mode": "maintenance-assisted",
+        }
+    )
+    with patch(
+        "src.knob_tuner.workflow.apply_knobs", side_effect=RuntimeError("boom")
+    ):
+        event = apply_live_node(ctx)
+
+    assert event.output["status"] == "FAILED"
+    assert event.actions.state_delta["result_status"] == "FAIL"
+
+
 def test_apply_live_node_postmaster_recorded_pending_restart():
     cfg = DBConfig(
         host="127.0.0.1",
@@ -417,6 +852,7 @@ def test_finalize_node_builds_manifest(tmp_path: Path):
             "validation_attempts": [{"attempt": 1, "status": "PASS"}],
             "applied_knobs": [{"knob": "shared_buffers"}],
             "validation_attestation": {"verified_knobs": [{"knob": "shared_buffers"}]},
+            "live_result": {"status": "APPLIED"},
             "staging_issues": [],
         }
     )
@@ -431,6 +867,53 @@ def test_finalize_node_builds_manifest(tmp_path: Path):
     assert manifest["knob_plan_hash"] == "deadbeef"
     assert manifest["application_code_hash"]
     assert event.output["run_id"] == "run-abc"
+
+
+def _finalize_state(**overrides):
+    state = {
+        "run_id": "run-abc",
+        "result_status": "PASS",
+        "resource_budget": {"cpu_cores": 4, "memory_gb": 8.0},
+        "db_type": "postgres",
+        "target": "",
+        "sysbench_profile": {},
+        "staging_issues": [],
+    }
+    state.update(overrides)
+    return state
+
+
+def test_finalize_node_failed_live_apply_is_not_pass():
+    ctx = _FakeContext(
+        _finalize_state(
+            live_result={"status": "FAILED", "reason": "apply exploded"},
+        )
+    )
+    event = finalize_node(ctx)
+    manifest = event.actions.state_delta["run_manifest"]
+    assert manifest["status"] == "FAIL"
+    assert manifest["final_status"] == "FAIL"
+    assert any("apply exploded" in err for err in manifest["errors"])
+
+
+def test_finalize_node_absent_live_apply_is_not_pass():
+    ctx = _FakeContext(_finalize_state())
+    event = finalize_node(ctx)
+    manifest = event.actions.state_delta["run_manifest"]
+    assert manifest["status"] == "INCONCLUSIVE"
+    assert manifest["final_status"] == "INCONCLUSIVE"
+
+
+def test_finalize_node_manual_sql_is_not_pass():
+    ctx = _FakeContext(
+        _finalize_state(
+            live_result={"status": "MANUAL_SQL", "reason": "manual SQL emitted"},
+        )
+    )
+    event = finalize_node(ctx)
+    manifest = event.actions.state_delta["run_manifest"]
+    assert manifest["status"] == "INCONCLUSIVE"
+    assert manifest["status"] != "PASS"
 
 
 # ===========================================================================
@@ -471,6 +954,13 @@ def test_cli_parser_defaults_with_required_resources():
     assert args.verbose is False
     assert args.cleanup_orphans is True
     assert args.buffer_time == 0.0
+    assert args.multi_fidelity_min_seconds == 300.0
+    assert args.screen_total_rows == 0
+    assert args.screen_max_rows == 5_000_000
+    assert args.rand_type is None
+    assert args.durability_profile == "strict"
+    assert args.screening_benchmark == "sysbench"
+    assert args.workload_hint == ""
 
 
 def test_cli_parser_custom_args():
@@ -489,6 +979,8 @@ def test_cli_parser_custom_args():
             "-v",
             "--no-cleanup-orphans",
             "--buffer-time", "1.5",
+            "--screening-benchmark", "pgbench",
+            "--workload-hint", "analytical sort spills",
         ]
     )
     assert args.cpu_cores == "8"
@@ -501,6 +993,8 @@ def test_cli_parser_custom_args():
     assert args.verbose is True
     assert args.cleanup_orphans is False
     assert args.buffer_time == 1.5
+    assert args.screening_benchmark == "pgbench"
+    assert args.workload_hint == "analytical sort spills"
 
 
 def test_parse_budget_valid():
@@ -584,6 +1078,8 @@ def test_build_initial_state_without_config_file():
     assert state["database"] == "custom_db"
     assert "staging_db_config" not in state
     assert "db_config" not in state
+    assert state["screening_benchmark"] == "sysbench"
+    assert state["workload_hint"] == ""
 
 
 def test_build_initial_state_with_valid_config(sample_ini_path):
@@ -601,12 +1097,56 @@ def test_build_initial_state_with_valid_config(sample_ini_path):
     )
     assert "db_config" in state
     cfg = state["db_config"]
-    assert isinstance(cfg, DBConfig)
-    assert cfg.host == "10.0.0.2"
-    assert cfg.database == "custom_db"
+    # Only a redacted, serializable view is stored: never the DBConfig secret.
+    assert isinstance(cfg, dict)
+    assert cfg["host"] == "10.0.0.2"
+    assert cfg["database"] == "custom_db"
+    assert "password" not in cfg
+    assert "stg_pass" not in json.dumps(state, default=str)
     assert "staging_db_config" not in state
     # The target container is NEVER registered as an active staging container.
-    assert cfg.restart_target not in ACTIVE_CONTAINERS
+    assert cfg["restart_target"] not in ACTIVE_CONTAINERS
+
+
+def test_build_initial_state_does_not_leak_password(sample_ini_path):
+    state = build_initial_state(
+        target="/tmp/my_app",
+        db_type="mysql",
+        db_name="custom_db",
+        budget=ResourceBudget(cpu_cores=2, memory_gb=4.0),
+        db_config_path=str(sample_ini_path),
+        production_db=True,
+        log_file="/tmp/log.log",
+        knob_path="/tmp/knobs",
+        output_path=None,
+        dry_run=False,
+    )
+    assert "password" not in state["db_config"]
+    assert "password" not in state["production_db_config"]
+    assert "password" not in state["prod_db_config"]
+    serialized = json.dumps(state, default=str)
+    assert "prod_pass" not in serialized
+    assert "password" not in serialized
+
+
+def test_resolve_db_config_reconstructs_secret_from_path(sample_ini_path):
+    state = build_initial_state(
+        target="/tmp/my_app",
+        db_type="postgres",
+        db_name="custom_db",
+        budget=ResourceBudget(cpu_cores=2, memory_gb=4.0),
+        db_config_path=str(sample_ini_path),
+        production_db=False,
+        log_file="/tmp/log.log",
+        knob_path="/tmp/knobs",
+        output_path=None,
+        dry_run=False,
+    )
+    assert "password" not in state["db_config"]
+    cfg = _resolve_db_config(state)
+    assert isinstance(cfg, DBConfig)
+    assert cfg.password == "stg_pass"
+    assert cfg.database == "custom_db"
 
 
 def test_build_initial_state_does_not_register_target_container(sample_ini_path):
@@ -644,7 +1184,9 @@ def test_build_initial_state_production_env(sample_ini_path):
     assert state["env"] == "production"
     assert state["production_db"] is True
     assert "production_db_config" in state
-    assert state["production_db_config"].host == "127.0.0.1"
+    assert state["production_db_config"]["host"] == "127.0.0.1"
+    assert isinstance(state["production_db_config"], dict)
+    assert "password" not in state["production_db_config"]
 
 
 # ===========================================================================

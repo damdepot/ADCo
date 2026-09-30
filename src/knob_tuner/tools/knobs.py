@@ -17,18 +17,36 @@ from src.knob_tuner.tools.db_connector import DBConfig
 from src.knob_tuner.tools.knob_scope import build_knob_plan
 
 
+_APPLY_MODE_ALIASES = {
+    "safe-auto": ApplyMode.DYNAMIC,
+    "maintenance-assisted": ApplyMode.PERSIST_STATIC,
+}
+
+
 def coerce_apply_mode(value: Any) -> ApplyMode:
     """Best-effort conversion of a raw apply-mode value to ``ApplyMode``."""
     if isinstance(value, ApplyMode):
         return value
     try:
-        return ApplyMode(str(value).strip().lower())
-    except (ValueError, AttributeError):
+        text = str(value).strip().lower()
+    except AttributeError:
+        return ApplyMode.DYNAMIC
+    if text in _APPLY_MODE_ALIASES:
+        return _APPLY_MODE_ALIASES[text]
+    try:
+        return ApplyMode(text)
+    except ValueError:
         return ApplyMode.DYNAMIC
 
 
 def coerce_profile(value: Any) -> SysbenchProfile:
-    """Coerce a raw profile value into a :class:`SysbenchProfile`."""
+    """Coerce a raw profile value into a :class:`SysbenchProfile`.
+
+    ponytail: this is a permissive state reader, so an invalid dict still falls
+    back to defaults rather than raising. CLI/JSON profiles go through
+    ``main._load_profile``, which validates strictly (extra keys are rejected by
+    ``SysbenchProfile``'s ``extra="forbid"``).
+    """
     if isinstance(value, SysbenchProfile):
         return value
     if isinstance(value, dict):

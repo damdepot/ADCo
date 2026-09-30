@@ -292,6 +292,9 @@ def get_knob_strategies(tool_context: ToolContext) -> str:
     if not isinstance(db_type, str):
         db_type = str(db_type.get("db_type", "postgres")) if isinstance(db_type, dict) else "postgres"
     workload = tool_context.state.get("workload") or tool_context.state.get("workload_info") or tool_context.state.get("intent_analyzer_output") or ""
+    workload_hint = tool_context.state.get("workload_hint") or ""
+    if workload_hint:
+        workload = f"{_to_text(workload)} {_to_text(workload_hint)}".strip()
     memory_gb = float(tool_context.state.get("memory_gb", 1.0))
     cpu_cores = int(tool_context.state.get("cpu_cores", 1))
     feedback = tool_context.state.get("feedback") or ""

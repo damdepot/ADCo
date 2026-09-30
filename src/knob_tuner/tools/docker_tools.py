@@ -652,30 +652,44 @@ def restart_docker_db(
     except Exception as e:
         return False, f"Unexpected error restarting container '{container_name}': {e}"
 
-    # Build the readiness probe command based on db_type
+    # Build the readiness probes based on db_type. A bare liveness check can
+    # report ready while the instance is still starting up, so for Postgres a
+    # real query over the local socket is also required. ponytail: MySQL keeps
+    # the liveness probe because a credentialed query would couple this generic
+    # helper to staging credentials; add one if MySQL restart races show up.
     if db_type == "mysql":
-        probe_cmd = [
-            "docker", "exec", container_name,
-            "mysqladmin", "ping", "-uroot", "--silent",
+        probe_cmds = [
+            [
+                "docker", "exec", container_name,
+                "mysqladmin", "ping", "-uroot", "--silent",
+            ],
         ]
     else:
         # Default to postgres
-        probe_cmd = [
-            "docker", "exec", container_name,
-            "pg_isready", "-U", "postgres", "-h", "127.0.0.1",
+        probe_cmds = [
+            [
+                "docker", "exec", container_name,
+                "pg_isready", "-U", "postgres", "-h", "127.0.0.1",
+            ],
+            [
+                "docker", "exec", container_name,
+                "psql", "-U", "postgres", "-tAc", "SELECT 1",
+            ],
         ]
 
     # Poll until the database is ready or readiness_timeout elapses
     elapsed = 0
     while elapsed < readiness_timeout:
         try:
-            result = subprocess.run(
-                probe_cmd,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
+            if all(
+                subprocess.run(
+                    probe,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).returncode == 0
+                for probe in probe_cmds
+            ):
                 return (
                     True,
                     f"Docker container '{container_name}' restarted and ready",

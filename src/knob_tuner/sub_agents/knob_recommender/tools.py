@@ -12,23 +12,28 @@ from src.knob_tuner.tools.kb_planner import get_knob_strategies
 
 
 __all__ = [
-    "read_knobs_file",
+    "read_knob_details",
     "write_selected_knobs",
     "get_knob_strategies",
 ]
 
 
-def read_knobs_file(tool_context: ToolContext) -> str:
-    """Read the extracted database configuration knobs from ``{knob_path}/knobs.json``.
+_DESC_TRUNC = 160
 
-    Populates ``tool_context.state['knobs_info']`` and returns a formatted summary
-    of the tunable parameters.
+
+def read_knob_details(names: str, tool_context: ToolContext) -> str:
+    """Fetch full details for the requested knob names.
+
+    Loads the knob inventory from ``{knob_path}/knobs.json`` (falling back to
+    ``tool_context.state['knobs_info']``) and returns a compact formatted block,
+    one line per requested knob.
 
     Args:
+        names: Comma-separated string of knob names.
         tool_context: ADK tool execution context.
 
     Returns:
-        Formatted summary string or error message.
+        Formatted details string or ``"ERROR: ..."`` message.
     """
     knob_path = (
         tool_context.state.get("knob_path")
@@ -48,41 +53,61 @@ def read_knobs_file(tool_context: ToolContext) -> str:
             elif isinstance(content, dict) and "available_knobs" in content:
                 knobs_data = content["available_knobs"]
                 tool_context.state["knobs_info"] = knobs_data
-        except Exception as e:
-            return f"ERROR: failed to read knobs file '{knobs_file}': {e}"
+        except Exception:
+            knobs_data = None
 
     if knobs_data is None:
         state_knobs = tool_context.state.get("knobs_info")
         if state_knobs and isinstance(state_knobs, list):
             knobs_data = state_knobs
-        else:
-            return (
-                f"ERROR: knobs file not found at '{knobs_file}' and knobs_info not found in state"
-            )
 
-    lines = [
-        f"Read {len(knobs_data)} tunable knobs from configuration source.",
-        "",
-        "## Top Tunable Knobs Summary",
-    ]
+    if not knobs_data:
+        return (
+            f"ERROR: knob inventory not found at '{knobs_file}' or in state['knobs_info']"
+        )
 
-    sample_count = 0
+    by_name = {}
     for k in knobs_data:
         if isinstance(k, dict):
-            name = k.get("name", "")
-            val = k.get("current_value", "")
-            unit = k.get("unit", "")
-            cat = k.get("category", "")
-            desc = k.get("description", "")
-            unit_str = f" {unit}" if unit else ""
-            desc_str = f" — {desc}" if desc else ""
-            lines.append(f"- **{name}**: `{val}{unit_str}` ({cat}){desc_str}")
-            sample_count += 1
-            if sample_count >= 25:
-                lines.append(
-                    f"... and {len(knobs_data) - sample_count} additional knobs."
-                )
-                break
+            by_name[str(k.get("name", "")).lower()] = k
+
+    requested = [n.strip() for n in str(names).split(",") if n.strip()]
+
+    lines = [f"Knob details ({len(requested)} requested):"]
+    missing: list[str] = []
+    for want in requested:
+        k = by_name.get(want.lower())
+        if k is None:
+            missing.append(want)
+            continue
+        val = k.get("current_value", "")
+        unit = k.get("unit", "")
+        ctx = k.get("context", "")
+        vartype = k.get("vartype", "")
+        enumvals = k.get("enumvals")
+        min_val = k.get("min_val")
+        max_val = k.get("max_val")
+        pending = k.get("pending_restart")
+        desc = str(k.get("description", ""))
+
+        parts = [f"- {k.get('name', want)}: {val}{f' {unit}' if unit else ''}"]
+        if ctx:
+            parts.append(f"context={ctx}")
+        if vartype:
+            parts.append(f"vartype={vartype}")
+        if enumvals:
+            parts.append(f"enumvals={enumvals}")
+        if min_val is not None or max_val is not None:
+            parts.append(f"range={min_val}..{max_val}")
+        parts.append(f"pending_restart={pending}")
+        if desc:
+            if len(desc) > _DESC_TRUNC:
+                desc = desc[: _DESC_TRUNC - 3] + "..."
+            parts.append(f"desc={desc}")
+        lines.append(" | ".join(parts))
+
+    if missing:
+        lines.append(f"Missing: {', '.join(missing)}")
 
     return "\n".join(lines)
 
