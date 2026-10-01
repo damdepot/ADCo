@@ -103,11 +103,6 @@ def test_extract_knob_list_recommendations_dict():
     assert [item["name"] for item in result] == ["a"]
 
 
-def test_extract_knob_list_selected_knobs_dict():
-    result = extract_knob_list({"selected_knobs": [{"name": "b", "value": 2}]})
-    assert [item["name"] for item in result] == ["b"]
-
-
 def test_extract_knob_list_recommendations_attribute():
     obj = SimpleNamespace(recommendations=[{"name": "c", "value": 3}])
     result = extract_knob_list(obj)
@@ -140,34 +135,30 @@ def test_dedupe_by_name_keeps_first_preserves_order():
 # ---------------------------------------------------------------------------
 
 
-def test_load_raw_knobs_from_selected_knobs():
-    state = {"selected_knobs": [{"name": "a", "value": 1}]}
-    assert [item["name"] for item in load_raw_knobs(state)] == ["a"]
-
-
 def test_load_raw_knobs_from_recommender_output():
     state = {"knob_recommender_output": {"recommendations": [{"name": "b", "value": 2}]}}
     assert [item["name"] for item in load_raw_knobs(state)] == ["b"]
 
 
-def test_load_raw_knobs_falls_back_to_file(tmp_path):
+def test_load_raw_knobs_ignores_file_fallback(tmp_path):
     (tmp_path / "knobs-selected.json").write_text(
         json.dumps([{"name": "from_file", "value": 7}]), encoding="utf-8"
     )
     state = {"knob_path": str(tmp_path)}
-    assert [item["name"] for item in load_raw_knobs(state)] == ["from_file"]
+    # Wave 4: the staged graph never writes knobs-selected.json, so state is
+    # the single source of truth — a stray file must not leak into the plan.
+    assert load_raw_knobs(state) == []
 
 
-def test_load_raw_knobs_dedupes_combined_candidates():
+def test_load_raw_knobs_dedupes_duplicate_names():
     state = {
-        "selected_knobs": [{"name": "a", "value": 1}],
         "knob_recommender_output": {
-            "recommendations": [{"name": "a", "value": 99}, {"name": "b", "value": 2}]
+            "recommendations": [{"name": "a", "value": 99}, {"name": "a", "value": 1}, {"name": "b", "value": 2}]
         },
     }
     result = load_raw_knobs(state)
     assert [item["name"] for item in result] == ["a", "b"]
-    assert result[0]["value"] == 1
+    assert result[0]["value"] == 99
 
 
 # ---------------------------------------------------------------------------

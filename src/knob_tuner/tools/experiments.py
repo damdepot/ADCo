@@ -188,7 +188,7 @@ def run_experiment_arms(
     attempt_base: int,
     early_stop_min_reps: int | None,
     progress: Callable[[str], None] | None = None,
-    min_improvement_pct: float = 2.0,
+    min_improvement_pct: float = 5.0,
 ) -> list[dict[str, Any]]:
     """Validate each experiment arm and score it with Welch stats.
 

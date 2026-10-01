@@ -1,4 +1,4 @@
-"""Welch t screen/confirm statistics for the knob tuner (stdlib only).
+"""Welch t screen/confirm statistics for the knob tuner (scipy-backed).
 
 Within-arm sysbench samples are sequential runs against the same mutating
 database, so they are temporally correlated and Welch's independence
@@ -17,6 +17,14 @@ from __future__ import annotations
 import math
 from statistics import mean, stdev
 from typing import Any
+
+try:
+    from scipy.stats import t as _t_dist
+except ImportError as exc:
+    raise ImportError(
+        "src.knob_tuner.tools.stats requires scipy "
+        "(scipy.stats.t.cdf); install it with `uv sync`."
+    ) from exc
 
 # One-sided 0.025 t critical values (the confirmation test uses the same lookup).
 # ponytail: floor of the Welch df is used (conservative for promotion) and the
@@ -110,6 +118,54 @@ def welch_delta(
         "sufficient": True,
         "zero_spread": zero_spread,
     }
+
+
+def p_win(baseline_samples: list[float], tuned_samples: list[float]) -> float:
+    """One-sided Welch ``P(tuned mean > baseline mean)`` in ``[0, 1]``.
+
+    The t-statistic (``mean_delta_pct / se_pct``) and Welch ``df`` come from
+    the existing :func:`welch_delta` outputs; the CDF is ``scipy.stats.t.cdf``
+    (scipy is a required dependency).
+    Sanity: a clear win returns ~1, pure noise ~0.5, a clear loss ~0.
+    Insufficient evidence (fewer than two samples per arm, non-positive
+    baseline mean, or ``df < 1``) returns 0.5 (no information either way);
+    a degenerate zero-variance pair returns 1.0/0.0 by the sign of the delta.
+    Never throws: bad input returns 0.5.
+    """
+    try:
+        baseline = [float(x) for x in (baseline_samples or [])]
+        tuned = [float(x) for x in (tuned_samples or [])]
+    except (TypeError, ValueError):
+        return 0.5
+    try:
+        stats = welch_delta(baseline, tuned)
+    except Exception:  # noqa: BLE001 - p_win never throws
+        return 0.5
+    try:
+        if not stats.get("sufficient", False):
+            return 0.5
+        df = float(stats.get("df", 0.0) or 0.0)
+        if df < 1.0:
+            return 0.5
+        delta = float(stats.get("mean_delta_pct", 0.0) or 0.0)
+        se = float(stats.get("se_pct", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.5
+    if se <= 0.0:
+        if delta > 0.0:
+            return 1.0
+        if delta < 0.0:
+            return 0.0
+        return 0.5
+    t_stat = delta / se
+    if t_stat >= 1e6:
+        return 1.0
+    if t_stat <= -1e6:
+        return 0.0
+    try:
+        return min(1.0, max(0.0, float(_t_dist.cdf(t_stat, df))))
+    except Exception:  # noqa: BLE001 - p_win never throws
+        return 0.5
 
 
 def futility_stop(

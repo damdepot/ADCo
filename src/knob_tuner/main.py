@@ -39,6 +39,7 @@ from src.knob_tuner.contracts import (
     SysbenchProfile,
     TuningStatus,
 )
+from src.knob_tuner.stages.models import normalize_workload_profile
 from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
 from src.knob_tuner.tools.docker_tools import (
     ACTIVE_CONTAINERS,
@@ -343,6 +344,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=10,
+        help=(
+            "Maximum screening attempts before the loop stops "
+            "(default: 10)"
+        ),
+    )
+    parser.add_argument(
         "--workload-hint",
         default="",
         help=(
@@ -469,6 +479,7 @@ def build_initial_state(
     candidate_warmup_seconds: int = 2,
     early_stop_min_reps: int = 4,
     max_set_knobs: int = 20,
+    max_attempts: int = 10,
 ) -> dict[str, Any]:
     """Construct the initial session state for the knob tuner workflow."""
     profile = profile or SysbenchProfile()
@@ -496,7 +507,7 @@ def build_initial_state(
         "output_path": output_path,
         "dry_run": dry_run,
         "validation_attempt_count": 0,
-        "max_validation_attempts": 4,
+        "max_attempts": max(1, int(max_attempts or 10)),
         "multi_fidelity_min_seconds": float(multi_fidelity_min_seconds),
         "screen_total_rows": int(screen_total_rows),
         "screen_max_rows": int(screen_max_rows),
@@ -513,6 +524,11 @@ def build_initial_state(
         "candidate_warmup_seconds": max(0, int(candidate_warmup_seconds or 0)),
         "early_stop_min_reps": max(2, int(early_stop_min_reps or 4)),
         "max_set_knobs": max(1, int(max_set_knobs or 20)),
+        # Staged-graph loop counters and the candidate/diagnosis context.
+        "attempt": 0,
+        "experiment_history": [],
+        "rejected_history": [],
+        "workload_profile": normalize_workload_profile(None, workload_hint),
     }
 
     if os.path.isfile(db_config_path):
@@ -677,6 +693,7 @@ async def run_pipeline(
     candidate_warmup_seconds: int = 2,
     early_stop_min_reps: int = 4,
     max_set_knobs: int = 20,
+    max_attempts: int = 10,
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using the ADK Runner and session service."""
     # 1. Resource contract FIRST: fail before any side effect.
@@ -742,6 +759,7 @@ async def run_pipeline(
         candidate_warmup_seconds=candidate_warmup_seconds,
         early_stop_min_reps=early_stop_min_reps,
         max_set_knobs=max_set_knobs,
+        max_attempts=max_attempts,
     )
 
     initial_state["verbose"] = verbose
@@ -768,6 +786,11 @@ async def run_pipeline(
                 initial_state["workload_info"] = workload
         except Exception as exc:
             _log_event(f"Intent analyzer warning: {exc}", log_file=log_file_abs, verbose=verbose)
+
+    # The staged graph reads a merged workload_profile (never the raw keys).
+    initial_state["workload_profile"] = normalize_workload_profile(
+        initial_state.get("workload_info"), workload_hint
+    )
 
     session_service = InMemorySessionService()
     sid = uuid.uuid4().hex[:12]
@@ -927,6 +950,7 @@ def main() -> None:
                 candidate_warmup_seconds=args.candidate_warmup_seconds,
                 early_stop_min_reps=args.early_stop_min_reps,
                 max_set_knobs=args.max_set_knobs,
+                max_attempts=args.max_attempts,
             )
         )
     except Exception as exc:

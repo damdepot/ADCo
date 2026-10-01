@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
 from typing import Any
 
 from src.knob_tuner.contracts import (
@@ -134,8 +131,6 @@ def extract_knob_list(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
         if "recommendations" in value:
             value = value.get("recommendations") or []
-        elif "selected_knobs" in value:
-            value = value.get("selected_knobs") or []
         elif "knobs" in value:
             value = value.get("knobs") or []
         else:
@@ -162,25 +157,14 @@ def dedupe_by_name(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def load_raw_knobs(state: Any) -> list[dict[str, Any]]:
-    """Load raw knob recommendations from session state or a selected-knobs file.
+    """Load raw knob recommendations from session state.
 
-    Prefers ``selected_knobs`` (already memory-clamped by the recommender tool),
-    then ``knob_recommender_output``, then ``{knob_path}/knobs-selected.json``.
+    Reads ``knob_recommender_output``. Wave 4: the ``{knob_path}/knobs-selected.json``
+    file fallback was removed — the staged graph never writes that file, so
+    state is the single source of truth.
     """
     candidates: list[dict[str, Any]] = []
-    candidates.extend(extract_knob_list(state.get("selected_knobs")))
     candidates.extend(extract_knob_list(state.get("knob_recommender_output")))
-
-    if not candidates:
-        knob_path = state.get("knob_path") or state.get("target")
-        if knob_path:
-            path = os.path.join(str(knob_path), "knobs-selected.json")
-            if os.path.isfile(path):
-                try:
-                    data = json.loads(Path(path).read_text(encoding="utf-8"))
-                    candidates.extend(extract_knob_list(data))
-                except Exception:
-                    pass
 
     return dedupe_by_name(candidates)
 

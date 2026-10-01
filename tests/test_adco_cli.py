@@ -41,6 +41,7 @@ def test_build_parser():
     assert args.buffer_time == 0.0
     assert args.screening_benchmark == "sysbench"
     assert args.workload_hint == ""
+    assert args.max_attempts == 10
 
 
 def test_build_parser_custom_options():
@@ -60,6 +61,7 @@ def test_build_parser_custom_options():
         "--buffer-time", "2.5",
         "--screening-benchmark", "pgbench",
         "--workload-hint", "analytical sort spills",
+        "--max-attempts", "7",
     ])
     assert args.target == "my_target"
     assert args.db_name == "my_db"
@@ -75,6 +77,7 @@ def test_build_parser_custom_options():
     assert args.buffer_time == 2.5
     assert args.screening_benchmark == "pgbench"
     assert args.workload_hint == "analytical sort spills"
+    assert args.max_attempts == 7
 
 
 

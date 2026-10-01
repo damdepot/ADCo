@@ -1268,10 +1268,12 @@ def test_ignored_error_mismatch_is_warning_only(
             apply_mode=ApplyMode.DYNAMIC,
         )
 
-    # The throughput comparison itself passes; the error-rate mismatch is
-    # recorded as a warning only and never vetoes the win.
+    # The throughput comparison itself passes, but the error-RATE parity veto
+    # fires: tuned rate 38/222 ~= 17.1% exceeds pooled-baseline rate 40/400
+    # = 10% by >50% with a material absolute gap (38 vs A1 20), so the win
+    # does not stand. The count mismatch warning is still recorded.
     assert result["paired"]["status"] == "PASS"
-    assert result["status"] == "PASS"
+    assert result["status"] == "FAIL"
     assert result["ignored_errors"]["mismatch"] is True
     assert result["ignored_errors"]["baseline_first"] == 20
     assert result["ignored_errors"]["baseline_reversal"] == 20
@@ -1281,6 +1283,7 @@ def test_ignored_error_mismatch_is_warning_only(
         reason.startswith("warning:") and "ignored-error mismatch" in reason
         for reason in result["reasons"]
     )
+    assert any("tuned error rate" in reason for reason in result["reasons"])
 
     written = {call.args[1]: call.args[2] for call in m_write.call_args_list}
     assert written["ignored-errors"]["mismatch"] is True
@@ -1532,14 +1535,17 @@ def test_shared_baseline_skips_baseline_and_reversal(budget, profile, plan, stag
         )
 
     # Only the tuned arm runs: no internal baseline, no reversal.
+    # The throughput comparison passes but the error-rate parity veto fires
+    # (tuned 38/222 ~= 17.1% vs shared-baseline 20/200 = 10%), so FAIL.
     m_bench.assert_called_once()
-    assert result["status"] == "PASS"
+    assert result["status"] == "FAIL"
     assert result["stopped_early"] is False
     assert result["ignored_errors"]["mismatch"] is True
     assert any(
         reason.startswith("warning:") and "ignored-error mismatch" in reason
         for reason in result["reasons"]
     )
+    assert any("tuned error rate" in reason for reason in result["reasons"])
     assert result["baseline_reversal"]["measured"] is False
     assert result["baseline_reversal"]["reason"] == (
         "shared baseline reused across candidates"

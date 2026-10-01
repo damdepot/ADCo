@@ -82,11 +82,13 @@ class SysbenchProfile(BaseModel):
     throughput_threshold_pct: float = Field(default=0.0, ge=0)
     latency_threshold_pct: float = Field(default=5.0, ge=0)
     min_improvement_pct: float = Field(
-        default=2.0,
+        default=5.0,
         ge=0,
         description=(
             "Minimum percentage the 95% lower confidence bound on throughput "
-            "must exceed for a candidate to be considered a real improvement."
+            "must exceed for a candidate to be considered a real improvement. "
+            "Proxy overstates production ~1.6-2x on OLTP, so the gate requires "
+            "5% proxy LCB."
         ),
     )
 

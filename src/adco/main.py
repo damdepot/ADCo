@@ -220,6 +220,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--max-attempts",
+        type=int,
+        default=10,
+        help="Maximum tuner screening attempts before the loop stops (default: 10)",
+    )
+    p.add_argument(
         "--knob-path",
         default="out/adco/knobs",
         help="Directory to save generated knob configuration files",
@@ -284,6 +290,7 @@ async def run_pipeline(
     candidate_warmup_seconds: int = 2,
     early_stop_min_reps: int = 4,
     max_set_knobs: int = 20,
+    max_attempts: int = 10,
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
 
@@ -393,6 +400,7 @@ async def run_pipeline(
         tuner_extra_state["candidate_warmup_seconds"] = candidate_warmup_seconds
         tuner_extra_state["early_stop_min_reps"] = early_stop_min_reps
         tuner_extra_state["max_set_knobs"] = max_set_knobs
+        tuner_extra_state["max_attempts"] = max_attempts
 
         tuner_state = await tuner_pipeline(
             target=sandbox,
@@ -518,6 +526,7 @@ def main() -> None:
                 ),
                 early_stop_min_reps=getattr(args, "early_stop_min_reps", 4),
                 max_set_knobs=getattr(args, "max_set_knobs", 20),
+                max_attempts=getattr(args, "max_attempts", 10),
             )
         )
     except Exception as exc:

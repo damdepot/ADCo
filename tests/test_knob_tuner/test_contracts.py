@@ -79,7 +79,7 @@ def test_sysbench_profile_defaults():
     assert profile.seed == 42
     assert profile.throughput_threshold_pct == 0.0
     assert profile.latency_threshold_pct == 5.0
-    assert profile.min_improvement_pct == 2.0
+    assert profile.min_improvement_pct == 5.0
 
 
 def test_sysbench_profile_min_improvement_validation():
@@ -97,7 +97,7 @@ def test_sysbench_profile_hash_changes_with_field():
     base = SysbenchProfile()
     changed = SysbenchProfile(threads=8)
     assert base.profile_hash() != changed.profile_hash()
-    promotion_changed = SysbenchProfile(min_improvement_pct=5.0)
+    promotion_changed = SysbenchProfile(min_improvement_pct=7.5)
     assert base.profile_hash() != promotion_changed.profile_hash()
 
 

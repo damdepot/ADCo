@@ -6,7 +6,7 @@ from src.code_rewriter.sub_agents.optimizer.agent import create_optimizer_agent
 from src.intent_analyzer.sub_agents.file_selector.agent import create_file_selector_agent as create_intent_fs_agent
 from src.intent_analyzer.sub_agents.intent_extractor.agent import create_intent_extractor_agent as create_intent_ie_agent
 from src.knob_tuner.sub_agents.db_inspector.agent import create_db_inspector_agent
-from src.knob_tuner.sub_agents.knob_recommender.agent import create_knob_recommender_agent
+from src.knob_tuner.sub_agents.candidate_generator.agent import create_candidate_generation_agent
 
 from src.intent_analyzer.models import IntentAnalyzerResult
 
@@ -19,7 +19,7 @@ def test_subagent_output_schemas():
         create_intent_fs_agent(),
         create_intent_ie_agent(),
         create_db_inspector_agent(),
-        create_knob_recommender_agent(),
+        create_candidate_generation_agent(),
     ]
     for agent in agents:
         assert getattr(agent, "output_schema", None) is not None, f"Agent {agent.name} missing output_schema"

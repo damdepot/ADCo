@@ -412,6 +412,51 @@ def _ignored_error_mismatch(
     )
 
 
+def _error_rate(errors: int, measurement: Any) -> float:
+    """Return the ignored-error rate for a measurement arm.
+
+    Rate is ``errors / max(1.0, total_transactions)`` where
+    ``total_transactions = sum(per_run_tps) * seconds`` with ``seconds``
+    taken from ``measurement.duration`` when positive, else ``10.0``.
+    Absolute counts punish higher throughput (more total transactions), so
+    rates keep the arms comparable. Defensive: missing attributes or bad
+    values yield ``0.0`` and this helper never raises.
+    """
+    try:
+        try:
+            count = int(errors)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.0
+        if count <= 0:
+            return 0.0
+        if measurement is None:
+            return 0.0
+        try:
+            per_run = getattr(measurement, "per_run_tps", None)
+        except Exception:
+            return 0.0
+        try:
+            total = (
+                float(sum(float(x) for x in per_run))
+                if per_run
+                else 0.0
+            )
+        except (TypeError, ValueError):
+            return 0.0
+        try:
+            seconds = float(getattr(measurement, "duration", 10.0))
+        except (TypeError, ValueError):
+            seconds = 10.0
+        if not seconds or seconds <= 0:
+            seconds = 10.0
+        denom = total * seconds
+        if denom <= 0:
+            denom = 1.0
+        return max(0.0, float(count) / max(1.0, denom))
+    except Exception:
+        return 0.0
+
+
 def _select_runner(benchmark_kind: str) -> Callable[..., SysbenchMeasurement]:
     """Return the measurement runner for ``benchmark_kind`` (default sysbench)."""
     if str(benchmark_kind or "").strip().lower() == "pgbench":
@@ -1168,6 +1213,46 @@ def validate_plan(
         if ignored_error_mismatch:
             reasons.append(f"warning: {ignored_error_reason}")
 
+        # 8c. Error-rate parity veto. Absolute ignored-error counts punish
+        #     higher throughput (more total transactions at a parity error
+        #     rate), so compare RATES: pooled-baseline rate vs tuned rate. A
+        #     >50% rate excess with a material absolute gap means the arms did
+        #     different work and the win cannot stand. The absolute gap is
+        #     measured like-for-like against the single A1/shared baseline arm
+        #     (the pooled arm covers ~2x the transactions when a reversal ran,
+        #     so a pooled absolute comparison would never fire).
+        error_rate_veto = False
+        try:
+            base_rate = _error_rate(
+                pooled_baseline.ignored_errors, pooled_baseline
+            )
+            tuned_rate = _error_rate(tuned.ignored_errors, tuned)
+            try:
+                tuned_n = int(tuned.ignored_errors)
+            except (TypeError, ValueError):
+                tuned_n = 0
+            try:
+                base_n = int(baseline.ignored_errors)
+            except (TypeError, ValueError):
+                base_n = 0
+            if tuned_n >= 5 or base_n >= 5:
+                if base_rate <= 0.0:
+                    if tuned_n >= 10:
+                        error_rate_veto = True
+                elif (
+                    tuned_rate > base_rate * 1.5
+                    and (tuned_n - base_n) >= 5
+                ):
+                    error_rate_veto = True
+            if error_rate_veto:
+                reasons.append(
+                    f"tuned error rate {tuned_rate:.3%} exceeds baseline "
+                    f"{base_rate:.3%} by >50% (tuned={tuned_n} errs, "
+                    f"baseline={base_n} errs); arms not like-for-like"
+                )
+        except Exception:
+            error_rate_veto = False
+
         # 9. Paired comparison against the pooled baseline.
         paired = PairedResult.evaluate(pooled_baseline, tuned, profile)
 
@@ -1188,6 +1273,8 @@ def validate_plan(
         reasons.extend(paired.reasons)
 
         if failed_applications or restart_failed:
+            status = TuningStatus.FAIL
+        elif error_rate_veto:
             status = TuningStatus.FAIL
         elif paired.status == TuningStatus.PASS and all_verified:
             status = TuningStatus.PASS
