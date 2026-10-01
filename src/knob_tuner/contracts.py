@@ -19,6 +19,187 @@ class TuningStatus(str, Enum):
     INCONCLUSIVE = "INCONCLUSIVE"
 
 
+# ---------------------------------------------------------------------------
+# Tuning defaults — single home for pipeline-wide constants (Phase 4.1).
+#
+# Canonical source for the experiment phases, the loop caps, and the win
+# gate. Every other site (stages/models.py, stages/nodes.py,
+# tools/experiments.py, workflow.py, main.py, prompts) imports from here or
+# carries only a prose copy with a comment pointing back here.
+# ---------------------------------------------------------------------------
+
+#: Valid experiment phases for CandidateProposal/ExperimentArm/CompiledPlan.
+VALID_EXPERIMENT_PHASES: tuple[str, str, str] = (
+    "screen",
+    "interaction",
+    "refinement",
+)
+
+#: Default maximum screening attempts before the loop stops.
+DEFAULT_MAX_ATTEMPTS: int = 10
+
+#: Default cap on distinct knobs per experiment proposal.
+DEFAULT_MAX_SET_KNOBS: int = 20
+
+#: Default win-gate: LCB on throughput must exceed this pct to confirm.
+DEFAULT_MIN_IMPROVEMENT_PCT: float = 5.0
+
+#: Default measurement reps per arm in single-fidelity mode.
+DEFAULT_MEASURE_REPS: int = 10
+
+#: Default measured seconds per repetition.
+DEFAULT_MEASURE_SECONDS: int = 10
+
+#: Default warmup seconds per measurement arm.
+DEFAULT_MEASURE_WARMUP_SECONDS: int = 2
+
+#: Default minimum reps before an arm may stop early for futility.
+DEFAULT_EARLY_STOP_MIN_REPS: int = 4
+
+#: Canonical session-state key for the database name (Phase 4.3, R3 done).
+#: Legacy ``db_name``/``dbname`` mirrors deleted; readers use ``database``.
+#: :func:`get_database_name` stays tolerant (harmless compat read).
+DATABASE_STATE_KEY: str = "database"
+
+#: Canonical session-state key for the loop counter (Phase 4.3, R3 done).
+#: Legacy ``attempt`` mirror deleted; readers use ``validation_attempt_count``.
+ATTEMPT_STATE_KEY: str = "validation_attempt_count"
+
+#: Canonical session-state key for the shared baseline (Phase 4.3, R3 done).
+#: Legacy ``baseline`` mirror deleted; readers use ``shared_baseline``.
+SHARED_BASELINE_STATE_KEY: str = "shared_baseline"
+
+#: Canonical session-state key for the DB config path (Phase 4.3, R3 done).
+#: Legacy ``config_path`` mirror deleted; readers use ``db_config_path``.
+DB_CONFIG_PATH_STATE_KEY: str = "db_config_path"
+
+#: Canonical session-state keys for the single-fidelity timing family.
+MEASURE_REPS_STATE_KEY: str = "measure_reps"
+MEASURE_SECONDS_STATE_KEY: str = "measure_seconds"
+MEASURE_WARMUP_SECONDS_STATE_KEY: str = "measure_warmup_seconds"
+EARLY_STOP_MIN_REPS_STATE_KEY: str = "early_stop_min_reps"
+
+
+def get_database_name(state: Any) -> str:
+    """Return the canonical database name (tolerant legacy read, harmless).
+
+    R3 keeps the ``db_name``/``dbname`` fallback: old persisted states and
+    embedded callers may still carry the deleted mirrors, and a read-only
+    fallback can never diverge writes (writes are canonical-only).
+    """
+    try:
+        getter = getattr(state, "get", None)
+        if not callable(getter):
+            return ""
+        return str(
+            getter("database") or getter("db_name") or getter("dbname") or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
+def get_db_config_path(state: Any) -> str:
+    """Return the canonical DB config path (R3: canonical-only)."""
+    try:
+        getter = getattr(state, "get", None)
+        if not callable(getter):
+            return ""
+        value = getter("db_config_path") or ""
+        return str(value).strip()
+    except Exception:
+        return ""
+
+
+def get_validation_attempt(state: Any) -> int:
+    """Return the canonical loop counter (R3: canonical-only)."""
+    try:
+        getter = getattr(state, "get", None)
+        if not callable(getter):
+            return 0
+        raw = getter("validation_attempt_count", 0)
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_max_attempts(state: Any) -> int:
+    """Return the loop cap (default :data:`DEFAULT_MAX_ATTEMPTS`)."""
+    try:
+        getter = getattr(state, "get", None)
+        raw = getter("max_attempts", DEFAULT_MAX_ATTEMPTS) if callable(getter) else DEFAULT_MAX_ATTEMPTS
+        return max(1, int(raw or DEFAULT_MAX_ATTEMPTS))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_ATTEMPTS
+
+
+def get_min_improvement_pct(state: Any) -> float:
+    """Return the win-gate pct (explicit 0.0 honored; missing → default).
+
+    Uses a plain ``.get`` default WITHOUT ``or`` so a configured ``0.0``
+    is honored while a missing/``None`` entry falls back to
+    :data:`DEFAULT_MIN_IMPROVEMENT_PCT`.
+    """
+    try:
+        getter = getattr(state, "get", None)
+        raw = getter("min_improvement_pct", DEFAULT_MIN_IMPROVEMENT_PCT) if callable(getter) else DEFAULT_MIN_IMPROVEMENT_PCT
+        if raw is None:
+            return DEFAULT_MIN_IMPROVEMENT_PCT
+        return float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_IMPROVEMENT_PCT
+
+
+def get_max_set_knobs(state: Any) -> int:
+    """Return the per-experiment knob cap (default :data:`DEFAULT_MAX_SET_KNOBS`)."""
+    try:
+        getter = getattr(state, "get", None)
+        raw = getter("max_set_knobs", DEFAULT_MAX_SET_KNOBS) if callable(getter) else DEFAULT_MAX_SET_KNOBS
+        return max(1, int(raw or DEFAULT_MAX_SET_KNOBS))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_SET_KNOBS
+
+
+def _read_clamped_int(state: Any, key: str, default: int, floor: int) -> int:
+    """Read *key* from *state* and apply *floor*, falling back to *default*.
+
+    Single source for the timing family's default + clamp: a missing/``None``
+    value yields *default*; any other value is coerced to ``int`` and floored
+    at *floor* (bad types yield *default*).
+    """
+    try:
+        getter = getattr(state, "get", None)
+        raw = getter(key, default) if callable(getter) else default
+        if raw is None:
+            return default
+        return max(floor, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_measure_reps(state: Any) -> int:
+    """Return measurement reps per arm (default :data:`DEFAULT_MEASURE_REPS`, min 2)."""
+    return _read_clamped_int(state, MEASURE_REPS_STATE_KEY, DEFAULT_MEASURE_REPS, 2)
+
+
+def get_measure_seconds(state: Any) -> int:
+    """Return measured seconds per rep (default :data:`DEFAULT_MEASURE_SECONDS`, min 1)."""
+    return _read_clamped_int(state, MEASURE_SECONDS_STATE_KEY, DEFAULT_MEASURE_SECONDS, 1)
+
+
+def get_measure_warmup_seconds(state: Any) -> int:
+    """Return warmup seconds per arm (default :data:`DEFAULT_MEASURE_WARMUP_SECONDS`, min 0)."""
+    return _read_clamped_int(
+        state, MEASURE_WARMUP_SECONDS_STATE_KEY, DEFAULT_MEASURE_WARMUP_SECONDS, 0
+    )
+
+
+def get_early_stop_min_reps(state: Any) -> int:
+    """Return futility early-stop floor (default :data:`DEFAULT_EARLY_STOP_MIN_REPS`, min 2)."""
+    return _read_clamped_int(
+        state, EARLY_STOP_MIN_REPS_STATE_KEY, DEFAULT_EARLY_STOP_MIN_REPS, 2
+    )
+
+
 class KnobScope(str, Enum):
     """PostgreSQL ``pg_settings.context`` categories for a knob."""
 
@@ -33,8 +214,8 @@ class ApplyMode(str, Enum):
     """How a knob value is applied to a running database."""
 
     NONE = "none"
-    DYNAMIC = "dynamic"
-    PERSIST_STATIC = "persist-static"
+    LIVE = "live"
+    MANUAL = "manual"
 
 
 class ResourceBudget(BaseModel):
@@ -308,5 +489,7 @@ class RunManifest(BaseModel):
     attempt_count: int = 0
     applied_knobs: list[dict[str, Any]] = Field(default_factory=list)
     verified_knobs: list[dict[str, Any]] = Field(default_factory=list)
+    pending_restart_knobs: list[dict[str, Any]] = Field(default_factory=list)
+    validation_timings: dict[str, Any] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     final_status: str = "INCONCLUSIVE"

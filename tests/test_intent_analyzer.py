@@ -1,6 +1,4 @@
 """Tests for the new intent_analyzer module."""
-import os
-import pytest
 from unittest.mock import MagicMock
 
 from src.intent_analyzer.agent import create_intent_analyzer_agent

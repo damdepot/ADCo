@@ -4,6 +4,7 @@ import os
 
 from google.adk.tools import ToolContext
 
+from src.knob_tuner.contracts import get_database_name, get_db_config_path
 from src.knob_tuner.sub_agents.db_inspector.models import (
     KnobInfo,
     TableInfo,
@@ -32,12 +33,11 @@ def _get_db_config(tool_context: ToolContext) -> DBConfig | None:
         isinstance(in_state, dict) and bool(in_state.get("password"))
     )
     if not has_secret:
-        path = state.get("db_config_path") or state.get("config_path")
+        path = get_db_config_path(state)
         if isinstance(path, str) and os.path.isfile(path):
             db_type = str(state.get("db_type", "postgres") or "postgres")
-            db_name = str(
-                state.get("database") or state.get("db_name") or state.get("dbname") or ""
-            ).strip()
+            # R3: canonical database name only (mirrors deleted).
+            db_name = get_database_name(state)
             try:
                 return load_db_config(path, db_type=db_type, db_override=db_name or None)
             except Exception:
@@ -56,7 +56,8 @@ def _get_db_config(tool_context: ToolContext) -> DBConfig | None:
                 port=int(cfg.get("port", default_port)),
                 user=cfg.get("user", default_user),
                 password=cfg.get("password", ""),
-                database=cfg.get("db_name", cfg.get("database", cfg.get("dbname", "postgres"))),
+                # R3: canonical database name only (mirrors deleted).
+                database=(cfg.get("database") or "postgres"),
                 db_type=db_type,
                 env=cfg.get("env", "staging"),
                 restart_type=cfg.get("restart_type", "docker"),
@@ -65,7 +66,7 @@ def _get_db_config(tool_context: ToolContext) -> DBConfig | None:
                 remote_host=cfg.get("remote_host", ""),
                 remote_user=cfg.get("remote_user", ""),
             )
-    if "db_type" in state and ("database" in state or "dbname" in state or "db_name" in state):
+    if "db_type" in state and "database" in state:
         db_type = state.get("db_type", "postgres")
         default_port = 5432 if "post" in db_type.lower() else 3306
         default_user = "postgres" if "post" in db_type.lower() else "root"
@@ -74,7 +75,8 @@ def _get_db_config(tool_context: ToolContext) -> DBConfig | None:
             port=int(state.get("port", default_port)),
             user=state.get("user", default_user),
             password=state.get("password", ""),
-            database=state.get("db_name", state.get("database", state.get("dbname", "postgres"))),
+            # R3: canonical database name only (mirrors deleted).
+            database=(state.get("database") or "postgres"),
             db_type=db_type,
             env=state.get("env", "staging"),
         )

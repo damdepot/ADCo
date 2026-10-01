@@ -245,7 +245,7 @@ def test_dry_run_skips_everything(budget, profile, plan):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             dry_run=True,
         )
 
@@ -283,7 +283,7 @@ def test_happy_path_pass(budget, profile, plan, staging_cfg):
         patch(
             f"{_VALIDATION}.apply_knobs", return_value=_apply_results()
         ) as m_apply,
-        patch(f"{_VALIDATION}.verify_active_knobs", return_value=_verify()) as m_verify,
+        patch(f"{_VALIDATION}.verify_active_knobs", return_value=_verify()) as _m_verify,
         patch(f"{_VALIDATION}.restart_docker_db") as m_restart,
         patch(f"{_VALIDATION}.stop_staging_db", return_value=(True, "stopped")) as m_stop,
         patch(
@@ -296,7 +296,7 @@ def test_happy_path_pass(budget, profile, plan, staging_cfg):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["status"] == "PASS"
@@ -381,7 +381,7 @@ def test_pgbench_dispatch_selects_pgbench_runner(budget, profile, plan, staging_
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             benchmark_kind="pgbench",
         )
 
@@ -418,7 +418,7 @@ def test_default_dispatch_selects_sysbench_runner(budget, profile, plan, staging
     ):
         validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert m_sys.call_count == 3
@@ -451,7 +451,7 @@ def test_every_arm_prepares_dataset_symmetrically(
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             reuse_dataset=reuse_dataset,
         )
 
@@ -484,7 +484,7 @@ def test_read_only_benchmark_prepares_once_and_reuses(
     ):
         validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             benchmark_kind="pgbench",
         )
 
@@ -538,7 +538,7 @@ def test_failed_baseline_is_not_resurrected_by_pooling(budget, profile, plan, st
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["paired"]["baseline"]["status"] == "error"
@@ -567,7 +567,7 @@ def test_inconclusive_when_missing_reps(budget, profile, plan, staging_cfg):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["status"] == "INCONCLUSIVE"
@@ -597,7 +597,7 @@ def test_fail_when_knob_application_fails(budget, profile, plan, staging_cfg):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["paired"]["status"] == "PASS"
@@ -630,7 +630,7 @@ def test_fail_when_verification_mismatch(budget, profile, plan, staging_cfg):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["paired"]["status"] == "PASS"
@@ -652,7 +652,7 @@ def test_environment_error_at_provisioning(budget, profile, plan):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["status"] == "FAIL"
@@ -693,7 +693,7 @@ def test_persist_static_restarts_and_refreshes_port(budget, profile, plan, stagi
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.PERSIST_STATIC,
+            apply_mode=ApplyMode.MANUAL,
         )
 
     assert result["status"] == "PASS"
@@ -726,7 +726,7 @@ def test_restart_failure_returns_fail(budget, profile, plan, staging_cfg):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.PERSIST_STATIC,
+            apply_mode=ApplyMode.MANUAL,
         )
 
     assert result["status"] == "FAIL"
@@ -757,7 +757,7 @@ def test_validate_plan_emits_progress(budget, profile, plan, staging_cfg):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             progress=messages.append,
         )
 
@@ -868,7 +868,7 @@ def test_validate_plan_records_wal_evidence(budget, profile, plan, staging_cfg):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["status"] == "PASS"
@@ -921,7 +921,7 @@ def test_validate_plan_survives_evidence_failures(budget, profile, plan, staging
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["status"] == "PASS"
@@ -960,7 +960,7 @@ def test_reversal_measures_baseline_twice_and_pools(budget, profile, plan, stagi
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     # A1, candidate B and the restored baseline A2 were all measured.
@@ -1003,7 +1003,7 @@ def test_reversal_cancels_cold_warm_bias(budget, profile, plan, staging_cfg):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     # A linear cold->warm drift puts the candidate exactly at the pooled median,
@@ -1035,7 +1035,7 @@ def test_reversal_genuine_win_still_passes(budget, profile, plan, staging_cfg):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["status"] == "PASS"
@@ -1068,7 +1068,7 @@ def test_reversal_falls_back_when_second_baseline_fails(
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     # A failed reversal must never fail the run and must fall back to A1.
@@ -1113,7 +1113,7 @@ def test_reversal_falls_back_when_revert_fails(budget, profile, plan, staging_cf
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["status"] == "PASS"
@@ -1148,7 +1148,7 @@ def test_reversal_restarts_staging_after_revert(budget, profile, plan, staging_c
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.PERSIST_STATIC,
+            apply_mode=ApplyMode.MANUAL,
         )
 
     assert result["status"] == "PASS"
@@ -1180,7 +1180,7 @@ def test_reversal_skipped_without_settings_snapshot(
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     assert result["status"] == "PASS"
@@ -1219,7 +1219,7 @@ def test_reversal_failure_is_visible_in_result(budget, profile, plan, staging_cf
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     # The run still passes on the single A1 baseline...
@@ -1265,7 +1265,7 @@ def test_ignored_error_mismatch_is_warning_only(
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
         )
 
     # The throughput comparison itself passes, but the error-RATE parity veto
@@ -1321,7 +1321,7 @@ def test_reversal_disabled_skips_reversal(budget, profile, plan, staging_cfg):
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             reversal=False,
         )
 
@@ -1363,7 +1363,7 @@ def test_snapshot_hit_boots_from_image_and_reuses_dataset(
     ):
         validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             snapshot=registry,
         )
 
@@ -1423,7 +1423,7 @@ def test_snapshot_miss_commits_clean_dataset_then_recreates_arms(
     ):
         validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             snapshot=registry,
         )
 
@@ -1476,7 +1476,7 @@ def test_snapshot_commit_failure_falls_back_to_prepare(
     ):
         validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             snapshot=registry,
         )
 
@@ -1501,7 +1501,7 @@ def test_baseline_only_measures_without_applying_plan(budget, profile, plan, sta
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             baseline_only=True,
         )
 
@@ -1529,7 +1529,7 @@ def test_shared_baseline_skips_baseline_and_reversal(budget, profile, plan, stag
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             shared_baseline=shared,
             early_stop_min_reps=4,
         )
@@ -1575,7 +1575,7 @@ def test_early_stop_futility_short_circuits_loser(budget, profile, plan, staging
     ):
         result = validate_plan(
             **_call_kwargs(budget, profile, plan),
-            apply_mode=ApplyMode.DYNAMIC,
+            apply_mode=ApplyMode.LIVE,
             shared_baseline=shared,
             early_stop_min_reps=4,
         )

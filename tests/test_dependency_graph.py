@@ -1,7 +1,5 @@
 import pytest
-from src.code_rewriter.models.ast_models import FileAnalysis
 from src.code_rewriter.models.dependency_models import (
-    CertaintyLevel,
     DependencyEdge,
     DependencyGraph,
     DependencyNode,

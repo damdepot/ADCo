@@ -47,7 +47,7 @@ from src.knob_tuner.tools.knobs import coerce_apply_mode
 from src.knob_tuner.tools.run_artifacts import write_artifact
 from src.knob_tuner.tools.stats import futility_stop
 
-_RESTART_MODES = (ApplyMode.PERSIST_STATIC,)
+_RESTART_MODES = (ApplyMode.MANUAL,)
 
 _POSTGRES_TYPES = ("postgres", "postgresql")
 
@@ -84,6 +84,27 @@ class SnapshotRegistry:
 
     def images(self) -> list[str]:
         return list(self._images.values())
+
+    def to_state(self) -> dict[str, dict[str, str]]:
+        """Return a plain-data snapshot (Phase 4.6: no live objects in state)."""
+        return {"images": dict(self._images)}
+
+    @classmethod
+    def from_state(cls, value: Any) -> SnapshotRegistry:
+        """Rebuild a registry from plain state data (never throws)."""
+        registry = cls()
+        try:
+            if isinstance(value, SnapshotRegistry):
+                registry._images = dict(value._images)
+            elif isinstance(value, dict):
+                images = value.get("images", value)
+                if isinstance(images, dict):
+                    for key, image in images.items():
+                        if key and image:
+                            registry._images[str(key)] = str(image)
+        except Exception:
+            pass
+        return registry
 
 
 def _snapshot_image_name(

@@ -18,12 +18,7 @@ from src.knob_tuner.stages.models import (
     TerminalDecision,
 )
 from src.knob_tuner.sub_agents.db_inspector.models import DbInspectorOutput
-
-
-class FakeCtx:
-    def __init__(self, state=None):
-        self.state = dict(state or {})
-        self.route = None
+from tests.test_knob_tuner.conftest import FakeCtx
 
 
 def _inv_state(**over):
@@ -185,7 +180,6 @@ def test_compile_sources_memory_from_resource_budget():
 def _routed_state(**over):
     state = {
         "max_attempts": 3,
-        "attempt": 1,
         "validation_attempt_count": 1,
         "min_improvement_pct": 2.0,
         "experiment_history": [
@@ -218,21 +212,21 @@ def test_controller_retry_without_recount():
         DiagnosisOutput(correction="drop_knob", targets=["work_mem"], rationale="r", confidence=0.7),
     )
     assert out["route"] == "retry" and ctx.route == "retry"
-    assert out["attempt"] == 1 and ctx.state["attempt"] == 1
+    assert out["validation_attempt_count"] == 1 and ctx.state["validation_attempt_count"] == 1
     assert len(ctx.state["experiment_history"]) == 1  # no second row
     assert len(ctx.state["diagnosis_history"]) == 1  # bookkeeping only
     assert out["status"] == "diagnosed:drop_knob"
 
 
 def test_controller_done_at_budget_with_attempt_cap_reason():
-    ctx = FakeCtx(_routed_state(max_attempts=2, attempt=2,
+    ctx = FakeCtx(_routed_state(max_attempts=2,
                                 validation_attempt_count=2))
     out = nodes.confirmation_controller(
         ctx,
         DiagnosisOutput(correction="drop_knob", targets=["work_mem"], rationale="r", confidence=0.7),
     )
     assert out["route"] == "done" and ctx.route == "done"
-    assert out["attempt"] == 2
+    assert out["validation_attempt_count"] == 2
     assert out.get("reason") == "attempt_cap"
 
 
@@ -279,7 +273,7 @@ def test_controller_rejection_does_not_reappend():
     # Compile already recorded the rejection (attempt bumped there); the
     # controller routes without touching history a second time.
     ctx = FakeCtx(
-        _inv_state(max_attempts=5, attempt=1,
+        _inv_state(max_attempts=5,
                    validation_attempt_count=1,
                    experiment_history=[],
                    rejected_history=["bad", "k: unknown"])
@@ -287,7 +281,7 @@ def test_controller_rejection_does_not_reappend():
     rej = CompileRejection(reason="bad", errors=["k: unknown"], design_name="e9")
     out = nodes.confirmation_controller(ctx, rej)
     assert out["route"] == "retry"
-    assert out["attempt"] == 1 and ctx.state["attempt"] == 1
+    assert out["validation_attempt_count"] == 1 and ctx.state["validation_attempt_count"] == 1
     assert ctx.state["experiment_history"] == []
     assert ctx.state["rejected_history"] == ["bad", "k: unknown"]
 
@@ -295,7 +289,7 @@ def test_controller_rejection_does_not_reappend():
 def test_screen_records_row_and_bumps_attempt_once():
     ctx = FakeCtx(
         {
-            "baseline": {"per_run_tps": [100.0, 101.0, 102.0]},
+            "shared_baseline": {"per_run_tps": [100.0, 101.0, 102.0]},
             "baseline_cache_key": nodes._baseline_cache_key(None, None),
             "min_improvement_pct": 2.0,
             "max_attempts": 6,
@@ -303,7 +297,7 @@ def test_screen_records_row_and_bumps_attempt_once():
     )
     out = nodes.screen_candidate(ctx, _compiled(), validate_fn=_mock_validate_ok)
     assert isinstance(out, ScreenVerdict)
-    assert ctx.state["attempt"] == 1
+    assert ctx.state["validation_attempt_count"] == 1
     assert len(ctx.state["experiment_history"]) == 1
     row = ctx.state["experiment_history"][0]
     assert row["name"] == "e1" and row["status"] == "PASS"
@@ -312,7 +306,7 @@ def test_screen_records_row_and_bumps_attempt_once():
         ctx,
         DiagnosisOutput(correction="retry_same", targets=[], rationale="flake?", confidence=0.6),
     )
-    assert ctx.state["attempt"] == 1
+    assert ctx.state["validation_attempt_count"] == 1
     assert len(ctx.state["experiment_history"]) == 1
     assert ctrl["route"] == "done"  # confident win backstop
     assert ctrl.get("reason") == "confident_win_backstop"
@@ -324,12 +318,12 @@ def test_compile_rejection_records_and_bumps_attempt_once():
         ctx, _proposal(levels=[{"knob": "nope", "value": "1"}])
     )
     assert isinstance(out, CompileRejection)
-    assert ctx.state["attempt"] == 1
+    assert ctx.state["validation_attempt_count"] == 1
     assert any("not in available knob inventory" in r for r in ctx.state["rejected_history"])
     # Controller routes the recorded rejection without recounting.
     ctrl = nodes.confirmation_controller(ctx, out)
     assert ctrl["route"] == "retry"
-    assert ctx.state["attempt"] == 1
+    assert ctx.state["validation_attempt_count"] == 1
 
 
 # --- screen: verdict mapping + never None ---
@@ -358,7 +352,7 @@ def _compiled():
 def test_screen_pass_maps_row():
     ctx = FakeCtx(
         {
-            "baseline": {"per_run_tps": [100.0, 101.0, 102.0]},
+            "shared_baseline": {"per_run_tps": [100.0, 101.0, 102.0]},
             "baseline_cache_key": nodes._baseline_cache_key(None, None),
             "min_improvement_pct": 2.0,
         }
@@ -382,7 +376,7 @@ def test_screen_baseline_runs_once_and_caches():
     ctx = FakeCtx({"min_improvement_pct": 2.0})
     first = nodes.screen_candidate(ctx, _compiled(), validate_fn=_validate)
     assert isinstance(first, ScreenVerdict)
-    assert ctx.state.get("baseline") == {"per_run_tps": [100.0, 101.0]}
+    assert ctx.state.get("shared_baseline") == {"per_run_tps": [100.0, 101.0]}
     n_calls = len(calls)
     second = nodes.screen_candidate(ctx, _compiled(), validate_fn=_validate)
     assert isinstance(second, ScreenVerdict)
@@ -393,7 +387,7 @@ def test_screen_fail_value_on_error_never_none():
     def _boom(**kwargs):
         raise RuntimeError("no db")
 
-    ctx = FakeCtx({"baseline": {"per_run_tps": [1.0]}})
+    ctx = FakeCtx({"shared_baseline": {"per_run_tps": [1.0]}})
     out = nodes.screen_candidate(ctx, _compiled(), validate_fn=_boom)
     assert isinstance(out, ScreenVerdict)
     assert out.status != "PASS" or out.confirmed is False
@@ -456,8 +450,8 @@ def _terminal(knobs):
     )
 
 
-def test_preflight_auto_dynamic():
-    ctx = FakeCtx({"apply_mode": "dynamic", "durability_profile": "strict"})
+def test_preflight_auto_live():
+    ctx = FakeCtx({"apply_mode": "live", "durability_profile": "strict"})
     out = nodes.production_preflight(
         ctx, _terminal([{"name": "work_mem", "value": "64MB", "scope": "user"}])
     )
@@ -518,7 +512,9 @@ def test_prepare_run_resolves_and_inits(tmp_path):
     out = nodes.prepare_run(ctx)
     assert out["resource_budget"] == {"cpu_cores": 4, "memory_gb": 8.0}
     assert out["max_attempts"] == 6
-    assert out["candidate_repetitions"] >= 2
-    assert ctx.state["attempt"] == 0
+    assert out["measure_reps"] >= 2
+    assert out["measure_seconds"] >= 1
+    assert out["measure_warmup_seconds"] >= 0
+    assert ctx.state["validation_attempt_count"] == 0
     assert ctx.state["experiment_history"] == []
     assert ctx.state["run_config"]["run_id"] == "r1"

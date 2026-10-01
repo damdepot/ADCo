@@ -11,6 +11,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from src.knob_tuner.contracts import VALID_EXPERIMENT_PHASES
+
 
 class ProposedLevel(BaseModel):
     """One knob setting within a proposed single experiment.
@@ -25,7 +27,8 @@ class ProposedLevel(BaseModel):
     value: Any = Field(description="Proposed level value for this experiment")
     reasoning: str = Field(default="", description="DBA rationale for this level")
 
-_VALID_EXPERIMENT_PHASES = ("screen", "interaction", "refinement")
+# Phase 4.1: canonical phases live in contracts.VALID_EXPERIMENT_PHASES.
+_VALID_EXPERIMENT_PHASES = VALID_EXPERIMENT_PHASES
 
 _VALID_TERMINAL_DECISIONS = (
     "apply_winner",
@@ -204,7 +207,10 @@ class ScreenVerdict(BaseModel):
     confirmed: bool = Field(default=False)
     improvement_confident: bool = Field(default=False)
     stopped_early: bool = Field(default=False)
-    paired: dict[str, Any] = Field(default_factory=dict)
+    paired: dict[str, Any] | None = Field(
+        default_factory=dict,
+        description="Paired per-run samples (None when no measurement exists)",
+    )
     reasons: list[str] = Field(default_factory=list)
 
 

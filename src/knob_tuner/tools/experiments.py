@@ -14,7 +14,13 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
-from src.knob_tuner.contracts import KnobPlan, KnobScope, KnobSpec
+from src.knob_tuner.contracts import (
+    DEFAULT_MIN_IMPROVEMENT_PCT,
+    KnobPlan,
+    KnobScope,
+    KnobSpec,
+    VALID_EXPERIMENT_PHASES,
+)
 from src.knob_tuner.tools.knobs import build_plan
 from src.knob_tuner.tools.stats import welch_delta
 
@@ -42,7 +48,8 @@ MAX_INTERACTION_ARMS = 4
 MAX_REFINEMENT_ARMS = 4
 MAX_TOTAL_ARMS = 12
 
-VALID_PHASES = ("screen", "interaction", "refinement")
+# Phase 4.1: canonical phases live in contracts.VALID_EXPERIMENT_PHASES.
+VALID_PHASES = VALID_EXPERIMENT_PHASES
 
 
 class ExperimentLevel(BaseModel):
@@ -188,7 +195,7 @@ def run_experiment_arms(
     attempt_base: int,
     early_stop_min_reps: int | None,
     progress: Callable[[str], None] | None = None,
-    min_improvement_pct: float = 5.0,
+    min_improvement_pct: float = DEFAULT_MIN_IMPROVEMENT_PCT,
 ) -> list[dict[str, Any]]:
     """Validate each experiment arm and score it with Welch stats.
 

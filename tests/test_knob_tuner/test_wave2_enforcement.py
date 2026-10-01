@@ -5,8 +5,6 @@ repeat-hash rejection + retry_same bypass, beliefs/bundle refresh,
 diagnosis_history append, inactive-with-empty-history. No live benchmarks.
 """
 
-from google.adk.sessions.state import State
-
 from src.knob_tuner.stages import nodes
 from src.knob_tuner.stages.models import (
     CompiledPlan,
@@ -14,12 +12,7 @@ from src.knob_tuner.stages.models import (
     DiagnosisOutput,
     ScreenVerdict,
 )
-
-
-class AdkCtx:
-    def __init__(self, **seed):
-        self.state = State(value=dict(seed), delta={})
-        self.route = None
+from tests.test_knob_tuner.conftest import AdkCtx
 
 
 def _seed_inventory(ctx: AdkCtx) -> None:
@@ -179,6 +172,42 @@ def test_adjust_value_violation_needs_new_value():
     assert isinstance(moved, CompiledPlan)
 
 
+def test_multi_action_history_enforces_all_corrections():
+    # Phase 5.4 full enforcement: every diagnosis in history applies, not
+    # just the latest. One rejection names each violated correction.
+    ctx = _ctx()
+    _diagnose(ctx, "drop_knob", ["work_mem"])
+    _diagnose(ctx, "change_phase", ["refinement"])
+    assert len(ctx.state.get("diagnosis_history") or []) == 2
+
+    both = nodes.compile_candidate(ctx, _proposal(phase="screen"))
+    assert isinstance(both, CompileRejection)
+    assert "drop_knob" in both.reason
+    assert "change_phase" in both.reason
+
+    one = nodes.compile_candidate(
+        ctx,
+        _proposal(
+            name="one",
+            phase="screen",
+            levels=[{"knob": "shared_buffers", "value": "256MB"}],
+        ),
+    )
+    assert isinstance(one, CompileRejection)
+    assert "change_phase" in one.reason
+    assert "drop_knob" not in one.reason
+
+    ok = nodes.compile_candidate(
+        ctx,
+        _proposal(
+            name="ok",
+            phase="refinement",
+            levels=[{"knob": "shared_buffers", "value": "256MB"}],
+        ),
+    )
+    assert isinstance(ok, CompiledPlan)
+
+
 def test_stop_violation_and_done():
     ctx = _ctx()
     out = _diagnose(ctx, "stop", [], "exhausted")
@@ -249,7 +278,7 @@ def test_beliefs_and_bundle_refresh_on_screen():
     ctx.state.update({"min_improvement_pct": 2.0})
     verdict = nodes.screen_candidate(ctx, compiled, validate_fn=_validate)
     assert isinstance(verdict, ScreenVerdict)
-    assert ctx.state.get("attempt") == 1
+    assert ctx.state.get("validation_attempt_count") == 1
     assert len(ctx.state.get("experiment_history") or []) == 1
     beliefs = ctx.state.get("knob_beliefs")
     assert isinstance(beliefs, dict) and "work_mem" in beliefs
@@ -267,7 +296,7 @@ def test_beliefs_and_bundle_refresh_on_screen():
                              confidence=0.95, stop_reason="winner")
     )
     assert out["route"] == "done"
-    assert ctx.state.get("attempt") == 1
+    assert ctx.state.get("validation_attempt_count") == 1
     assert len(ctx.state.get("experiment_history") or []) == 1
 
 
@@ -300,7 +329,7 @@ def test_screen_pass_then_diagnosis_next_routes_retry_once():
     ctx.state.update({"min_improvement_pct": 2.0})
     verdict = nodes.screen_candidate(ctx, compiled, validate_fn=_weak_validate)
     assert verdict.status == "PASS"
-    assert ctx.state.get("attempt") == 1
+    assert ctx.state.get("validation_attempt_count") == 1
     out = nodes.confirmation_controller(
         ctx,
         DiagnosisOutput(correction="drop_knob", targets=["work_mem"], rationale="next", confidence=0.6),
@@ -311,7 +340,7 @@ def test_screen_pass_then_diagnosis_next_routes_retry_once():
     else:
         assert out["route"] == "retry"
         assert "reason" not in out
-    assert ctx.state.get("attempt") == 1
+    assert ctx.state.get("validation_attempt_count") == 1
     assert len(ctx.state.get("experiment_history") or []) == 1
 
 
@@ -319,7 +348,6 @@ def test_confident_win_backstop_overrides_next():
     ctx = _ctx()
     ctx.state.update(
         {
-            "attempt": 1,
             "validation_attempt_count": 1,
             "min_improvement_pct": 2.0,
             "experiment_history": [
@@ -358,7 +386,6 @@ def test_attempt_cap_reason():
     ctx = _ctx()
     ctx.state.update(
         {
-            "attempt": 6,
             "validation_attempt_count": 6,
             "max_attempts": 6,
             "min_improvement_pct": 2.0,
@@ -415,13 +442,13 @@ def test_no_double_count_across_screen_diagnosis_controller():
 
     ctx.state.update({"min_improvement_pct": 2.0})
     nodes.screen_candidate(ctx, compiled, validate_fn=_fail_validate)
-    assert ctx.state.get("attempt") == 1
+    assert ctx.state.get("validation_attempt_count") == 1
     out = nodes.confirmation_controller(
         ctx,
         DiagnosisOutput(correction="drop_knob", targets=["work_mem"], rationale="bad", confidence=0.6),
     )
     assert out["route"] == "retry"
-    assert ctx.state.get("attempt") == 1
+    assert ctx.state.get("validation_attempt_count") == 1
     assert len(ctx.state.get("experiment_history") or []) == 1
 
 
@@ -431,12 +458,12 @@ def test_compile_rejected_bypasses_diagnosis():
         ctx, _proposal(levels=[{"knob": "nope", "value": "1"}])
     )
     assert isinstance(bad, CompileRejection)
-    assert ctx.state.get("attempt") == 1
+    assert ctx.state.get("validation_attempt_count") == 1
     assert ctx.state.get("diagnosis_history") in (None, [])
     assert any("not in available knob inventory" in r for r in (ctx.state.get("rejected_history") or []))
     out = nodes.confirmation_controller(ctx, bad)
     assert out["route"] == "retry"
-    assert ctx.state.get("attempt") == 1  # no recount
+    assert ctx.state.get("validation_attempt_count") == 1  # no recount
     assert ctx.state.get("diagnosis_history") in (None, [])
 
 
@@ -474,7 +501,7 @@ def test_inactive_with_empty_history():
         }
 
     nodes.screen_candidate(ctx, compiled, validate_fn=_fail_validate)
-    assert ctx.state.get("attempt") == 1
+    assert ctx.state.get("validation_attempt_count") == 1
     assert len(ctx.state.get("experiment_history") or []) == 1
     assert ctx.state.get("excluded_knobs") == []
     assert ctx.state.get("required_phase") == ""

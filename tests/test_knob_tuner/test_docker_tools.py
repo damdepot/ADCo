@@ -894,7 +894,7 @@ def test_start_staging_db_uses_base_image():
 
 def test_recreate_docker_db_passes_base_image():
     new_cfg = DBConfig(host="10.0.0.1", port=5555, user="u", password="p", database="d", db_type="postgres", env="staging")
-    with patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as mock_stop, \
+    with patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as _mock_stop, \
          patch("src.knob_tuner.tools.docker_tools.start_staging_db", return_value=("new-container", new_cfg)) as mock_start:
         ok, cname, cfg = recreate_docker_db(
             "old-container",

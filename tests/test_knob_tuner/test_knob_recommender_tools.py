@@ -48,9 +48,10 @@ def test_candidate_generator_prompt_guardrails():
     assert "available-knob list" in CANDIDATE_GENERATOR_PROMPT
     assert "read_knob_details" in CANDIDATE_GENERATOR_PROMPT
     assert "Never" in CANDIDATE_GENERATOR_PROMPT
-    # durability policy is explicit
+    # durability policy is explicit — Phase 4.4: strict-always, no relaxed
+    # mode (the prompt states the strict rule and forbids relaxing it).
     assert "strict" in CANDIDATE_GENERATOR_PROMPT
-    assert "relaxed" in CANDIDATE_GENERATOR_PROMPT
+    assert "no relaxed mode" in CANDIDATE_GENERATOR_PROMPT
     assert "synchronous_commit" in CANDIDATE_GENERATOR_PROMPT
 
 

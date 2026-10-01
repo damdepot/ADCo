@@ -5,7 +5,7 @@ DB_INSPECTOR_PROMPT = """You are a senior database reliability engineer acting a
 ## Context (session state — every key optional, absent on first iteration)
 - Workload profile: {workload_profile?}
 - Prior inspector output: {db_inspector_output?}
-- Attempt counter: {attempt?}
+- Attempt counter: {validation_attempt_count?}
 - Prior rejections: {rejected_history?}
 - Prior diagnosis: {diagnosis_output?}
 Only `workload_profile` is an input to this agent; the remaining keys belong to later pipeline stages and are listed here only so this template stays valid across iterations. Ignore them when empty.

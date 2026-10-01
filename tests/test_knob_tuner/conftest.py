@@ -5,6 +5,8 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from google.adk.sessions.state import State
+
 src_path = str(Path(__file__).resolve().parent.parent.parent / "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
@@ -13,6 +15,22 @@ try:
     from knob_tuner.tools.db_connector import DBConfig
 except ImportError:
     from src.knob_tuner.tools.db_connector import DBConfig
+
+
+class AdkCtx:
+    """Minimal ctx carrying a real ADK State (like the live runner)."""
+
+    def __init__(self, **seed):
+        self.state = State(value=dict(seed), delta={})
+        self.route = None
+
+
+class FakeCtx:
+    """Minimal ctx carrying a plain-dict state (copied, no ADK runtime)."""
+
+    def __init__(self, state=None):
+        self.state = dict(state or {})
+        self.route = None
 
 
 @pytest.fixture

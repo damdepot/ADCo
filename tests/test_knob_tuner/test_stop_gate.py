@@ -7,7 +7,6 @@ bundle P(win) column.
 """
 
 import pytest
-from google.adk.sessions.state import State
 
 from src.knob_tuner.contracts import KnobPlan
 from src.knob_tuner.stages import nodes
@@ -15,17 +14,12 @@ from src.knob_tuner.stages.evidence import build_evidence_bundle
 from src.knob_tuner.stages.models import CompiledPlan, DiagnosisOutput
 from src.knob_tuner.sub_agents.diagnosis_agent import prompt as diag_prompt_mod
 from src.knob_tuner.tools.stats import p_win, welch_delta
+from tests.test_knob_tuner.conftest import AdkCtx
 
 BASE = [100.0, 101.0, 102.0, 100.5, 101.5]
 WIN = [112.0, 113.0, 114.0, 112.5, 113.5]
 LOSS = [88.0, 89.0, 90.0, 88.5, 89.5]
 NOISE = [100.4, 100.8, 102.2, 99.9, 101.7]
-
-
-class AdkCtx:
-    def __init__(self, **seed):
-        self.state = State(value=dict(seed), delta={})
-        self.route = None
 
 
 def _paired(baseline=BASE, tuned=WIN):
@@ -36,7 +30,6 @@ def _paired(baseline=BASE, tuned=WIN):
 def _gate_state(last_row, **over):
     seed = {
         "max_attempts": 6,
-        "attempt": 1,
         "validation_attempt_count": 1,
         "min_improvement_pct": 2.0,
         "experiment_history": [],
@@ -67,18 +60,19 @@ def test_p_win_clear_loss_near_zero():
     assert p_win(BASE, LOSS) < 0.01
 
 
-def test_p_win_insufficient_evidence_is_neutral():
-    assert p_win([100.0], [105.0]) == 0.5
-    assert p_win([], []) == 0.5
-    assert p_win([0.0, 0.0], [10.0, 12.0]) == 0.5
-    assert p_win(None, None) == 0.5
-    assert p_win(["x", None], [1.0, 2.0]) == 0.5
+def test_p_win_insufficient_evidence_is_none():
+    assert p_win([100.0], [105.0]) is None
+    assert p_win([], []) is None
+    assert p_win([0.0, 0.0], [10.0, 12.0]) is None
+    assert p_win(None, None) is None
+    assert p_win(["x", None], [1.0, 2.0]) is None
 
 
 def test_p_win_degenerate_zero_spread_follows_sign():
     assert p_win([100.0, 100.0, 100.0], [105.0, 105.0, 105.0]) == 1.0
     assert p_win([100.0, 100.0, 100.0], [95.0, 95.0, 95.0]) == 0.0
-    assert p_win([100.0, 100.0], [100.0, 100.0]) == 0.5
+    # An identical constant pair carries no evidence (not a 0.5 toss-up).
+    assert p_win([100.0, 100.0], [100.0, 100.0]) is None
 
 
 def test_p_win_delegates_to_scipy_t_cdf(monkeypatch):
@@ -208,7 +202,7 @@ def test_gate_thresholds_overridable_via_state():
 
 
 def test_gate_disagree_still_honors_attempt_cap():
-    ctx = _gate_state(_loss_row(), attempt=6, validation_attempt_count=6)
+    ctx = _gate_state(_loss_row(), validation_attempt_count=6)
     out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.9))
     assert out["route"] == "done"
     assert out["reason"] == "attempt_cap"
@@ -246,7 +240,7 @@ def _compiled(exp_name="e1"):
 
 
 def test_screen_row_carries_p_win():
-    ctx = AdkCtx(baseline={"per_run_tps": list(BASE)},
+    ctx = AdkCtx(shared_baseline={"per_run_tps": list(BASE)},
                  baseline_cache_key=nodes._baseline_cache_key(None, None),
                  min_improvement_pct=2.0, max_attempts=6)
 
@@ -272,7 +266,7 @@ def test_evidence_bundle_shows_p_win_column():
         "last_screen_row": dict(_win_row(), arm="e1"),
         "rejected_history": [],
         "resource_budget": {"cpu": 4, "memory_gb": 8},
-        "attempt": 2,
+        "validation_attempt_count": 2,
         "max_attempts": 6,
     }
     text = build_evidence_bundle(state)

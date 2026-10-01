@@ -203,8 +203,8 @@ def main() -> None:
             )
         )
     except Exception as exc:
-        print(f"\n=== Checker ===")
-        print(f"Run:      fail")
+        print("\n=== Checker ===")
+        print("Run:      fail")
         print(f"Error:    {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -213,8 +213,8 @@ def main() -> None:
     issues = checker_output.get("issues", [])
     summary = checker_output.get("summary", "")
 
-    print(f"\n=== Checker ===")
-    print(f"Run:      success")
+    print("\n=== Checker ===")
+    print("Run:      success")
     print(f"Result:   {check_status}")
     print(f"Sandbox:  {sandbox}")
     print(f"Model:    {args.model}")

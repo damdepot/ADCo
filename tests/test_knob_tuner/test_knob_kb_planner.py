@@ -1,7 +1,5 @@
 """Unit tests for the knowledge-base planner tool."""
 
-import os
-import pytest
 from pydantic import BaseModel
 
 from src.knob_tuner.tools.kb_planner import (
@@ -11,7 +9,6 @@ from src.knob_tuner.tools.kb_planner import (
     _to_text,
     plan_knob_tuning,
     get_knob_strategies,
-    KB_PATH,
 )
 
 

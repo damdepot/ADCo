@@ -1,4 +1,3 @@
-import pytest
 from src.code_rewriter.tools.ast_replacer import (
     replace_function_ast,
 )

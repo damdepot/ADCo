@@ -12,6 +12,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from src.knob_tuner.contracts import get_max_attempts, get_validation_attempt
+
 MAX_BUNDLE_LINES = 40
 
 
@@ -23,7 +25,17 @@ def _num(value: Any, default: float = 0.0) -> float:
 
 
 def _fmt_pct(value: Any) -> str:
-    return f"{_num(value):+.2f}%"
+    """Format a percentage, or ``"n/a"`` when there is no measurement.
+
+    A missing mean must never render as ``+0.00%`` — that confuses "failed"
+    with "measured zero".
+    """
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):+.2f}%"
+    except (TypeError, ValueError):
+        return "n/a"
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -51,12 +63,12 @@ def _history_rows(state: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _attempt(state: Mapping[str, Any]) -> tuple[str, str]:
-    attempt = state.get("attempt", state.get("validation_attempt_count", 0))
+    # Phase 4.1/4.3: canonical loop counter + cap from contracts.
     try:
-        attempt_s = str(int(attempt or 0))
+        attempt_s = str(int(get_validation_attempt(state)))
     except (TypeError, ValueError):
         attempt_s = "0"
-    total = state.get("max_attempts", 10)
+    total = get_max_attempts(state)
     try:
         total_s = str(int(total)) if total is not None else "?"
     except (TypeError, ValueError):
@@ -66,7 +78,11 @@ def _attempt(state: Mapping[str, Any]) -> tuple[str, str]:
 
 def _resource_line(state: Mapping[str, Any]) -> str:
     budget = _as_dict(state.get("resource_budget"))
-    cpu = budget.get("cpu", budget.get("cpus", budget.get("cpu_count", "?")))
+    # ResourceBudget declares cpu_cores; older states used cpu/cpus/cpu_count.
+    cpu = budget.get(
+        "cpu_cores",
+        budget.get("cpu", budget.get("cpus", budget.get("cpu_count", "?"))),
+    )
     mem = budget.get("memory_gb", budget.get("memory", state.get("memory_gb", "?")))
     try:
         mem_s = f"{float(mem):g}GB"
@@ -94,8 +110,8 @@ def _history_table_lines(rows: list[dict[str, Any]]) -> list[str]:
         lines.append(
             f"| {i} | {row.get('name', '')} | {row.get('phase', '')} | "
             f"{row.get('n_knobs', '')} | "
-            f"{_fmt_pct(row.get('mean_delta_pct', 0.0))} | "
-            f"{_fmt_pct(row.get('lcb_pct', 0.0))} | "
+            f"{_fmt_pct(row.get('mean_delta_pct'))} | "
+            f"{_fmt_pct(row.get('lcb_pct'))} | "
             f"{row.get('status', '')} | "
             f"{'yes' if row.get('confirmed') else 'no'} | "
             f"{_fmt_pwin(row.get('p_win'))} |"
@@ -109,8 +125,8 @@ def _detail_lines(rows: list[dict[str, Any]]) -> list[str]:
         lines.append(
             f"- {row.get('name', '?')} [{row.get('phase', '?')}] "
             f"knobs={row.get('n_knobs', '?')} "
-            f"mean={_fmt_pct(row.get('mean_delta_pct', 0.0))} "
-            f"lcb={_fmt_pct(row.get('lcb_pct', 0.0))} "
+            f"mean={_fmt_pct(row.get('mean_delta_pct'))} "
+            f"lcb={_fmt_pct(row.get('lcb_pct'))} "
             f"status={row.get('status', '?')} "
             f"confirmed={'yes' if row.get('confirmed') else 'no'}"
         )
@@ -162,9 +178,9 @@ def _last_verdict_lines(state: Mapping[str, Any]) -> list[str]:
             f"status={row.get('status', '?')}"
         ),
         (
-            f"  mean={_fmt_pct(row.get('mean_delta_pct', 0.0))} "
-            f"lcb={_fmt_pct(row.get('lcb_pct', 0.0))} "
-            f"ucb={_fmt_pct(row.get('ucb_pct', 0.0))} "
+            f"  mean={_fmt_pct(row.get('mean_delta_pct'))} "
+            f"lcb={_fmt_pct(row.get('lcb_pct'))} "
+            f"ucb={_fmt_pct(row.get('ucb_pct'))} "
             f"df={_num(row.get('df', 0.0)):.1f} "
             f"p(win)={_last_verdict_pwin(row)} "
             f"confirmed={'yes' if row.get('confirmed') else 'no'}"

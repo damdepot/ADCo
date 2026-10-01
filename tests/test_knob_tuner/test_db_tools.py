@@ -1,7 +1,6 @@
 """Unit tests for db_tools module."""
 
-from unittest.mock import MagicMock, patch
-import pytest
+from unittest.mock import patch
 from src.knob_tuner.contracts import ApplyMode, KnobScope
 from src.knob_tuner.tools.db_connector import DBConfig
 from src.knob_tuner.tools.db_tools import (
@@ -156,7 +155,7 @@ def test_apply_knobs_mode_none_skips_all_no_connection(mock_db_config_pg):
         assert result["error"] is None
 
 
-def test_apply_knobs_mode_dynamic_excludes_static_and_rejects_internal(
+def test_apply_knobs_mode_live_excludes_static_and_rejects_internal(
     mock_db_config_pg, mock_db_conn
 ):
     conn, cursor = mock_db_conn
@@ -166,7 +165,7 @@ def test_apply_knobs_mode_dynamic_excludes_static_and_rejects_internal(
         {"name": "max_worker_processes", "value": 8, "scope": "internal"},
     ]
     with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
-        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.DYNAMIC)
+        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.LIVE)
 
     assert len(results) == 3
     assert results[0]["status"] == "applied"
@@ -178,7 +177,7 @@ def test_apply_knobs_mode_dynamic_excludes_static_and_rejects_internal(
     assert cursor.execute.call_count == 2
 
 
-def test_apply_knobs_mode_persist_static_applies_full_plan_and_reloads(
+def test_apply_knobs_mode_manual_applies_full_plan_and_reloads(
     mock_db_config_pg, mock_db_conn
 ):
     conn, cursor = mock_db_conn
@@ -188,7 +187,7 @@ def test_apply_knobs_mode_persist_static_applies_full_plan_and_reloads(
         {"name": "max_worker_processes", "value": 8, "scope": "internal"},
     ]
     with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
-        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.PERSIST_STATIC)
+        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.MANUAL)
 
     # Reloadable knobs go live; restart-required knobs are persisted (pending a
     # manual restart); internal knobs are rejected.

@@ -1,6 +1,4 @@
-import argparse
 import json
-import os
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest

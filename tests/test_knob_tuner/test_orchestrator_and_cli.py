@@ -187,7 +187,7 @@ def _staged_state(**overrides):
     state = {
         "resource_budget": {"cpu_cores": 2, "memory_gb": 4.0},
         "sysbench_profile": {},
-        "apply_mode": "dynamic",
+        "apply_mode": "live",
         "dry_run": False,
         "run_id": "run-1",
         "run_dir": "/tmp/run-1",
@@ -318,12 +318,14 @@ def test_compile_candidate_node_durability_policy_gates_synchronous_commit():
     assert isinstance(strict, CompileRejection)
     assert any("durability" in e for e in strict.errors)
 
+    # Phase 4.4: strict is enforced ALWAYS — 'relaxed' no longer permits
+    # synchronous_commit=off (this assertion documents the old ambiguity).
     relaxed = compile_candidate_node(
         _FakeContext(_staged_state(durability_profile="relaxed")),
         _proposal("dur", "screen", [("synchronous_commit", "off")]),
     )
-    assert isinstance(relaxed, CompiledPlan)
-    assert relaxed.valid_knobs == ["synchronous_commit"]
+    assert isinstance(relaxed, CompileRejection)
+    assert any("durability" in e for e in relaxed.errors)
 
 
 def test_confirmation_controller_node_retry_then_done():
@@ -332,7 +334,7 @@ def test_confirmation_controller_node_retry_then_done():
     ctx = _FakeContext(
         _staged_state(
             max_attempts=3,
-            attempt=1,
+            validation_attempt_count=1,
             experiment_history=[
                 {
                     "name": "e1",
@@ -358,7 +360,7 @@ def test_confirmation_controller_node_retry_then_done():
         DiagnosisOutput(correction="drop_knob", targets=["work_mem"], rationale="bad mover", confidence=0.7),
     )
     assert loser["route"] == "retry" and ctx.route == "retry"
-    assert loser["attempt"] == 1  # unchanged: screen already counted it
+    assert loser["validation_attempt_count"] == 1  # unchanged: screen already counted it
     assert len(ctx.state["experiment_history"]) == 1
     assert len(ctx.state["diagnosis_history"]) == 1
 
@@ -386,18 +388,18 @@ def test_confirmation_controller_node_retry_then_done():
     )
     assert champion["route"] == "done" and ctx.route == "done"
     assert champion["reason"] == "confident_win_backstop"
-    assert champion["attempt"] == 1
+    assert champion["validation_attempt_count"] == 1
 
 
 def test_confirmation_controller_node_rejection_routes_retry():
     # Compile rejections are recorded by compile_candidate (bypassing
     # diagnosis); the controller routes without re-appending.
-    ctx = _FakeContext(_staged_state(max_attempts=5, attempt=1, experiment_history=[]))
+    ctx = _FakeContext(_staged_state(max_attempts=5, validation_attempt_count=1, experiment_history=[]))
     rej = CompileRejection(reason="bad", errors=["k: unknown"], design_name="e9")
     ctx.state["rejected_history"] = ["bad", "k: unknown"]
     out = confirmation_controller_node(ctx, rej)
     assert out["route"] == "retry"
-    assert out["attempt"] == 1
+    assert out["validation_attempt_count"] == 1
     assert ctx.state["experiment_history"] == []
     assert ctx.state["rejected_history"] == ["bad", "k: unknown"]
 
@@ -559,7 +561,7 @@ def test_apply_live_node_applies_on_pass():
             "result_status": "PASS",
             "knob_plan": _plan_dump(),
             "db_config": cfg,
-            "apply_mode": "dynamic",
+            "apply_mode": "live",
         }
     )
     applied = [{"knob": "shared_buffers", "value": "1GB", "status": "applied"}]
@@ -570,7 +572,7 @@ def test_apply_live_node_applies_on_pass():
     assert event.actions.state_delta["applied_knobs"] == applied
 
 
-def test_apply_live_node_maintenance_assisted_emits_manual_sql():
+def test_apply_live_node_manual_emits_manual_sql():
     cfg = DBConfig(
         host="127.0.0.1",
         port=5432,
@@ -585,7 +587,7 @@ def test_apply_live_node_maintenance_assisted_emits_manual_sql():
             "result_status": "PASS",
             "knob_plan": _plan_dump(),
             "db_config": cfg,
-            "apply_mode": "maintenance-assisted",
+            "apply_mode": "manual",
         }
     )
     sql_results = [
@@ -611,6 +613,81 @@ def test_apply_live_node_maintenance_assisted_emits_manual_sql():
     assert mock_apply.call_args.kwargs.get("dry_run") is True
 
 
+def test_apply_live_node_preflight_manual_gates_live_mutation():
+    cfg = DBConfig(
+        host="127.0.0.1",
+        port=5432,
+        user="u",
+        password="p",
+        database="d",
+        db_type="postgres",
+    )
+    ctx = _FakeContext(
+        {
+            "dry_run": False,
+            "result_status": "PASS",
+            "knob_plan": _plan_dump(),
+            "db_config": cfg,
+            "apply_mode": "live",
+            "preflight_route": "maintenance_assisted",
+            "preflight_verdict": {
+                "route": "maintenance_assisted",
+                "reason": "restart-required knobs (shared_buffers)",
+            },
+        }
+    )
+    sql_results = [
+        {
+            "knob": "shared_buffers",
+            "value": "1GB",
+            "status": "dry_run",
+            "sql": "ALTER SYSTEM SET shared_buffers = '1GB';",
+            "error": None,
+        }
+    ]
+    with patch(
+        "src.knob_tuner.workflow.apply_knobs", return_value=sql_results
+    ) as mock_apply:
+        event = apply_live_node(ctx)
+
+    assert event.output["status"] == "MANUAL_SQL"
+    assert event.output["manual_sql"] == ["ALTER SYSTEM SET shared_buffers = '1GB';"]
+    assert event.actions.state_delta["applied_knobs"] == []
+    assert event.actions.state_delta["result_status"] == "INCONCLUSIVE"
+    assert mock_apply.call_args.kwargs.get("dry_run") is True
+
+
+def test_apply_live_node_preflight_blocked_applies_nothing():
+    cfg = DBConfig(
+        host="127.0.0.1",
+        port=5432,
+        user="u",
+        password="p",
+        database="d",
+        db_type="postgres",
+    )
+    ctx = _FakeContext(
+        {
+            "dry_run": False,
+            "result_status": "PASS",
+            "knob_plan": _plan_dump(),
+            "db_config": cfg,
+            "apply_mode": "live",
+            "preflight_route": "blocked",
+            "preflight_verdict": {"route": "blocked", "reason": "empty plan"},
+        }
+    )
+    with patch("src.knob_tuner.workflow.apply_knobs") as mock_apply:
+        event = apply_live_node(ctx)
+        mock_apply.assert_not_called()
+
+    assert event.output["status"] == "FAILED"
+    assert "preflight blocked" in event.output["reason"]
+    assert event.output["applied_knobs"] == []
+    assert event.actions.state_delta["applied_knobs"] == []
+    assert event.actions.state_delta["result_status"] == "FAIL"
+
+
 def test_apply_live_node_apply_failure_sets_result_status_fail():
     cfg = DBConfig(
         host="127.0.0.1",
@@ -626,7 +703,7 @@ def test_apply_live_node_apply_failure_sets_result_status_fail():
             "result_status": "PASS",
             "knob_plan": _plan_dump(),
             "db_config": cfg,
-            "apply_mode": "dynamic",
+            "apply_mode": "live",
         }
     )
     with patch(
@@ -638,7 +715,7 @@ def test_apply_live_node_apply_failure_sets_result_status_fail():
     assert event.actions.state_delta["result_status"] == "FAIL"
 
 
-def test_apply_live_node_maintenance_sql_failure_sets_result_status_fail():
+def test_apply_live_node_manual_sql_failure_sets_result_status_fail():
     cfg = DBConfig(
         host="127.0.0.1",
         port=5432,
@@ -653,7 +730,7 @@ def test_apply_live_node_maintenance_sql_failure_sets_result_status_fail():
             "result_status": "PASS",
             "knob_plan": _plan_dump(),
             "db_config": cfg,
-            "apply_mode": "maintenance-assisted",
+            "apply_mode": "manual",
         }
     )
     with patch(
@@ -691,7 +768,7 @@ def test_apply_live_node_postmaster_recorded_pending_restart():
             "result_status": "PASS",
             "knob_plan": plan,
             "db_config": cfg,
-            "apply_mode": "dynamic",
+            "apply_mode": "live",
         }
     )
     with patch(
@@ -701,6 +778,11 @@ def test_apply_live_node_postmaster_recorded_pending_restart():
     pending = event.output["pending_restart_knobs"]
     assert len(pending) == 1
     assert pending[0]["name"] == "max_connections"
+    # Nothing was applied (postmaster knob skipped under live mode): the
+    # empty apply must not report success or stay PASS.
+    assert event.output["status"] == "APPLIED_NOTHING"
+    assert event.output["applied_knobs"] == []
+    assert event.actions.state_delta["result_status"] == "INCONCLUSIVE"
 
 
 def test_finalize_node_builds_manifest(tmp_path: Path):
@@ -786,6 +868,495 @@ def test_finalize_node_manual_sql_is_not_pass():
 
 
 # ===========================================================================
+# 4b. Explicit apply outcomes (Phase 1.4) + staging identity gate (Phase 1.5)
+# ===========================================================================
+
+
+def _live_cfg(database="d", host="127.0.0.1", port=5432):
+    return DBConfig(
+        host=host,
+        port=port,
+        user="u",
+        password="p",
+        database=database,
+        db_type="postgres",
+    )
+
+
+def _pass_ctx(**overrides):
+    state = {
+        "dry_run": False,
+        "result_status": "PASS",
+        "knob_plan": _plan_dump(),
+        "db_config": _live_cfg(),
+        "apply_mode": "live",
+    }
+    state.update(overrides)
+    return _FakeContext(state)
+
+
+def test_apply_live_node_all_failed_yields_applied_nothing_and_fail():
+    ctx = _pass_ctx()
+    failed = [
+        {
+            "knob": "shared_buffers",
+            "value": "1GB",
+            "status": "failed",
+            "sql": "",
+            "error": "boom",
+        }
+    ]
+    with patch("src.knob_tuner.workflow.apply_knobs", return_value=failed):
+        event = apply_live_node(ctx)
+    assert event.output["status"] == "APPLIED_NOTHING"
+    assert event.output["applied_knobs"] == []
+    assert event.actions.state_delta["result_status"] == "FAIL"
+
+
+def test_apply_live_node_all_skipped_yields_applied_nothing_inconclusive():
+    ctx = _pass_ctx()
+    skipped = [
+        {
+            "knob": "shared_buffers",
+            "value": "1GB",
+            "status": "skipped",
+            "sql": "",
+            "error": None,
+        }
+    ]
+    with patch("src.knob_tuner.workflow.apply_knobs", return_value=skipped):
+        event = apply_live_node(ctx)
+    assert event.output["status"] == "APPLIED_NOTHING"
+    assert event.output["applied_knobs"] == []
+    assert event.actions.state_delta["result_status"] == "INCONCLUSIVE"
+
+
+def test_apply_live_node_mode_none_applies_nothing():
+    # Real apply_knobs under NONE never touches the DB (all skipped).
+    ctx = _pass_ctx(apply_mode="none")
+    event = apply_live_node(ctx)
+    assert event.output["status"] == "APPLIED_NOTHING"
+    assert event.output["applied_knobs"] == []
+    assert event.actions.state_delta["result_status"] == "INCONCLUSIVE"
+
+
+def test_apply_live_node_empty_plan_applies_nothing():
+    ctx = _pass_ctx(knob_plan={"knobs": []})
+    with patch("src.knob_tuner.workflow.apply_knobs", return_value=[]):
+        event = apply_live_node(ctx)
+    assert event.output["status"] == "APPLIED_NOTHING"
+    assert event.actions.state_delta["result_status"] == "INCONCLUSIVE"
+
+
+def test_apply_live_node_partial_downgrades_to_inconclusive():
+    ctx = _pass_ctx()
+    mixed = [
+        {"knob": "work_mem", "value": "64MB", "status": "applied"},
+        {"knob": "shared_buffers", "value": "1GB", "status": "failed", "error": "x"},
+    ]
+    with patch("src.knob_tuner.workflow.apply_knobs", return_value=mixed):
+        event = apply_live_node(ctx)
+    assert event.output["status"] == "PARTIAL"
+    assert len(event.output["applied_knobs"]) == 1
+    assert event.actions.state_delta["result_status"] == "INCONCLUSIVE"
+
+
+def test_apply_live_node_full_apply_keeps_pass():
+    ctx = _pass_ctx()
+    applied = [{"knob": "shared_buffers", "value": "1GB", "status": "applied"}]
+    with patch("src.knob_tuner.workflow.apply_knobs", return_value=applied):
+        event = apply_live_node(ctx)
+    assert event.output["status"] == "APPLIED"
+    assert "result_status" not in event.actions.state_delta
+
+
+def test_apply_live_node_identity_mismatch_refuses():
+    ctx = _pass_ctx(
+        staging_database_identity="postgres://127.0.0.1:9999/staging_db",
+    )
+    with patch("src.knob_tuner.workflow.apply_knobs") as mock_apply:
+        event = apply_live_node(ctx)
+        mock_apply.assert_not_called()
+    assert event.output["status"] == "FAILED"
+    assert "mismatch" in event.output["reason"]
+    assert event.output["applied_knobs"] == []
+    assert event.actions.state_delta["result_status"] == "FAIL"
+
+
+def test_apply_live_node_identity_match_proceeds():
+    # Same database name, ephemeral staging host/port: the (engine, db) pair
+    # matches, so the apply proceeds.
+    ctx = _pass_ctx(
+        staging_database_identity="postgres://10.9.8.7:23456/d",
+    )
+    applied = [{"knob": "shared_buffers", "value": "1GB", "status": "applied"}]
+    with patch(
+        "src.knob_tuner.workflow.apply_knobs", return_value=applied
+    ) as mock_apply:
+        event = apply_live_node(ctx)
+        mock_apply.assert_called_once()
+    assert event.output["status"] == "APPLIED"
+
+
+def test_apply_live_node_attestation_identity_fallback_refuses():
+    ctx = _pass_ctx(
+        validation_attestation={"database_identity": "postgres://h:1/other_db"},
+    )
+    with patch("src.knob_tuner.workflow.apply_knobs") as mock_apply:
+        event = apply_live_node(ctx)
+        mock_apply.assert_not_called()
+    assert event.output["status"] == "FAILED"
+    assert event.actions.state_delta["result_status"] == "FAIL"
+
+
+def test_apply_live_node_no_staging_record_proceeds():
+    ctx = _pass_ctx()
+    applied = [{"knob": "shared_buffers", "value": "1GB", "status": "applied"}]
+    with patch(
+        "src.knob_tuner.workflow.apply_knobs", return_value=applied
+    ) as mock_apply:
+        event = apply_live_node(ctx)
+        mock_apply.assert_called_once()
+    assert event.output["status"] == "APPLIED"
+
+
+def test_screen_candidate_records_staging_identity():
+    from src.knob_tuner.stages import nodes as stage_nodes
+    from src.knob_tuner.stages.models import CompiledPlan as _CompiledPlan
+
+    def _validate_with_attestation(**kwargs):
+        return {
+            "status": "PASS",
+            "paired": {
+                "baseline": {"per_run_tps": [100.0, 101.0, 102.0, 99.0, 100.5]},
+                "tuned": {"per_run_tps": [120.0, 121.0, 119.0, 122.0, 120.5]},
+            },
+            "reasons": [],
+            "stopped_early": False,
+            "attestation": {
+                "database_identity": "postgres://127.0.0.1:5555/testdb"
+            },
+        }
+
+    plan = KnobPlan.model_validate(
+        {"knobs": [{"name": "work_mem", "value": "64MB", "scope": "user"}]}
+    )
+    compiled = _CompiledPlan(
+        plan=plan.model_dump(),
+        exp_name="e1",
+        phase="screen",
+        valid_knobs=["work_mem"],
+    )
+    ctx = _FakeContext({"min_improvement_pct": 5.0})
+    stage_nodes.screen_candidate(
+        ctx, compiled, validate_fn=_validate_with_attestation
+    )
+    assert (
+        ctx.state["staging_database_identity"]
+        == "postgres://127.0.0.1:5555/testdb"
+    )
+
+
+def test_finalize_node_applied_nothing_with_failures_is_fail():
+    ctx = _FakeContext(
+        _finalize_state(
+            live_result={
+                "status": "APPLIED_NOTHING",
+                "reason": "every knob failed (1/1): bad_knob",
+                "results": [{"knob": "bad_knob", "status": "failed"}],
+            },
+        )
+    )
+    event = finalize_node(ctx)
+    manifest = event.actions.state_delta["run_manifest"]
+    assert manifest["status"] == "FAIL"
+    assert manifest["final_status"] == "FAIL"
+    assert any("APPLIED_NOTHING" in err for err in manifest["errors"])
+
+
+def test_finalize_node_applied_nothing_all_skipped_is_inconclusive():
+    ctx = _FakeContext(
+        _finalize_state(
+            live_result={
+                "status": "APPLIED_NOTHING",
+                "reason": "every knob skipped under live apply mode",
+                "results": [{"knob": "shared_buffers", "status": "skipped"}],
+            },
+        )
+    )
+    event = finalize_node(ctx)
+    manifest = event.actions.state_delta["run_manifest"]
+    assert manifest["status"] == "INCONCLUSIVE"
+    assert manifest["status"] != "PASS"
+
+
+def test_finalize_node_partial_is_not_pass():
+    ctx = _FakeContext(
+        _finalize_state(
+            applied_knobs=[{"knob": "work_mem"}],
+            live_result={
+                "status": "PARTIAL",
+                "reason": "partial apply: 1/2 knobs applied",
+                "applied_knobs": [{"knob": "work_mem"}],
+                "results": [
+                    {"knob": "work_mem", "status": "applied"},
+                    {"knob": "shared_buffers", "status": "failed"},
+                ],
+            },
+        )
+    )
+    event = finalize_node(ctx)
+    manifest = event.actions.state_delta["run_manifest"]
+    assert manifest["status"] == "INCONCLUSIVE"
+    assert manifest["status"] != "PASS"
+
+
+def test_finalize_node_legacy_completed_empty_is_not_pass():
+    ctx = _FakeContext(
+        _finalize_state(
+            live_result={"status": "COMPLETED", "reason": "", "results": []},
+        )
+    )
+    event = finalize_node(ctx)
+    manifest = event.actions.state_delta["run_manifest"]
+    assert manifest["status"] != "PASS"
+    assert manifest["status"] == "INCONCLUSIVE"
+
+
+# ===========================================================================
+# 4b-ii. keep_best-after-futility gate (Phase 1.7)
+# ===========================================================================
+
+
+def _weak_row(**overrides):
+    """Confirmed PASS row below the win threshold (a keep_best candidate)."""
+    row = _confirmed_row(
+        mean_delta_pct=1.0,
+        lcb_pct=0.5,
+        ucb_pct=1.5,
+        improvement_confident=False,
+    )
+    row.update(overrides)
+    return row
+
+
+def _fail_row(arm="e1", **overrides):
+    row = _confirmed_row(
+        status="FAIL",
+        mean_delta_pct=-1.0,
+        lcb_pct=-2.0,
+        ucb_pct=0.0,
+        confirmed=False,
+        improvement_confident=False,
+        reasons=["regression"],
+    )
+    row["arm"] = arm
+    row.update(overrides)
+    return row
+
+
+def _futility_state(**overrides):
+    state = _staged_state(
+        baseline_tps=[100.0, 101.0],
+        diagnosis_output={
+            "correction": "stop",
+            "stop_reason": "futility",
+            "confidence": 0.8,
+        },
+    )
+    state.update(overrides)
+    return state
+
+
+def test_decision_withholds_unconfirmed_best_by_default():
+    from src.knob_tuner.stages import nodes as stage_nodes
+
+    ctx = _FakeContext(_futility_state(all_rows=[_weak_row()]))
+
+    dec = stage_nodes.decision(ctx)
+    assert dec.decision in ("inconclusive", "fail"), dec.summary
+    assert dec.winner_plan == {}
+    assert any("withheld" in r for r in dec.summary["reasons"])
+
+
+def test_decision_node_downgrades_stray_keep_best_without_flag():
+    keep = TerminalDecision(
+        decision="keep_best",
+        winner_plan={
+            "knobs": [{"name": "work_mem", "value": "64MB", "scope": "user"}]
+        },
+        summary={"reasons": []},
+    )
+    ctx = _FakeContext(_futility_state(all_rows=[]))
+    with patch(
+        "src.knob_tuner.workflow.stage_nodes.decision", return_value=keep
+    ):
+        term = decision_node(ctx)
+    assert term.decision == "inconclusive"
+    assert term.winner_plan == {}
+    assert ctx.state["knob_plan"] == {"knobs": []}
+    assert ctx.state["result_status"] == "INCONCLUSIVE"
+
+
+def test_futility_campaign_applies_nothing():
+    """Key Phase 1.7 assertion: all-FAIL screens apply nothing, never PASS."""
+    ctx = _FakeContext(
+        _futility_state(all_rows=[_fail_row("e1"), _fail_row("e2")])
+    )
+    term = decision_node(ctx)
+    assert term.decision in ("inconclusive", "fail"), term.summary
+    assert term.winner_plan == {}
+    assert ctx.state["knob_plan"] == {"knobs": []}
+    assert ctx.state["result_status"] in ("INCONCLUSIVE", "FAIL")
+
+    verdict = production_preflight_node(ctx, term)
+    assert verdict.route == "blocked"
+
+    with patch("src.knob_tuner.workflow.apply_knobs") as mock_apply:
+        event = apply_live_node(ctx)
+        mock_apply.assert_not_called()
+    assert event.output["status"] == "APPLIED_NOTHING"
+    assert event.output["applied_knobs"] == []
+    ctx.state.update(event.actions.state_delta)
+
+    final = finalize_node(ctx)
+    manifest = final.actions.state_delta["run_manifest"]
+    assert manifest["status"] != "PASS"
+    assert manifest["applied_knobs"] == []
+
+
+def test_apply_live_node_empty_plan_reports_applied_nothing():
+    ctx = _FakeContext(
+        {
+            "dry_run": False,
+            "result_status": "INCONCLUSIVE",
+            "knob_plan": {"knobs": []},
+        }
+    )
+    with patch("src.knob_tuner.workflow.apply_knobs") as mock_apply:
+        event = apply_live_node(ctx)
+        mock_apply.assert_not_called()
+    assert event.output["status"] == "APPLIED_NOTHING"
+    assert event.output["applied_knobs"] == []
+
+
+# ===========================================================================
+# 4c. CLI Next-Steps message + exit code (Phase 1.6)
+# ===========================================================================
+
+
+def _cli_result(tmp_path, live_result, result_status="PASS"):
+    return {
+        "target": str(tmp_path),
+        "result_status": result_status,
+        "run_dir": str(tmp_path),
+        "staging_issues": [],
+        "live_result": live_result,
+        "run_manifest": {},
+    }
+
+
+def _cli_argv(tmp_path, *extra):
+    return [str(tmp_path), "--db-name", "custom_db", "--cpu-cores", "4", "--memory", "8", *extra]
+
+
+def test_main_cli_next_steps_reports_persisted(tmp_path, capsys):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+    live = {
+        "status": "APPLIED",
+        "reason": "",
+        "applied_knobs": [{"knob": "shared_buffers", "status": "applied"}],
+        "persisted_static_knobs": [{"knob": "shared_buffers"}],
+        "pending_restart_knobs": [{"name": "shared_buffers"}],
+        "results": [{"knob": "shared_buffers", "status": "applied"}],
+    }
+    with patch(
+        "src.knob_tuner.main.run_pipeline", new_callable=AsyncMock
+    ) as mock_run:
+        mock_run.return_value = _cli_result(tmp_path, live)
+        with patch.object(sys, "argv", ["knob_tuner", *_cli_argv(tmp_path)]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+    assert exc_info.value.code == 0
+    out = capsys.readouterr().out
+    assert "have been persisted" in out
+
+
+def test_main_cli_next_steps_reports_skipped_under_live(tmp_path, capsys):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+    live = {
+        "status": "APPLIED",
+        "reason": "",
+        "applied_knobs": [{"knob": "work_mem", "status": "applied"}],
+        "persisted_static_knobs": [],
+        "pending_restart_knobs": [{"name": "shared_buffers"}],
+        "results": [
+            {"knob": "work_mem", "status": "applied"},
+            {"knob": "shared_buffers", "status": "skipped"},
+        ],
+    }
+    with patch(
+        "src.knob_tuner.main.run_pipeline", new_callable=AsyncMock
+    ) as mock_run:
+        mock_run.return_value = _cli_result(tmp_path, live)
+        with patch.object(sys, "argv", ["knob_tuner", *_cli_argv(tmp_path)]):
+            with pytest.raises(SystemExit):
+                main()
+    out = capsys.readouterr().out
+    assert "skipped under live apply mode" in out
+    assert "have been persisted" not in out
+
+
+def test_main_cli_next_steps_reports_nothing_applied(tmp_path, capsys):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+    live = {
+        "status": "APPLIED_NOTHING",
+        "reason": "every knob skipped under live apply mode (1/1)",
+        "applied_knobs": [],
+        "persisted_static_knobs": [],
+        "pending_restart_knobs": [{"name": "shared_buffers"}],
+        "results": [{"knob": "shared_buffers", "status": "skipped"}],
+    }
+    with patch(
+        "src.knob_tuner.main.run_pipeline", new_callable=AsyncMock
+    ) as mock_run:
+        mock_run.return_value = _cli_result(
+            tmp_path, live, result_status="INCONCLUSIVE"
+        )
+        with patch.object(sys, "argv", ["knob_tuner", *_cli_argv(tmp_path)]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+    assert exc_info.value.code == 3
+    out = capsys.readouterr().out
+    assert "were NOT persisted" in out
+    assert "have been persisted" not in out
+
+
+def test_main_cli_dry_run_fail_exits_1(tmp_path):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+    state = {
+        "target": str(target_dir),
+        "result_status": "FAIL",
+        "run_dir": str(tmp_path),
+    }
+    code, _ = _run_main(
+        [
+            str(target_dir),
+            "--db-name", "custom_db",
+            "--cpu-cores", "4",
+            "--memory", "8",
+            "--dry-run",
+        ],
+        state,
+    )
+    assert code == 1
+
+
+# ===========================================================================
 # 5. CLI argument parsing & strict budget parsing
 # ===========================================================================
 
@@ -811,27 +1382,45 @@ def test_cli_parser_defaults_with_required_resources():
     assert args.db_type == "postgres"
     assert args.cpu_cores == "4"
     assert args.memory == "8"
-    assert args.apply_mode == "dynamic"
+    assert args.apply_mode == "live"
     assert args.results_dir == "results/dco"
-    assert args.sysbench_profile is None
     assert args.db_config == "db.config"
-    assert args.production_db is False
+    assert not hasattr(args, "production_db")
     assert args.log_file == "logs/knob_tuner.log"
-    assert args.knob_path == "out/knob_tuner"
-    assert args.output_path is None
     assert args.dry_run is False
     assert args.verbose is False
-    assert args.cleanup_orphans is True
     assert args.buffer_time == 0.0
-    assert args.multi_fidelity_min_seconds == 300.0
+    option_strings = {s for a in parser._actions for s in a.option_strings}
+    for removed in (
+        "--apply-unconfirmed",
+        "--durability-profile",
+        "--workload-hint",
+        "--rand-type",
+        "--sysbench-profile",
+        "--no-cleanup-orphans",
+        "--output-path",
+        "--knob-path",
+        "--screen-seconds",
+        "--screen-warmup-seconds",
+        "--candidate-repetitions",
+        "--candidate-seconds",
+        "--candidate-warmup-seconds",
+        "--repetitions",
+        "--production-db",
+    ):
+        assert removed not in option_strings
+    assert "--measure-reps" in option_strings
+    assert "--multi-fidelity-min-seconds" not in option_strings
+    assert not hasattr(args, "multi_fidelity_min_seconds")
+    assert not hasattr(args, "screen_seconds")
+    assert not hasattr(args, "screen_warmup_seconds")
     assert args.screen_total_rows == 0
     assert args.screen_max_rows == 5_000_000
-    assert args.screen_seconds == 10
-    assert args.screen_warmup_seconds == 2
-    assert args.rand_type is None
-    assert args.durability_profile == "strict"
+    assert args.measure_reps == 10
+    assert args.measure_seconds == 10
+    assert args.measure_warmup_seconds == 2
+    assert args.early_stop_min_reps == 4
     assert args.screening_benchmark == "sysbench"
-    assert args.workload_hint == ""
     assert args.max_attempts == 10
 
 
@@ -846,6 +1435,37 @@ def test_cli_parser_max_attempts_override_and_no_legacy_flags():
     assert "--max-attempts" in option_strings
     assert "--max-validation-attempts" not in option_strings
     assert "--max-experiments" not in option_strings
+    assert "--multi-fidelity-min-seconds" not in option_strings
+
+
+def test_build_initial_state_drops_multi_fidelity_min_seconds():
+    budget = ResourceBudget(cpu_cores=4, memory_gb=8.0)
+    state = build_initial_state(
+        target="/tmp/my_app",
+        db_type="postgres",
+        db_name="custom_db",
+        budget=budget,
+        db_config_path="/tmp/non_existent.config",
+        log_file="/tmp/log.log",
+        knob_path="/tmp/knobs",
+        dry_run=True,
+    )
+    assert "multi_fidelity_min_seconds" not in state
+
+
+def test_durability_always_strict_in_initial_state():
+    budget = ResourceBudget(cpu_cores=4, memory_gb=8.0)
+    state = build_initial_state(
+        target="/tmp/my_app",
+        db_type="postgres",
+        db_name="custom_db",
+        budget=budget,
+        db_config_path="/tmp/non_existent.config",
+        log_file="/tmp/log.log",
+        knob_path="/tmp/knobs",
+        dry_run=True,
+    )
+    assert state["durability_profile"] == "strict"
 
 
 def test_build_initial_state_sets_single_attempt_ceiling():
@@ -856,10 +1476,8 @@ def test_build_initial_state_sets_single_attempt_ceiling():
         db_name="custom_db",
         budget=budget,
         db_config_path="/tmp/non_existent.config",
-        production_db=False,
         log_file="/tmp/log.log",
         knob_path="/tmp/knobs",
-        output_path=None,
         dry_run=True,
     )
     assert default["max_attempts"] == 10
@@ -871,10 +1489,8 @@ def test_build_initial_state_sets_single_attempt_ceiling():
         db_name="custom_db",
         budget=budget,
         db_config_path="/tmp/non_existent.config",
-        production_db=False,
         log_file="/tmp/log.log",
         knob_path="/tmp/knobs",
-        output_path=None,
         dry_run=True,
         max_attempts=7,
     )
@@ -889,34 +1505,42 @@ def test_cli_parser_custom_args():
             "--db-name", "custom_db",
             "--cpu-cores", "8",
             "--memory", "16.0",
-            "--apply-mode", "persist-static",
+            "--apply-mode", "manual",
             "--results-dir", "/custom/results",
-            "--sysbench-profile", "/custom/profile.json",
-            "--output-path", "/custom/res.dat",
             "--dry-run",
             "-v",
-            "--no-cleanup-orphans",
             "--buffer-time", "1.5",
-            "--screen-seconds", "6",
-            "--screen-warmup-seconds", "1",
+            "--measure-reps", "6",
+            "--measure-seconds", "6",
+            "--measure-warmup-seconds", "1",
+            "--early-stop-min-reps", "3",
             "--screening-benchmark", "pgbench",
-            "--workload-hint", "analytical sort spills",
         ]
     )
     assert args.cpu_cores == "8"
     assert args.memory == "16.0"
-    assert args.apply_mode == "persist-static"
+    assert args.apply_mode == "manual"
     assert args.results_dir == "/custom/results"
-    assert args.sysbench_profile == "/custom/profile.json"
-    assert args.output_path == "/custom/res.dat"
     assert args.dry_run is True
     assert args.verbose is True
-    assert args.cleanup_orphans is False
     assert args.buffer_time == 1.5
-    assert args.screen_seconds == 6
-    assert args.screen_warmup_seconds == 1
+    assert args.measure_reps == 6
+    assert args.measure_seconds == 6
+    assert args.measure_warmup_seconds == 1
+    assert args.early_stop_min_reps == 3
     assert args.screening_benchmark == "pgbench"
-    assert args.workload_hint == "analytical sort spills"
+
+
+def test_cli_parser_apply_mode_choices_are_canonical_only():
+    parser = build_parser()
+    action = next(a for a in parser._actions if "--apply-mode" in a.option_strings)
+    assert sorted(action.choices) == ["live", "manual", "none"]
+    # Legacy spellings are hidden from the CLI but still coerce via state.
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["/tmp/target_app", "--db-name", "t", "--cpu-cores", "4",
+             "--memory", "8", "--apply-mode", "persist-static"]
+        )
 
 
 def test_parse_budget_valid():
@@ -978,15 +1602,13 @@ def test_build_initial_state_without_config_file():
         db_name="custom_db",
         budget=budget,
         db_config_path="/tmp/non_existent.config",
-        production_db=False,
         log_file="/tmp/log.log",
         knob_path="/tmp/knobs",
-        output_path=None,
         dry_run=True,
         profile=profile,
         run_id="run-1",
         run_dir="/tmp/results/run-1",
-        apply_mode="dynamic",
+        apply_mode="live",
     )
     assert state["target"] == "/tmp/my_app"
     assert state["resource_budget"] == {"cpu_cores": 4, "memory_gb": 8.0}
@@ -994,7 +1616,7 @@ def test_build_initial_state_without_config_file():
     assert state["memory_gb"] == 8.0
     assert state["sysbench_profile"] == profile.model_dump()
     assert state["sysbench_profile_hash"] == profile.profile_hash()
-    assert state["apply_mode"] == "dynamic"
+    assert state["apply_mode"] == "live"
     assert state["run_id"] == "run-1"
     assert state["run_dir"] == "/tmp/results/run-1"
     assert state["database"] == "custom_db"
@@ -1002,27 +1624,60 @@ def test_build_initial_state_without_config_file():
     assert "db_config" not in state
     assert state["screening_benchmark"] == "sysbench"
     assert state["workload_hint"] == ""
-    assert state["screen_measurement_seconds"] == 10
-    assert state["screen_warmup_seconds"] == 2
+    assert state["measure_reps"] == 10
+    assert state["measure_seconds"] == 10
+    assert state["measure_warmup_seconds"] == 2
+    assert state["early_stop_min_reps"] == 4
+    for dead_key in (
+        "screen_measurement_seconds",
+        "screen_warmup_seconds",
+        "candidate_repetitions",
+        "candidate_measurement_seconds",
+        "candidate_warmup_seconds",
+    ):
+        assert dead_key not in state
 
 
-def test_build_initial_state_threads_screen_measurement_settings():
+def test_build_initial_state_threads_timing_settings():
     state = build_initial_state(
         target="/tmp/my_app",
         db_type="postgres",
         db_name="custom_db",
         budget=ResourceBudget(cpu_cores=2, memory_gb=4.0),
         db_config_path="/tmp/non_existent.config",
-        production_db=False,
         log_file="/tmp/log.log",
         knob_path="/tmp/knobs",
-        output_path=None,
         dry_run=False,
-        screen_measurement_seconds=7,
-        screen_warmup_seconds=3,
+        measure_reps=7,
+        measure_seconds=8,
+        measure_warmup_seconds=3,
+        early_stop_min_reps=5,
     )
-    assert state["screen_measurement_seconds"] == 7
-    assert state["screen_warmup_seconds"] == 3
+    assert state["measure_reps"] == 7
+    assert state["measure_seconds"] == 8
+    assert state["measure_warmup_seconds"] == 3
+    assert state["early_stop_min_reps"] == 5
+
+
+def test_build_initial_state_clamps_timing_settings():
+    state = build_initial_state(
+        target="/tmp/my_app",
+        db_type="postgres",
+        db_name="custom_db",
+        budget=ResourceBudget(cpu_cores=2, memory_gb=4.0),
+        db_config_path="/tmp/non_existent.config",
+        log_file="/tmp/log.log",
+        knob_path="/tmp/knobs",
+        dry_run=False,
+        measure_reps=0,
+        measure_seconds=0,
+        measure_warmup_seconds=0,
+        early_stop_min_reps=0,
+    )
+    assert state["measure_reps"] == 2
+    assert state["measure_seconds"] == 1
+    assert state["measure_warmup_seconds"] == 0
+    assert state["early_stop_min_reps"] == 2
 
 
 def test_build_initial_state_with_valid_config(sample_ini_path):
@@ -1032,10 +1687,8 @@ def test_build_initial_state_with_valid_config(sample_ini_path):
         db_name="custom_db",
         budget=ResourceBudget(cpu_cores=2, memory_gb=4.0),
         db_config_path=str(sample_ini_path),
-        production_db=False,
         log_file="/tmp/log.log",
         knob_path="/tmp/knobs",
-        output_path=None,
         dry_run=False,
     )
     assert "db_config" in state
@@ -1058,15 +1711,11 @@ def test_build_initial_state_does_not_leak_password(sample_ini_path):
         db_name="custom_db",
         budget=ResourceBudget(cpu_cores=2, memory_gb=4.0),
         db_config_path=str(sample_ini_path),
-        production_db=True,
         log_file="/tmp/log.log",
         knob_path="/tmp/knobs",
-        output_path=None,
         dry_run=False,
     )
     assert "password" not in state["db_config"]
-    assert "password" not in state["production_db_config"]
-    assert "password" not in state["prod_db_config"]
     serialized = json.dumps(state, default=str)
     assert "prod_pass" not in serialized
     assert "password" not in serialized
@@ -1079,10 +1728,8 @@ def test_resolve_db_config_reconstructs_secret_from_path(sample_ini_path):
         db_name="custom_db",
         budget=ResourceBudget(cpu_cores=2, memory_gb=4.0),
         db_config_path=str(sample_ini_path),
-        production_db=False,
         log_file="/tmp/log.log",
         knob_path="/tmp/knobs",
-        output_path=None,
         dry_run=False,
     )
     assert "password" not in state["db_config"]
@@ -1102,34 +1749,11 @@ def test_build_initial_state_does_not_register_target_container(sample_ini_path)
             db_name="custom_db",
             budget=ResourceBudget(cpu_cores=2, memory_gb=4.0),
             db_config_path=str(sample_ini_path),
-            production_db=False,
             log_file="/tmp/log.log",
             knob_path="/tmp/knobs",
-            output_path=None,
             dry_run=False,
         )
         mock_register.assert_not_called()
-
-
-def test_build_initial_state_production_env(sample_ini_path):
-    state = build_initial_state(
-        target="/tmp/my_app",
-        db_type="mysql",
-        db_name="custom_db",
-        budget=ResourceBudget(cpu_cores=4, memory_gb=16.0),
-        db_config_path=str(sample_ini_path),
-        production_db=True,
-        log_file="/tmp/log.log",
-        knob_path="/tmp/knobs",
-        output_path=None,
-        dry_run=False,
-    )
-    assert state["env"] == "production"
-    assert state["production_db"] is True
-    assert "production_db_config" in state
-    assert state["production_db_config"]["host"] == "127.0.0.1"
-    assert isinstance(state["production_db_config"], dict)
-    assert "password" not in state["production_db_config"]
 
 
 # ===========================================================================
@@ -1210,7 +1834,6 @@ def test_run_pipeline_writes_run_scoped_artifacts(tmp_path: Path):
                 cpu_cores_arg=2,
                 memory_arg=4.0,
                 log_file=str(tmp_path / "logs" / "tuner.log"),
-                knob_path=str(tmp_path / "knobs"),
                 results_dir=str(results_dir),
                 dry_run=True,
                 verbose=False,
@@ -1221,6 +1844,10 @@ def test_run_pipeline_writes_run_scoped_artifacts(tmp_path: Path):
     run_dir = res["run_dir"]
     assert os.path.isdir(run_dir)
     assert Path(run_dir).parent == results_dir.resolve()
+
+    # Knob artifacts are derived under the run directory.
+    assert res["knob_path"] == os.path.join(run_dir, "knobs")
+    assert os.path.isdir(res["knob_path"])
 
     manifest_path = os.path.join(run_dir, "manifest.json")
     result_path = os.path.join(run_dir, "result.json")
@@ -1234,10 +1861,18 @@ def test_run_pipeline_writes_run_scoped_artifacts(tmp_path: Path):
     assert manifest["application_target"] == str(target_dir.resolve())
 
 
-def test_run_pipeline_writes_optional_output_path(tmp_path: Path):
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlinks unsupported")
+def test_run_pipeline_refreshes_latest_symlink(tmp_path: Path):
     target_dir = tmp_path / "target_app"
     target_dir.mkdir()
-    out_file = tmp_path / "extra" / "result.json"
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    # A stale pointer that must be replaced by the new run.
+    stale = results_dir / "latest"
+    try:
+        os.symlink(str(results_dir), str(stale))
+    except OSError:
+        pytest.skip("symlinks not permitted on this platform")
 
     async def mock_run_async(*args, **kwargs):
         yield _mock_event()
@@ -1246,21 +1881,21 @@ def test_run_pipeline_writes_optional_output_path(tmp_path: Path):
         mock_runner = MagicMock()
         mock_runner.run_async = mock_run_async
         mock_runner_cls.return_value = mock_runner
-        asyncio.run(
+        res = asyncio.run(
             run_pipeline(
                 target=str(target_dir),
                 db_name="custom_db",
                 cpu_cores_arg=2,
                 memory_arg=4.0,
                 log_file=str(tmp_path / "log.log"),
-                knob_path=str(tmp_path / "knobs"),
-                results_dir=str(tmp_path / "results"),
-                output_path=str(out_file),
+                results_dir=str(results_dir),
                 dry_run=True,
             )
         )
 
-    assert out_file.is_file()
+    latest = results_dir / "latest"
+    assert os.path.islink(latest)
+    assert Path(os.path.realpath(latest)) == Path(res["run_dir"]).resolve()
 
 
 def test_run_pipeline_budget_validation_precedes_side_effects(tmp_path: Path):
@@ -1455,38 +2090,10 @@ def test_run_pipeline_orphan_cleanup_called(tmp_path: Path):
                 cpu_cores_arg=2,
                 memory_arg=4.0,
                 results_dir=str(tmp_path / "results"),
-                cleanup_orphans=True,
                 dry_run=True,
             )
         )
         mock_cleanup.assert_called_once()
-
-
-def test_run_pipeline_orphan_cleanup_skipped(tmp_path: Path):
-    target_dir = tmp_path / "target_app"
-    target_dir.mkdir()
-
-    async def mock_run_async(*args, **kwargs):
-        yield _mock_event()
-
-    with patch(
-        "src.knob_tuner.main.cleanup_orphan_containers"
-    ) as mock_cleanup, patch("src.knob_tuner.main.Runner") as mock_runner_cls:
-        mock_runner = MagicMock()
-        mock_runner.run_async = mock_run_async
-        mock_runner_cls.return_value = mock_runner
-        asyncio.run(
-            run_pipeline(
-                target=str(target_dir),
-                db_name="custom_db",
-                cpu_cores_arg=2,
-                memory_arg=4.0,
-                results_dir=str(tmp_path / "results"),
-                cleanup_orphans=False,
-                dry_run=True,
-            )
-        )
-        mock_cleanup.assert_not_called()
 
 
 def test_run_pipeline_exception_triggers_cleanup(tmp_path: Path):
@@ -1508,7 +2115,6 @@ def test_run_pipeline_exception_triggers_cleanup(tmp_path: Path):
                     cpu_cores_arg=2,
                     memory_arg=4.0,
                     results_dir=str(tmp_path / "results"),
-                    cleanup_orphans=False,
                     dry_run=True,
                 )
             )

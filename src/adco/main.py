@@ -23,6 +23,18 @@ from src.knob_tuner.main import (
     _parse_budget,
     run_pipeline as tuner_pipeline,
 )
+from src.knob_tuner.contracts import (
+    DEFAULT_EARLY_STOP_MIN_REPS,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_SET_KNOBS,
+    DEFAULT_MEASURE_REPS,
+    DEFAULT_MEASURE_SECONDS,
+    DEFAULT_MEASURE_WARMUP_SECONDS,
+    get_early_stop_min_reps,
+    get_measure_reps,
+    get_measure_seconds,
+    get_measure_warmup_seconds,
+)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
@@ -102,22 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--apply-mode",
-        choices=["none", "dynamic", "persist-static"],
-        default="dynamic",
+        choices=["none", "live", "manual"],
+        default="live",
         help=(
-            "How validated knobs are applied live: 'dynamic' applies reloadable "
-            "knobs; 'persist-static' also persists restart-required knobs for a "
-            "manual restart (default: dynamic)"
-        ),
-    )
-    p.add_argument(
-        "--durability-profile",
-        choices=["strict", "relaxed"],
-        default="strict",
-        help=(
-            "Durability policy for tuner knobs: 'strict' (default) forbids "
-            "relaxing synchronous_commit/full_page_writes/fsync; 'relaxed' permits "
-            "synchronous_commit=off for commit-bound workloads"
+            "How validated knobs are applied: 'live' mutates reloadable knobs "
+            "now; 'manual' never mutates and instead emits manual SQL plus a "
+            "restart procedure (default: live; legacy spellings dynamic, "
+            "safe-auto, persist-static, maintenance-assisted still accepted)"
         ),
     )
     p.add_argument(
@@ -141,56 +144,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--confirm-repetitions",
+        "--measure-reps",
         type=int,
-        default=5,
+        default=DEFAULT_MEASURE_REPS,
         help=(
-            "Repetitions for the confirmation measurement (default: 5). Starting "
-            "at the escalation cap avoids a 3-rep rung that fails by chance and "
-            "then wastes a whole extra pass."
+            "Measurement reps per arm in single-fidelity mode: one "
+            "shared baseline plus one arm per plan, each with this many runs "
+            f"(default: {DEFAULT_MEASURE_REPS})"
         ),
     )
     p.add_argument(
-        "--screen-seconds",
+        "--measure-seconds",
         type=int,
-        default=10,
-        help="Measured seconds per screening repetition (default: 10)",
+        default=DEFAULT_MEASURE_SECONDS,
+        help=f"Measured seconds per repetition (default: {DEFAULT_MEASURE_SECONDS})",
     )
     p.add_argument(
-        "--screen-warmup-seconds",
+        "--measure-warmup-seconds",
         type=int,
-        default=2,
-        help="Warmup seconds for screening (default: 2)",
-    )
-    p.add_argument(
-        "--candidate-repetitions",
-        type=int,
-        default=10,
+        default=DEFAULT_MEASURE_WARMUP_SECONDS,
         help=(
-            "Repetitions per arm in single-fidelity mode: one shared baseline "
-            "plus one arm per candidate, each with this many short runs "
-            "(default: 10)"
+            "Warmup seconds per measurement arm "
+            f"(default: {DEFAULT_MEASURE_WARMUP_SECONDS})"
         ),
-    )
-    p.add_argument(
-        "--candidate-seconds",
-        type=int,
-        default=10,
-        help="Measured seconds per candidate repetition (default: 10)",
-    )
-    p.add_argument(
-        "--candidate-warmup-seconds",
-        type=int,
-        default=2,
-        help="Warmup seconds per candidate arm (default: 2)",
     )
     p.add_argument(
         "--early-stop-min-reps",
         type=int,
-        default=4,
+        default=DEFAULT_EARLY_STOP_MIN_REPS,
         help=(
-            "Minimum reps before a candidate arm may stop early for futility "
-            "(default: 4)"
+            "Minimum reps before an arm may stop early for futility "
+            f"(default: {DEFAULT_EARLY_STOP_MIN_REPS})"
         ),
     )
     p.add_argument(
@@ -212,34 +196,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--workload-hint",
-        default="",
-        help=(
-            "Free-text description of the production workload shown to the "
-            "recommender (e.g. an aggregate/sort-heavy analytical workload)"
-        ),
-    )
-    p.add_argument(
         "--max-attempts",
         type=int,
         default=10,
         help="Maximum tuner screening attempts before the loop stops (default: 10)",
-    )
-    p.add_argument(
-        "--knob-path",
-        default="out/adco/knobs",
-        help="Directory to save generated knob configuration files",
-    )
-    p.add_argument(
-        "--tuner-output",
-        default="out/adco/knob_result.json",
-        help="Path to write knob tuner result output",
-    )
-    p.add_argument(
-        "--production-db",
-        action="store_true",
-        default=False,
-        help="Target production environment database instead of staging",
     )
     p.add_argument(
         "--dry-run",
@@ -270,27 +230,19 @@ async def run_pipeline(
     db_config: str = "db.config",
     cpu_cores_arg: Any = "auto",
     memory_arg: Any = "auto",
-    knob_path: str = "out/adco/knobs",
-    tuner_output: str = "out/adco/knob_result.json",
-    production_db: bool = False,
     dry_run: bool = False,
     verbose: bool = False,
     buffer_time: float = 0.0,
-    apply_mode: str = "dynamic",
-    durability_profile: str = "strict",
+    apply_mode: str = "live",
     screen_total_rows: int = 0,
     screen_max_rows: int = 5_000_000,
-    confirm_repetitions: int = 5,
-    screen_measurement_seconds: int = 10,
-    screen_warmup_seconds: int = 2,
     screening_benchmark: str = "sysbench",
-    workload_hint: str = "",
-    candidate_repetitions: int = 10,
-    candidate_measurement_seconds: int = 10,
-    candidate_warmup_seconds: int = 2,
-    early_stop_min_reps: int = 4,
-    max_set_knobs: int = 20,
-    max_attempts: int = 10,
+    measure_reps: int = DEFAULT_MEASURE_REPS,
+    measure_seconds: int = DEFAULT_MEASURE_SECONDS,
+    measure_warmup_seconds: int = DEFAULT_MEASURE_WARMUP_SECONDS,
+    early_stop_min_reps: int = DEFAULT_EARLY_STOP_MIN_REPS,
+    max_set_knobs: int = DEFAULT_MAX_SET_KNOBS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
 
@@ -387,18 +339,19 @@ async def run_pipeline(
         if screen_total_rows > 0:
             tuner_extra_state["screen_total_rows"] = screen_total_rows
         tuner_extra_state["screen_max_rows"] = screen_max_rows
-        tuner_extra_state["confirm_repetitions"] = confirm_repetitions
-        tuner_extra_state["screen_measurement_seconds"] = screen_measurement_seconds
-        tuner_extra_state["screen_warmup_seconds"] = screen_warmup_seconds
         tuner_extra_state["screening_benchmark"] = screening_benchmark
-        if workload_hint:
-            tuner_extra_state["workload_hint"] = workload_hint
-        tuner_extra_state["candidate_repetitions"] = candidate_repetitions
-        tuner_extra_state["candidate_measurement_seconds"] = (
-            candidate_measurement_seconds
-        )
-        tuner_extra_state["candidate_warmup_seconds"] = candidate_warmup_seconds
-        tuner_extra_state["early_stop_min_reps"] = early_stop_min_reps
+        # Single source for timing defaults + clamps (contracts is canonical):
+        # these extra-state keys override build_initial_state, so normalize here.
+        timing = {
+            "measure_reps": measure_reps,
+            "measure_seconds": measure_seconds,
+            "measure_warmup_seconds": measure_warmup_seconds,
+            "early_stop_min_reps": early_stop_min_reps,
+        }
+        tuner_extra_state["measure_reps"] = get_measure_reps(timing)
+        tuner_extra_state["measure_seconds"] = get_measure_seconds(timing)
+        tuner_extra_state["measure_warmup_seconds"] = get_measure_warmup_seconds(timing)
+        tuner_extra_state["early_stop_min_reps"] = get_early_stop_min_reps(timing)
         tuner_extra_state["max_set_knobs"] = max_set_knobs
         tuner_extra_state["max_attempts"] = max_attempts
 
@@ -409,17 +362,13 @@ async def run_pipeline(
             cpu_cores_arg=cpu_cores_arg,
             memory_arg=memory_arg,
             db_config=db_config,
-            production_db=production_db,
             log_file=log_file,
-            knob_path=knob_path,
-            output_path=tuner_output,
             dry_run=dry_run,
             verbose=verbose,
             db_name=db_name,
             extra_initial_state=tuner_extra_state,
             buffer_time=buffer_time,
             apply_mode=apply_mode,
-            durability_profile=durability_profile,
         )
     else:
         if verbose:
@@ -444,7 +393,10 @@ async def run_pipeline(
             open(rewriter_output).read() if os.path.exists(rewriter_output) else "{}"
         ),
         "knob_tuner": _maybe_parse(
-            open(tuner_output).read() if os.path.exists(tuner_output) else "{}"
+            open(os.path.join(tuner_run_dir, "result.json")).read()
+            if tuner_run_dir
+            and os.path.exists(os.path.join(tuner_run_dir, "result.json"))
+            else "{}"
         ),
     }
 
@@ -504,27 +456,17 @@ def main() -> None:
                 db_config=args.db_config,
                 cpu_cores_arg=args.cpu_cores,
                 memory_arg=args.memory,
-                knob_path=args.knob_path,
-                tuner_output=args.tuner_output,
-                production_db=args.production_db,
                 dry_run=args.dry_run,
                 verbose=args.verbose,
                 buffer_time=getattr(args, "buffer_time", 0.0),
                 apply_mode=args.apply_mode,
-                durability_profile=getattr(args, "durability_profile", "strict"),
                 screen_total_rows=getattr(args, "screen_total_rows", 0),
                 screen_max_rows=getattr(args, "screen_max_rows", 5_000_000),
-                confirm_repetitions=getattr(args, "confirm_repetitions", 5),
-                screen_measurement_seconds=getattr(args, "screen_seconds", 10),
-                screen_warmup_seconds=getattr(args, "screen_warmup_seconds", 2),
                 screening_benchmark=getattr(args, "screening_benchmark", "sysbench"),
-                workload_hint=getattr(args, "workload_hint", ""),
-                candidate_repetitions=getattr(args, "candidate_repetitions", 10),
-                candidate_measurement_seconds=getattr(args, "candidate_seconds", 10),
-                candidate_warmup_seconds=getattr(
-                    args, "candidate_warmup_seconds", 2
-                ),
-                early_stop_min_reps=getattr(args, "early_stop_min_reps", 4),
+                measure_reps=args.measure_reps,
+                measure_seconds=args.measure_seconds,
+                measure_warmup_seconds=args.measure_warmup_seconds,
+                early_stop_min_reps=args.early_stop_min_reps,
                 max_set_knobs=getattr(args, "max_set_knobs", 20),
                 max_attempts=getattr(args, "max_attempts", 10),
             )

@@ -15,6 +15,28 @@ _CONTEXT_TO_SCOPE: dict[str, KnobScope] = {
 }
 
 
+def requires_restart(item: Any = None, *, scope: Any = None, restart_required: bool = False) -> bool:
+    """Single helper for restart-required computation (Phase 4.7).
+
+    Accepts a :class:`KnobSpec`, a knob dict (``scope``/``restart_required``
+    keys), or explicit ``scope``/``restart_required`` kwargs. A knob needs a
+    restart when its explicit flag is set or its scope is POSTMASTER.
+    """
+    if isinstance(item, KnobSpec):
+        scope = item.scope
+        restart_required = item.restart_required
+    elif isinstance(item, dict):
+        if "scope" in item:
+            scope = item.get("scope")
+        if "restart_required" in item:
+            restart_required = bool(item.get("restart_required"))
+    if isinstance(scope, KnobScope):
+        scope_text = scope.value
+    else:
+        scope_text = str(scope or "").strip().lower()
+    return bool(restart_required) or scope_text == KnobScope.POSTMASTER.value
+
+
 def classify_scope(context: str | None) -> KnobScope:
     """Map a ``pg_settings.context`` value to a :class:`KnobScope`.
 
@@ -84,7 +106,7 @@ def build_knob_plan(raw_knobs: list[dict], context_map: dict[str, str]) -> KnobP
                 name=str(name),
                 value=raw.get("value", raw.get("recommended_value")),
                 scope=scope,
-                restart_required=scope == KnobScope.POSTMASTER,
+                restart_required=requires_restart(scope=scope),
                 reasoning=str(raw.get("reasoning", "") or ""),
             )
         )

@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-from datetime import datetime, timezone
 from typing import Any, Union
 
 from google.adk import Context, Event, Workflow
@@ -39,10 +38,13 @@ from google.adk.workflow import Edge, FunctionNode
 from src.knob_tuner.contracts import (
     ApplyMode,
     KnobPlan,
-    KnobScope,
     ResourceBudget,
-    RunManifest,
     TuningStatus,
+    get_database_name,
+    get_db_config_path,
+    get_measure_reps,
+    get_measure_seconds,
+    get_measure_warmup_seconds,
 )
 from src.knob_tuner.stages import nodes as stage_nodes
 from src.knob_tuner.stages.models import (
@@ -65,15 +67,15 @@ from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
 from src.knob_tuner.tools.db_tools import apply_knobs
 from src.knob_tuner.tools.docker_tools import (
     cleanup_snapshot_image,
-    resolve_docker_image,
 )
 from src.knob_tuner.tools.knobs import (
     coerce_apply_mode,
     coerce_db_config,
     coerce_profile,
 )
+from src.knob_tuner.tools.knob_scope import requires_restart
 from src.knob_tuner.tools.progress import make_progress_callback
-from src.knob_tuner.tools.run_artifacts import application_code_hash
+from src.knob_tuner.tools.run_artifacts import build_run_manifest
 from src.knob_tuner.tools.validation import SnapshotRegistry, validate_plan
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
@@ -115,27 +117,97 @@ def _resolve_db_config(state: Any) -> DBConfig | None:
     fully-populated config already in state (embedded callers/tests) is honored
     first.
     """
-    for key in ("db_config", "production_db_config", "prod_db_config"):
+    for key in ("db_config",):
         cfg = coerce_db_config(state.get(key))
         if cfg is not None and cfg.password:
             return cfg
 
-    path = state.get("db_config_path") or state.get("config_path")
-    if isinstance(path, str) and os.path.isfile(path):
+    path = get_db_config_path(state)
+    if path and os.path.isfile(path):
         db_type = str(state.get("db_type", "postgres") or "postgres")
-        db_name = str(
-            state.get("database") or state.get("db_name") or state.get("dbname") or ""
-        ).strip()
+        db_name = get_database_name(state)
         try:
             return load_db_config(path, db_type=db_type, db_override=db_name or None)
         except Exception:
             return None
 
-    for key in ("db_config", "production_db_config", "prod_db_config"):
+    for key in ("db_config",):
         cfg = coerce_db_config(state.get(key))
         if cfg is not None:
             return cfg
     return None
+
+
+def _format_database_identity(db_type: str, host: Any, port: Any, database: Any) -> str:
+    """Render a canonical ``engine://host:port/database`` identity string."""
+    engine = str(db_type or "").strip().lower() or "unknown"
+    return f"{engine}://{host}:{port}/{database}"
+
+
+def _live_target_identity(cfg: DBConfig, db_type: str = "") -> str:
+    """Build the live apply-target identity in attestation format."""
+    engine = str(cfg.db_type or db_type or "").strip().lower()
+    return _format_database_identity(engine, cfg.host, cfg.port, cfg.database)
+
+
+def _attestation_identity(attestation: Any) -> str:
+    """Best-effort extraction of ``database_identity`` from an attestation."""
+    if attestation is None:
+        return ""
+    if isinstance(attestation, dict):
+        return str(attestation.get("database_identity", "") or "")
+    return str(getattr(attestation, "database_identity", "") or "")
+
+
+def _staging_identity_from_state(state: Any) -> str:
+    """Return the database identity recorded at staging/validation time."""
+    getter = getattr(state, "get", None)
+    if not callable(getter):
+        return ""
+    recorded = str(getter("staging_database_identity", "") or "").strip()
+    if recorded:
+        return recorded
+    return _attestation_identity(getter("validation_attestation")).strip()
+
+
+def _identity_key(identity: str) -> tuple[str, str]:
+    """Reduce an identity string to the comparable ``(engine, database)`` pair.
+
+    Only the engine and database name are compared: staging runs in an
+    ephemeral container (dynamic host port), so host/port can never match the
+    live target. The database NAME is what staging and production share, and
+    applying knobs validated on one database to another is the hazard.
+    """
+    text = str(identity or "").strip()
+    engine, _, rest = text.partition("://")
+    database = rest.rsplit("/", 1)[-1].strip() if rest else ""
+    engine_norm = engine.strip().lower()
+    if engine_norm in ("postgres", "postgresql"):
+        engine_norm = "postgresql"
+    elif engine_norm in ("mysql", "mariadb"):
+        engine_norm = "mysql"
+    return (engine_norm, database.lower())
+
+
+def _staging_identity_matches(staging_identity: str, live_identity: str) -> bool:
+    """Whether the staged database matches the live apply target.
+
+    An absent staging record means there is nothing to check against (proceed).
+    Otherwise an exact string match passes, else the ``(engine, database)``
+    pair must agree; an unparseable record that cannot prove a mismatch does
+    not block the apply.
+    """
+    if not str(staging_identity or "").strip():
+        return True
+    if not str(live_identity or "").strip():
+        return False
+    if staging_identity.strip() == live_identity.strip():
+        return True
+    staged = _identity_key(staging_identity)
+    live = _identity_key(live_identity)
+    if not staged[1] or not live[1]:
+        return True
+    return staged == live
 
 
 def apply_live_node(ctx: Context, node_input: Any = None) -> Event:
@@ -148,6 +220,29 @@ def apply_live_node(ctx: Context, node_input: Any = None) -> Event:
     status = str(state.get("result_status", "") or "").upper()
 
     if dry_run or status != TuningStatus.PASS.value:
+        # Phase 1.7: a failed/inconclusive campaign carries an empty winner
+        # plan, so there is nothing to apply — report APPLIED_NOTHING (not
+        # SKIPPED) so the outcome is explicit and auditable. Dry-run and
+        # non-empty-plan skips keep the SKIPPED status.
+        raw_plan = state.get("knob_plan") or {}
+        plan_knobs = (
+            raw_plan.get("knobs", [])
+            if isinstance(raw_plan, dict)
+            else getattr(raw_plan, "knobs", []) or []
+        )
+        if not dry_run and not plan_knobs:
+            live_result = {
+                "status": "APPLIED_NOTHING",
+                "reason": "no confirmed winner; nothing to apply",
+                "applied_knobs": [],
+                "persisted_static_knobs": [],
+                "pending_restart_knobs": [],
+            }
+            progress(f"live apply: {live_result['reason']}")
+            return Event(
+                output=live_result,
+                state={"live_result": live_result, "applied_knobs": []},
+            )
         live_result = {
             "status": "SKIPPED",
             "reason": (
@@ -190,23 +285,92 @@ def apply_live_node(ctx: Context, node_input: Any = None) -> Event:
     except Exception:
         plan = KnobPlan(knobs=[])
 
-    mode = coerce_apply_mode(state.get("apply_mode", "dynamic"))
+    resolved_raw = state.get("apply_mode_resolved", None)
+    if resolved_raw is None:
+        resolved_raw = state.get("apply_mode", "live")
+    mode = coerce_apply_mode(resolved_raw)
     knobs = [spec.model_dump() for spec in plan.knobs]
 
     pending_restart = [
-        spec.model_dump()
-        for spec in plan.knobs
-        if spec.restart_required or spec.scope == KnobScope.POSTMASTER
+        spec.model_dump() for spec in plan.knobs if requires_restart(spec)
     ]
 
-    if str(state.get("apply_mode", "")).strip().lower() == "maintenance-assisted":
-        progress("maintenance-assisted: generating manual SQL (no production mutation)...")
+    # Phase 1.5: refuse to mutate a live target that is not the database the
+    # plan was staged against. The staging record is the attestation's
+    # database_identity (recorded as staging_database_identity); only the
+    # (engine, database) pair is compared because staging host/ports are
+    # ephemeral.
+    live_identity = _live_target_identity(cfg, str(state.get("db_type", "") or ""))
+    staging_identity = _staging_identity_from_state(state)
+    if not _staging_identity_matches(staging_identity, live_identity):
+        reason = (
+            "staging/live database mismatch: plan was staged against "
+            f"{staging_identity or 'unknown'}, live target is {live_identity}; "
+            "refusing to apply"
+        )
+        progress(f"live apply refused: {reason}")
+        live_result = {
+            "status": "FAILED",
+            "reason": reason,
+            "applied_knobs": [],
+            "persisted_static_knobs": [],
+            "pending_restart_knobs": pending_restart,
+            "results": [],
+            "staging_database_identity": staging_identity,
+            "live_database_identity": live_identity,
+        }
+        return Event(
+            output=live_result,
+            state={
+                "live_result": live_result,
+                "applied_knobs": [],
+                "result_status": TuningStatus.FAIL.value,
+            },
+        )
+
+    route = str(state.get("preflight_route") or "").strip().lower()
+    verdict_raw = state.get("preflight_verdict") or {}
+    verdict_reason = (
+        verdict_raw.get("reason", "") if isinstance(verdict_raw, dict) else ""
+    )
+
+    if route == "blocked":
+        live_result = {
+            "status": "FAILED",
+            "reason": f"preflight blocked: {verdict_reason or 'apply gated'}; "
+            "no production mutation",
+            "applied_knobs": [],
+            "persisted_static_knobs": [],
+            "pending_restart_knobs": pending_restart,
+            "manual_sql": [],
+        }
+        return Event(
+            output=live_result,
+            state={
+                "live_result": live_result,
+                "applied_knobs": [],
+                "result_status": TuningStatus.FAIL.value,
+            },
+        )
+
+    if mode == ApplyMode.MANUAL or route == "maintenance_assisted":
+        if route == "maintenance_assisted" and mode != ApplyMode.MANUAL:
+            reason = (
+                "preflight maintenance_assisted: manual SQL emitted; "
+                f"no auto restart ({verdict_reason})"
+                if verdict_reason
+                else "preflight maintenance_assisted: manual SQL emitted; "
+                "no auto restart"
+            )
+        else:
+            reason = "manual: manual SQL emitted; no auto restart"
+        progress("manual: generating manual SQL (no production mutation)...")
         try:
             sql_results = apply_knobs(knobs, cfg, dry_run=True, mode=mode)
             manual_sql = [r.get("sql", "") for r in sql_results if r.get("sql")]
             live_result = {
                 "status": "MANUAL_SQL",
-                "reason": "maintenance-assisted: manual SQL emitted; no auto restart",
+                "reason": reason,
                 "applied_knobs": [],
                 "persisted_static_knobs": [],
                 "pending_restart_knobs": pending_restart,
@@ -241,23 +405,63 @@ def apply_live_node(ctx: Context, node_input: Any = None) -> Event:
         progress(f"Applying plan to live DB ({mode.value})...")
         results = apply_knobs(knobs, cfg, dry_run=False, mode=mode)
         applied = [r for r in results if r.get("status") == "applied"]
+        failed = [r for r in results if r.get("status") == "failed"]
+        skipped = [r for r in results if r.get("status") == "skipped"]
         restart_names = {
-            spec.name
-            for spec in plan.knobs
-            if spec.restart_required or spec.scope == KnobScope.POSTMASTER
+            spec.name for spec in plan.knobs if requires_restart(spec)
         }
         persisted_static = [r for r in applied if r.get("knob") in restart_names]
         progress(
             f"applied {len(applied)}; pending restart: "
             f"{', '.join(sorted(restart_names)) or 'none'}"
         )
+        # Phase 1.4: explicit apply outcome. An empty `applied` list is never
+        # reported as a success: APPLIED (all), PARTIAL (some), APPLIED_NOTHING
+        # (none — every-knob-failed, every-knob-skipped, or --apply-mode none).
+        total = len(results)
+        if applied and len(applied) == total:
+            outcome = "APPLIED"
+            reason = ""
+        elif applied:
+            outcome = "PARTIAL"
+            reason = (
+                f"partial apply: {len(applied)}/{total} knobs applied "
+                f"({len(failed)} failed, {len(skipped)} skipped)"
+            )
+        elif not results:
+            outcome = "APPLIED_NOTHING"
+            reason = "no knobs in plan; nothing applied"
+        elif failed and not skipped:
+            outcome = "APPLIED_NOTHING"
+            names = ", ".join(str(r.get("knob")) for r in failed[:3])
+            reason = f"every knob failed ({len(failed)}/{total}): {names}"
+        elif skipped and not failed:
+            outcome = "APPLIED_NOTHING"
+            if mode == ApplyMode.NONE:
+                reason = (
+                    f"apply mode is 'none': all {total} knobs skipped; "
+                    "nothing applied"
+                )
+            else:
+                reason = (
+                    f"every knob skipped under {mode.value} apply mode "
+                    f"({total}/{total}); nothing applied"
+                )
+        else:
+            outcome = "APPLIED_NOTHING"
+            reason = (
+                f"nothing applied "
+                f"({len(failed)} failed, {len(skipped)} skipped of {total})"
+            )
         live_result = {
-            "status": "APPLIED" if applied else "COMPLETED",
-            "reason": "",
+            "status": outcome,
+            "reason": reason,
             "applied_knobs": applied,
             "persisted_static_knobs": persisted_static,
             "pending_restart_knobs": pending_restart,
             "results": results,
+            "staging_database_identity": staging_identity,
+            "live_database_identity": live_identity,
         }
     except Exception as exc:
         live_result = {
@@ -274,6 +478,19 @@ def apply_live_node(ctx: Context, node_input: Any = None) -> Event:
     }
     if live_result["status"] == "FAILED":
         apply_state["result_status"] = TuningStatus.FAIL.value
+    elif live_result["status"] in ("APPLIED_NOTHING", "PARTIAL"):
+        # Empty/partial applies never stay PASS: every-knob-failed is a FAIL,
+        # every-knob-skipped / mode-none / partial is INCONCLUSIVE.
+        res = [
+            r
+            for r in (live_result.get("results") or [])
+            if isinstance(r, dict)
+        ]
+        any_failed = any(r.get("status") == "failed" for r in res)
+        if live_result["status"] == "APPLIED_NOTHING" and any_failed:
+            apply_state["result_status"] = TuningStatus.FAIL.value
+        else:
+            apply_state["result_status"] = TuningStatus.INCONCLUSIVE.value
     return Event(output=live_result, state=apply_state)
 
 
@@ -284,77 +501,16 @@ def finalize_node(ctx: Context, node_input: Any = None) -> Event:
         state.get("log_file"), bool(state.get("verbose", False))
     )
 
-    try:
-        status = TuningStatus(
-            str(state.get("result_status", TuningStatus.INCONCLUSIVE.value)).upper()
-        )
-    except ValueError:
-        status = TuningStatus.INCONCLUSIVE
-
-    # Reconcile against the live apply: a validated PASS is only a success if
-    # the production mutation actually happened. A failed or absent apply must
-    # never surface as a PASS manifest. MANUAL_SQL is not an applied success.
-    live = state.get("live_result") or {}
-    live_status = str(live.get("status", "") or "").upper()
-    errors = list(state.get("staging_issues", []) or [])
-    if live_status in ("FAILED", "ERROR"):
-        reason = str(live.get("reason", "") or "")
-        errors.append(f"live apply {live_status}: {reason}".rstrip(": "))
-    if status == TuningStatus.PASS and live_status not in ("APPLIED", "COMPLETED"):
-        status = (
-            TuningStatus.FAIL
-            if live_status in ("FAILED", "ERROR")
-            else TuningStatus.INCONCLUSIVE
-        )
-
-    profile = coerce_profile(state.get("sysbench_profile"))
-    target = state.get("target", "") or ""
-    db_type = state.get("db_type", "") or ""
-    db_version = state.get("db_version") or ""
-
-    db_image = state.get("db_image") or ""
-    if not db_image:
-        try:
-            db_image = resolve_docker_image(db_type, db_version)
-        except Exception:
-            db_image = ""
-
-    attestation = state.get("validation_attestation") or {}
-    if isinstance(attestation, dict):
-        verified_knobs = attestation.get("verified_knobs", []) or []
-    else:
-        verified_knobs = getattr(attestation, "verified_knobs", []) or []
-
-    attempts = state.get("validation_attempts") or []
-    attempt_count = len(attempts) or int(state.get("validation_attempt_count", 0) or 0)
-
-    progress(f"run complete: {status.value}")
-    manifest = RunManifest(
-        run_id=state.get("run_id", "") or "",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        status=status,
-        resource_budget=state.get("resource_budget") or {},
-        db_engine=db_type,
-        db_version=str(db_version),
-        db_image=db_image,
-        application_target=target,
-        application_code_hash=application_code_hash(target),
-        knob_plan_hash=state.get("knob_plan_hash", "") or "",
-        sysbench_profile_hash=profile.profile_hash(),
-        seed=profile.seed,
-        client_threads=profile.threads,
-        attempt_count=attempt_count,
-        applied_knobs=state.get("applied_knobs", []) or [],
-        verified_knobs=verified_knobs,
-        errors=errors,
-        final_status=status.value,
-    )
+    # Single source of truth: the shared builder owns db_image/errors/status
+    # reconciliation (see tools.run_artifacts.build_run_manifest).
+    manifest = build_run_manifest(state)
+    progress(f"run complete: {manifest.status.value}")
 
     return Event(
         output=manifest.model_dump(),
         state={
             "run_manifest": manifest.model_dump(),
-            "result_status": status.value,
+            "result_status": manifest.status.value,
         },
     )
 
@@ -385,15 +541,28 @@ def compile_candidate_node(
     ctx: Context, node_input: CandidateProposal
 ) -> CompiledPlan | CompileRejection:
     """Compile one proposal; route ``"ok"`` or ``"rejected"``."""
+    progress = make_progress_callback(
+        ctx.state.get("log_file"), bool(ctx.state.get("verbose", False))
+    )
     result = stage_nodes.compile_candidate(ctx, node_input)
     if isinstance(result, CompileRejection):
         ctx.route = "rejected"
         ctx.state["exp_name"] = result.design_name or "experiment"
+        progress(f"compile {ctx.state['exp_name']}: rejected ({result.reason})")
+        # Audit trail: the CompileRejection object travels to the controller,
+        # but only this state projection survives it — persist the reason and
+        # errors so manifest readers see why the proposal never ran.
+        with contextlib.suppress(Exception):
+            ctx.state["last_rejection"] = result.model_dump()
     else:
         ctx.route = "ok"
         ctx.state["exp_name"] = result.exp_name
         ctx.state["phase"] = result.phase
         ctx.state["n_knobs"] = len(result.valid_knobs)
+        progress(
+            f"compile {result.exp_name}: ok "
+            f"({len(result.valid_knobs)} knobs, phase={result.phase})"
+        )
     return result
 
 
@@ -415,23 +584,15 @@ def _screen_runtime(ctx: Context) -> tuple[Any, Any]:
     run_dir = state.get("run_dir", "") or ""
     db_type = state.get("db_type", "postgres") or "postgres"
     db_version = state.get("db_version")
-    database = (
-        state.get("database") or state.get("db_name") or state.get("dbname") or ""
-    )
+    # Phase 4.3: canonical database name (compat mirrors handled in helper).
+    database = get_database_name(state)
     benchmark_kind = str(state.get("screening_benchmark", "sysbench") or "sysbench")
     dry_run = bool(state.get("dry_run", False))
-    candidate_reps = max(2, int(state.get("candidate_repetitions", 10) or 10))
-    candidate_seconds = max(
-        1, int(state.get("candidate_measurement_seconds", 10) or 10)
-    )
-    candidate_warmup = max(
-        0, int(state.get("candidate_warmup_seconds", 2) or 2)
-    )
-    try:
-        min_improvement = float(getattr(profile, "min_improvement_pct", 5.0))
-    except (TypeError, ValueError):
-        min_improvement = 5.0
-    state["min_improvement_pct"] = min_improvement
+    measure_reps = get_measure_reps(state)
+    measure_seconds = get_measure_seconds(state)
+    measure_warmup_seconds = get_measure_warmup_seconds(state)
+    # Phase 4.2: min_improvement_pct is written once by prepare_run;
+    # screen/confirm edges read it from state (no local re-derivation).
 
     schema_info = state.get("schema_info") or []
     target_total_rows = 0
@@ -457,16 +618,14 @@ def _screen_runtime(ctx: Context) -> tuple[Any, Any]:
     state["screen_dataset"] = dataset_meta
     run_profile = screen_profile.model_copy(
         update={
-            "repetitions": candidate_reps,
-            "measurement_seconds": max(1, candidate_seconds),
-            "warmup_seconds": max(0, candidate_warmup),
+            "repetitions": measure_reps,
+            "measurement_seconds": measure_seconds,
+            "warmup_seconds": measure_warmup_seconds,
         }
     )
 
-    registry = state.get("snapshot_registry")
-    if not isinstance(registry, SnapshotRegistry):
-        registry = SnapshotRegistry()
-        state["snapshot_registry"] = registry
+    registry = SnapshotRegistry.from_state(state.get("snapshot_registry"))
+    state["snapshot_registry"] = registry.to_state()
 
     def _validate(
         plan: KnobPlan,
@@ -476,7 +635,7 @@ def _screen_runtime(ctx: Context) -> tuple[Any, Any]:
         early_stop_min_reps: Any = None,
         baseline_only: bool = False,
     ) -> dict[str, Any]:
-        return validate_plan(
+        result = validate_plan(
             run_id=run_id,
             run_dir=run_dir,
             plan=plan,
@@ -487,8 +646,8 @@ def _screen_runtime(ctx: Context) -> tuple[Any, Any]:
             database=database,
             # Staging validates the FULL plan (postmaster knobs included) by
             # restarting the throwaway container; production apply is scoped
-            # separately by safe-auto / maintenance-assisted.
-            apply_mode=ApplyMode.PERSIST_STATIC,
+            # separately by live / manual.
+            apply_mode=ApplyMode.MANUAL,
             dry_run=dry_run,
             attempt=attempt,
             benchmark_kind=benchmark_kind,
@@ -499,6 +658,11 @@ def _screen_runtime(ctx: Context) -> tuple[Any, Any]:
             baseline_only=baseline_only,
             early_stop_min_reps=early_stop_min_reps,
         )
+        # Phase 4.6: the live registry mutated above — sync its plain-data
+        # view back so snapshot reuse survives across screens.
+        with contextlib.suppress(Exception):
+            state["snapshot_registry"] = registry.to_state()
+        return result
 
     return _validate, run_profile
 
@@ -540,7 +704,26 @@ def confirmation_controller_node(
     ``CompileRejection`` inputs arrive directly from compile (cheap retry,
     no LLM call); screen verdicts always arrive via diagnosis first.
     """
-    return stage_nodes.confirmation_controller(ctx, node_input)
+    out = stage_nodes.confirmation_controller(ctx, node_input)
+    # Audit trail: the decision node runs after this controller and only
+    # reads session state, so the routing reason (gate_info/reason) must be
+    # persisted here or it is invisible downstream.
+    with contextlib.suppress(Exception):
+        state = ctx.state
+        state["last_controller"] = dict(out)
+        # Phase 4.5: read-copy-reassign, never mutate the live list in place.
+        history = list(state.get("controller_history") or [])
+        history.append(dict(out))
+        state["controller_history"] = history
+    progress = make_progress_callback(
+        ctx.state.get("log_file"), bool(ctx.state.get("verbose", False))
+    )
+    progress(
+        f"controller: route={out.get('route')} "
+        f"reason={out.get('reason', '')} "
+        f"attempt={out.get('validation_attempt_count')}/{out.get('max_attempts')}"
+    )
+    return out
 
 
 _DECISION_STATUS = {
@@ -554,6 +737,21 @@ _DECISION_STATUS = {
 def decision_node(ctx: Context) -> TerminalDecision:
     """Pick the terminal outcome and bridge it into apply/finalize state keys."""
     term = stage_nodes.decision(ctx)
+    state = ctx.state
+    # Phase 1.7 belt-and-braces: a non-winning plan must never bridge to an
+    # apply — downgrade a stray keep_best to an empty inconclusive decision.
+    if term.decision == "keep_best":
+        summary = dict(term.summary or {})
+        reasons = list(summary.get("reasons", []) or [])
+        note = "unconfirmed best withheld: nothing applied"
+        if note not in reasons:
+            reasons.append(note)
+        summary["reasons"] = reasons
+        summary["status"] = "INCONCLUSIVE"
+        summary["plan_hash"] = ""
+        term = TerminalDecision(
+            decision="inconclusive", winner_plan={}, summary=summary
+        )
     status = _DECISION_STATUS.get(term.decision, TuningStatus.INCONCLUSIVE.value)
     winner = dict(term.winner_plan or {})
     summary = term.summary or {}
@@ -561,20 +759,31 @@ def decision_node(ctx: Context) -> TerminalDecision:
         plan_hash = KnobPlan.model_validate(winner).plan_hash() if winner else ""
     except ValueError:
         plan_hash = ""
-    state = ctx.state
     state["knob_plan"] = winner if winner else {"knobs": []}
     state["knob_plan_hash"] = plan_hash or str(summary.get("plan_hash", "") or "")
     state["result_status"] = status
     state["staging_validated"] = status == TuningStatus.PASS.value
-    state["staging_issues"] = [str(r) for r in (summary.get("reasons", []) or [])]
+    try:
+        issue_attempt = int(state.get("validation_attempt_count") or 0)
+    except (TypeError, ValueError):
+        issue_attempt = 0
+    issue_knobs = [
+        str(spec.get("name"))
+        for spec in (winner.get("knobs", []) if isinstance(winner, dict) else [])
+        if isinstance(spec, dict) and spec.get("name")
+    ]
+    state["staging_issues"] = stage_nodes.structure_staging_issues(
+        summary.get("reasons", []) or [],
+        attempt=issue_attempt,
+        knob_names=issue_knobs,
+    )
     state["validation_attempts"] = list(state.get("experiment_history") or [])
     state["candidate_archive"] = summary.get("archive", {}) or {}
     state["improvement_confident"] = bool(
         summary.get("improvement_confident", False)
     )
-    registry = state.get("snapshot_registry")
-    if isinstance(registry, SnapshotRegistry):
-        for image in registry.images():
+    registry = SnapshotRegistry.from_state(state.get("snapshot_registry"))
+    for image in registry.images():
             with contextlib.suppress(Exception):
                 cleanup_snapshot_image(image)
     return term
@@ -592,9 +801,21 @@ def production_preflight_node(
         state.get("result_status", "") or ""
     ).upper() == TuningStatus.PASS.value:
         state["result_status"] = TuningStatus.INCONCLUSIVE.value
-        issues = state.setdefault("staging_issues", [])
-        if isinstance(issues, list) and verdict.reason not in issues:
-            issues.append(f"preflight blocked: {verdict.reason}")
+        # Phase 4.5: read-copy-reassign — never mutate the live list in place.
+        issues = list(state.get("staging_issues") or [])
+        try:
+            issue_attempt = int(state.get("validation_attempt_count") or 0)
+        except (TypeError, ValueError):
+            issue_attempt = 0
+        structured = stage_nodes.structure_staging_issues(
+            [f"preflight blocked: {verdict.reason}"],
+            attempt=issue_attempt,
+            knob_names=None,
+        )
+        for entry in structured:
+            if entry not in issues:
+                issues.append(entry)
+        state["staging_issues"] = issues
     return verdict
 
 

@@ -31,17 +31,39 @@ def test_build_parser():
     assert args.output_path == "out/adco/result.json"
     assert args.intent_output == "out/adco/intent_result.json"
     assert args.rewriter_output == "out/adco/rewriter_result.json"
-    assert args.tuner_output == "out/adco/knob_result.json"
-    assert args.knob_path == "out/adco/knobs"
-    assert args.production_db is False
+    option_strings = {s for a in parser._actions for s in a.option_strings}
+    assert "--tuner-output" not in option_strings
+    assert "--knob-path" not in option_strings
+    assert "--output-path" in option_strings
+    for dead in (
+        "--screen-seconds",
+        "--screen-warmup-seconds",
+        "--candidate-repetitions",
+        "--candidate-seconds",
+        "--candidate-warmup-seconds",
+    ):
+        assert dead not in option_strings
+    for live in (
+        "--measure-reps",
+        "--measure-seconds",
+        "--measure-warmup-seconds",
+        "--early-stop-min-reps",
+    ):
+        assert live in option_strings
+    assert "--repetitions" not in option_strings
+    assert "--production-db" not in option_strings
+    assert not hasattr(args, "production_db")
     assert args.dry_run is False
     assert args.verbose is False
     assert args.mode == "all"
-    assert args.apply_mode == "dynamic"
+    assert args.apply_mode == "live"
     assert args.buffer_time == 0.0
     assert args.screening_benchmark == "sysbench"
-    assert args.workload_hint == ""
     assert args.max_attempts == 10
+    assert args.measure_reps == 10
+    assert args.measure_seconds == 10
+    assert args.measure_warmup_seconds == 2
+    assert args.early_stop_min_reps == 4
 
 
 def test_build_parser_custom_options():
@@ -53,14 +75,16 @@ def test_build_parser_custom_options():
         "--model", "gemini-test",
         "--cpu-cores", "4",
         "--memory", "8",
-        "--production-db",
         "--dry-run",
         "-v",
         "--mode", "tune-only",
-        "--apply-mode", "persist-static",
+        "--apply-mode", "manual",
         "--buffer-time", "2.5",
         "--screening-benchmark", "pgbench",
-        "--workload-hint", "analytical sort spills",
+        "--measure-reps", "3",
+        "--measure-seconds", "5",
+        "--measure-warmup-seconds", "1",
+        "--early-stop-min-reps", "2",
         "--max-attempts", "7",
     ])
     assert args.target == "my_target"
@@ -69,15 +93,23 @@ def test_build_parser_custom_options():
     assert args.model == "gemini-test"
     assert args.cpu_cores == "4"
     assert args.memory == "8"
-    assert args.production_db is True
     assert args.dry_run is True
     assert args.verbose is True
     assert args.mode == "tune-only"
-    assert args.apply_mode == "persist-static"
+    assert args.apply_mode == "manual"
     assert args.buffer_time == 2.5
     assert args.screening_benchmark == "pgbench"
-    assert args.workload_hint == "analytical sort spills"
+    assert args.measure_reps == 3
+    assert args.measure_seconds == 5
+    assert args.measure_warmup_seconds == 1
+    assert args.early_stop_min_reps == 2
     assert args.max_attempts == 7
+
+
+def test_build_parser_apply_mode_choices_are_canonical_only():
+    parser = build_parser()
+    action = next(a for a in parser._actions if "--apply-mode" in a.option_strings)
+    assert sorted(action.choices) == ["live", "manual", "none"]
 
 
 
@@ -94,11 +126,14 @@ def test_run_pipeline_success_with_tuning(mock_tuner, mock_rewriter, mock_intent
     out_file = tmp_path / "result.json"
     intent_out = tmp_path / "intent.json"
     rewriter_out = tmp_path / "rewriter.json"
-    tuner_out = tmp_path / "tuner.json"
+    tuner_run_dir = tmp_path / "tuner_run"
+    tuner_run_dir.mkdir()
 
     intent_out.write_text(json.dumps({"intent_output": {"queries": "SELECT * FROM users"}}))
     rewriter_out.write_text(json.dumps({"status": "PASS", "sandbox": str(sandbox_dir)}))
-    tuner_out.write_text(json.dumps({"staging_validated": True}))
+    (tuner_run_dir / "result.json").write_text(
+        json.dumps({"staging_validated": True})
+    )
 
     mock_intent.return_value = {
         "intent_output": {
@@ -122,6 +157,7 @@ def test_run_pipeline_success_with_tuning(mock_tuner, mock_rewriter, mock_intent
     }
     mock_tuner.return_value = {
         "staging_validated": True,
+        "run_dir": str(tuner_run_dir),
     }
 
     res = asyncio.run(
@@ -134,7 +170,6 @@ def test_run_pipeline_success_with_tuning(mock_tuner, mock_rewriter, mock_intent
             rewriter_output=str(rewriter_out),
             db_name="testdb",
             db_type="postgres",
-            tuner_output=str(tuner_out),
         )
     )
 
@@ -145,6 +180,8 @@ def test_run_pipeline_success_with_tuning(mock_tuner, mock_rewriter, mock_intent
     # Verify tuner received sandbox path and workload_info
     tuner_call_kwargs = mock_tuner.call_args.kwargs
     assert tuner_call_kwargs["target"] == str(sandbox_dir)
+    assert "knob_path" not in tuner_call_kwargs
+    assert "output_path" not in tuner_call_kwargs
     assert "workload_info" in tuner_call_kwargs["extra_initial_state"]
     assert "SELECT" in tuner_call_kwargs["extra_initial_state"]["workload_info"]["query_types"]
 
@@ -153,7 +190,35 @@ def test_run_pipeline_success_with_tuning(mock_tuner, mock_rewriter, mock_intent
     assert res["sandbox"] == str(sandbox_dir)
     assert "intent_analyzer" in res
     assert "rewriter" in res
-    assert "knob_tuner" in res
+    assert res["knob_tuner"]["staging_validated"] is True
+
+
+@patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.rewriter_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.tuner_pipeline", new_callable=AsyncMock)
+def test_run_pipeline_knob_tuner_missing_artifact_is_empty(
+    mock_tuner, mock_rewriter, mock_intent, tmp_path
+):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+    tuner_run_dir = tmp_path / "tuner_run"
+    tuner_run_dir.mkdir()
+
+    mock_intent.return_value = {"workload_info": {"query_types": ["SELECT"]}}
+    # run_dir exists but has no result.json yet: the combined field is empty.
+    mock_tuner.return_value = {"run_dir": str(tuner_run_dir)}
+
+    res = asyncio.run(
+        run_pipeline(
+            target=str(target_dir),
+            mode="tune-only",
+            log_file=str(tmp_path / "adco.log"),
+            output_path=str(tmp_path / "result.json"),
+            db_name="testdb",
+        )
+    )
+
+    assert res["knob_tuner"] == {}
 
 
 @patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)
@@ -216,13 +281,48 @@ def test_run_pipeline_forwards_screening_config_to_tuner(
             output_path=str(out_file),
             db_name="testdb",
             screening_benchmark="pgbench",
-            workload_hint="Analytical GROUP BY spills to disk",
         )
     )
 
     extra = mock_tuner.call_args.kwargs["extra_initial_state"]
     assert extra["screening_benchmark"] == "pgbench"
-    assert extra["workload_hint"] == "Analytical GROUP BY spills to disk"
+    assert extra["measure_reps"] == 10
+    assert extra["measure_seconds"] == 10
+    assert extra["measure_warmup_seconds"] == 2
+    assert extra["early_stop_min_reps"] == 4
+
+
+@patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.rewriter_pipeline", new_callable=AsyncMock)
+@patch("src.adco.main.tuner_pipeline", new_callable=AsyncMock)
+def test_run_pipeline_clamps_timing_before_forwarding(
+    mock_tuner, mock_rewriter, mock_intent, tmp_path
+):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+
+    mock_intent.return_value = {"workload_info": {"query_types": ["SELECT"]}}
+    mock_tuner.return_value = {"staging_validated": True}
+
+    asyncio.run(
+        run_pipeline(
+            target=str(target_dir),
+            mode="tune-only",
+            log_file=str(tmp_path / "adco.log"),
+            output_path=str(tmp_path / "result.json"),
+            db_name="testdb",
+            measure_reps=0,
+            measure_seconds=0,
+            measure_warmup_seconds=0,
+            early_stop_min_reps=0,
+        )
+    )
+
+    extra = mock_tuner.call_args.kwargs["extra_initial_state"]
+    assert extra["measure_reps"] == 2
+    assert extra["measure_seconds"] == 1
+    assert extra["measure_warmup_seconds"] == 0
+    assert extra["early_stop_min_reps"] == 2
 
 
 @patch("src.adco.main.intent_analyzer_pipeline", new_callable=AsyncMock)
@@ -653,4 +753,4 @@ def test_main_valid_budget_reaches_auth(monkeypatch, capsys, tmp_path):
     assert exc_info.value.code == 0
     assert mock_auth.called
     assert mock_run.called
-    assert mock_run.call_args.kwargs["apply_mode"] == "dynamic"
+    assert mock_run.call_args.kwargs["apply_mode"] == "live"

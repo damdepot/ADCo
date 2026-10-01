@@ -120,7 +120,9 @@ def welch_delta(
     }
 
 
-def p_win(baseline_samples: list[float], tuned_samples: list[float]) -> float:
+def p_win(
+    baseline_samples: list[float], tuned_samples: list[float]
+) -> float | None:
     """One-sided Welch ``P(tuned mean > baseline mean)`` in ``[0, 1]``.
 
     The t-statistic (``mean_delta_pct / se_pct``) and Welch ``df`` come from
@@ -128,35 +130,37 @@ def p_win(baseline_samples: list[float], tuned_samples: list[float]) -> float:
     (scipy is a required dependency).
     Sanity: a clear win returns ~1, pure noise ~0.5, a clear loss ~0.
     Insufficient evidence (fewer than two samples per arm, non-positive
-    baseline mean, or ``df < 1``) returns 0.5 (no information either way);
-    a degenerate zero-variance pair returns 1.0/0.0 by the sign of the delta.
-    Never throws: bad input returns 0.5.
+    baseline mean, ``df < 1``, unparseable input, or a CDF failure) returns
+    ``None`` — no evidence — so callers can tell "failed" apart from a
+    genuine ~0.5 toss-up; a degenerate zero-variance pair returns 1.0/0.0 by
+    the sign of the delta (an identical pair has no evidence: ``None``).
+    Never throws: bad input returns ``None``.
     """
     try:
         baseline = [float(x) for x in (baseline_samples or [])]
         tuned = [float(x) for x in (tuned_samples or [])]
     except (TypeError, ValueError):
-        return 0.5
+        return None
     try:
         stats = welch_delta(baseline, tuned)
     except Exception:  # noqa: BLE001 - p_win never throws
-        return 0.5
+        return None
     try:
         if not stats.get("sufficient", False):
-            return 0.5
+            return None
         df = float(stats.get("df", 0.0) or 0.0)
         if df < 1.0:
-            return 0.5
+            return None
         delta = float(stats.get("mean_delta_pct", 0.0) or 0.0)
         se = float(stats.get("se_pct", 0.0) or 0.0)
     except (TypeError, ValueError):
-        return 0.5
+        return None
     if se <= 0.0:
         if delta > 0.0:
             return 1.0
         if delta < 0.0:
             return 0.0
-        return 0.5
+        return None
     t_stat = delta / se
     if t_stat >= 1e6:
         return 1.0
@@ -165,7 +169,7 @@ def p_win(baseline_samples: list[float], tuned_samples: list[float]) -> float:
     try:
         return min(1.0, max(0.0, float(_t_dist.cdf(t_stat, df))))
     except Exception:  # noqa: BLE001 - p_win never throws
-        return 0.5
+        return None
 
 
 def futility_stop(

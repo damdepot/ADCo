@@ -148,7 +148,7 @@ def test_rewrite_imports_import_pkg_sub_worker_as_worker(temp_sandbox_root):
         test_file = os.path.join(dest, "worker_test.py")
         Path(test_file).write_text("import pkg.sub.worker as worker\n")
 
-        count = rewrite_imports(dest, source_root)
+        _count = rewrite_imports(dest, source_root)
         rewritten = Path(test_file).read_text()
         assert "import worker as worker" in rewritten
         assert "pkg.sub.worker" not in rewritten
@@ -171,7 +171,7 @@ def test_rewrite_imports_dunder_import(temp_sandbox_root):
         test_file = os.path.join(dest, "dynamic_test.py")
         Path(test_file).write_text("__import__('pkg.sub.drivers.X')\n")
 
-        count = rewrite_imports(dest, source_root)
+        _count = rewrite_imports(dest, source_root)
         rewritten = Path(test_file).read_text()
         assert "__import__('drivers.X')" in rewritten
         assert "pkg.sub.drivers" not in rewritten
@@ -195,7 +195,7 @@ def test_rewrite_imports_from_pkg_sub_import_constants(temp_sandbox_root):
         test_file = os.path.join(dest, "constants_test.py")
         Path(test_file).write_text("from pkg.sub import constants\n")
 
-        count = rewrite_imports(dest, source_root)
+        _count = rewrite_imports(dest, source_root)
         rewritten = Path(test_file).read_text()
         assert "import constants" in rewritten
         assert "from pkg.sub import" not in rewritten

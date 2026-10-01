@@ -7,11 +7,7 @@ from src.knob_tuner.sub_agents.db_inspector.tools import (
     check_schema,
     extract_knobs,
 )
-
-
-class _Ctx:
-    def __init__(self, state):
-        self.state = state
+from tests.test_knob_tuner.conftest import FakeCtx as _Ctx
 
 
 def test_check_schema_analyzes_before_reading_row_estimates():

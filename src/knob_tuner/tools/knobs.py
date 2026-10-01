@@ -11,12 +11,15 @@ from src.knob_tuner.contracts import (
     SysbenchProfile,
 )
 from src.knob_tuner.tools.db_connector import DBConfig
-from src.knob_tuner.tools.knob_scope import build_knob_plan
+from src.knob_tuner.tools.knob_scope import build_knob_plan, requires_restart
 
 
 _APPLY_MODE_ALIASES = {
-    "safe-auto": ApplyMode.DYNAMIC,
-    "maintenance-assisted": ApplyMode.PERSIST_STATIC,
+    "dynamic": ApplyMode.LIVE,
+    "safe-auto": ApplyMode.LIVE,
+    "persist-static": ApplyMode.MANUAL,
+    "maintenance-assisted": ApplyMode.MANUAL,
+    "maintenance_assisted": ApplyMode.MANUAL,
 }
 
 
@@ -24,16 +27,15 @@ def coerce_apply_mode(value: Any) -> ApplyMode:
     """Best-effort conversion of a raw apply-mode value to ``ApplyMode``."""
     if isinstance(value, ApplyMode):
         return value
-    try:
-        text = str(value).strip().lower()
-    except AttributeError:
-        return ApplyMode.DYNAMIC
+    if not isinstance(value, str):
+        return ApplyMode.LIVE
+    text = value.strip().lower()
     if text in _APPLY_MODE_ALIASES:
         return _APPLY_MODE_ALIASES[text]
     try:
         return ApplyMode(text)
     except ValueError:
-        return ApplyMode.DYNAMIC
+        return ApplyMode.LIVE
 
 
 def coerce_profile(value: Any) -> SysbenchProfile:
@@ -69,12 +71,8 @@ def coerce_db_config(value: Any) -> DBConfig | None:
                 port=int(value.get("port", default_port)),
                 user=value.get("user", ""),
                 password=value.get("password", ""),
-                database=(
-                    value.get("database")
-                    or value.get("db_name")
-                    or value.get("dbname")
-                    or ""
-                ),
+                # R3: canonical database name only (db_name/dbname mirrors deleted).
+                database=(value.get("database") or ""),
                 db_type=db_type,
                 env=value.get("env", "staging"),
                 restart_type=value.get("restart_type", "docker"),
@@ -181,7 +179,10 @@ def build_plan(
         if raw.get("name") and raw.get("restart_required")
     }
     for spec in plan.knobs:
-        if spec.scope == KnobScope.UNKNOWN and spec.name in raw_restart:
+        # Phase 4.7: single requires_restart helper (UNKNOWN-scope preserve).
+        if spec.scope == KnobScope.UNKNOWN and requires_restart(
+            scope=spec.scope, restart_required=spec.name in raw_restart
+        ):
             spec.restart_required = True
 
     return plan

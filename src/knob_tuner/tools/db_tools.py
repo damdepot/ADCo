@@ -6,6 +6,7 @@ from typing import Any
 from src.knob_tuner.contracts import ApplyMode, KnobScope
 
 from .db_connector import DBConfig, get_connection, run_safe_query
+from .knob_scope import requires_restart
 from .knobs import coerce_apply_mode
 
 
@@ -82,17 +83,17 @@ def resolve_knob_scope(item: dict[str, Any]) -> KnobScope:
 
 
 def _knob_requires_restart(item: dict[str, Any], scope: KnobScope) -> bool:
-    """Whether the knob needs a restart (explicit flag or POSTMASTER scope)."""
-    return bool(item.get("restart_required")) or scope == KnobScope.POSTMASTER
+    """Whether the knob needs a restart (Phase 4.7: single helper)."""
+    return requires_restart(item, scope=scope)
 
 
 def _applies_in_mode(scope: KnobScope, mode: ApplyMode) -> bool:
     """Return True when ``scope`` should be applied under ``mode``."""
     if scope == KnobScope.INTERNAL:
         return False
-    if mode == ApplyMode.DYNAMIC:
+    if mode == ApplyMode.LIVE:
         return scope not in (KnobScope.POSTMASTER, KnobScope.INTERNAL)
-    if mode == ApplyMode.PERSIST_STATIC:
+    if mode == ApplyMode.MANUAL:
         # Apply the full plan: reloadable knobs go live, restart-required knobs
         # are persisted and only activated by the operator's manual restart.
         return True
@@ -103,7 +104,7 @@ def apply_knobs(
     knobs: list[dict[str, Any]],
     cfg: DBConfig,
     dry_run: bool = False,
-    mode: ApplyMode = ApplyMode.DYNAMIC,
+    mode: ApplyMode = ApplyMode.LIVE,
 ) -> list[dict[str, Any]]:
     """Apply database configuration knobs to the target database.
 
@@ -113,7 +114,7 @@ def apply_knobs(
                'restart_required'.
         cfg: DBConfig object.
         dry_run: If True, only plan the SQL queries without executing them.
-        mode: Apply semantics (NONE/DYNAMIC/PERSIST_STATIC).
+        mode: Apply semantics (NONE/LIVE/MANUAL).
 
     Returns:
         List of dictionaries with ``knob``, ``value``, ``status``, ``sql`` and
@@ -251,7 +252,7 @@ def apply_knobs(
             # until the operator's manual restart.
             if (
                 cfg.db_type.lower() in ("postgres", "postgresql")
-                and mode in (ApplyMode.DYNAMIC, ApplyMode.PERSIST_STATIC)
+                and mode in (ApplyMode.LIVE, ApplyMode.MANUAL)
             ):
                 try:
                     cursor.execute("SELECT pg_reload_conf();")
@@ -641,7 +642,8 @@ def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> 
                 if isinstance(row, dict):
                     k = row.get("VARIABLE_NAME") or row.get("Variable_name")
                     v = row.get("VARIABLE_VALUE") or row.get("Value")
-                    if k: settings_map[k.lower()] = v
+                    if k:
+                        settings_map[k.lower()] = v
                 else:
                     settings_map[str(row[0]).lower()] = row[1]
                     

@@ -231,21 +231,27 @@ def test_coerce_profile_passthrough_instance():
 
 
 def test_coerce_apply_mode_enum_passthrough():
-    assert coerce_apply_mode(ApplyMode.PERSIST_STATIC) == ApplyMode.PERSIST_STATIC
+    assert coerce_apply_mode(ApplyMode.MANUAL) == ApplyMode.MANUAL
 
 
 def test_coerce_apply_mode_string():
-    assert coerce_apply_mode("persist-static") == ApplyMode.PERSIST_STATIC
+    assert coerce_apply_mode("manual") == ApplyMode.MANUAL
+    assert coerce_apply_mode("live") == ApplyMode.LIVE
 
 
-def test_coerce_apply_mode_invalid_returns_dynamic():
-    assert coerce_apply_mode("bogus") == ApplyMode.DYNAMIC
+def test_coerce_apply_mode_invalid_returns_live():
+    assert coerce_apply_mode("bogus") == ApplyMode.LIVE
+    assert coerce_apply_mode(None) == ApplyMode.LIVE
+    assert coerce_apply_mode(123) == ApplyMode.LIVE
 
 
 def test_coerce_apply_mode_aliases():
-    assert coerce_apply_mode("safe-auto") == ApplyMode.DYNAMIC
-    assert coerce_apply_mode("maintenance-assisted") == ApplyMode.PERSIST_STATIC
-    assert coerce_apply_mode("unknown") == ApplyMode.DYNAMIC
+    assert coerce_apply_mode("dynamic") == ApplyMode.LIVE
+    assert coerce_apply_mode("safe-auto") == ApplyMode.LIVE
+    assert coerce_apply_mode("persist-static") == ApplyMode.MANUAL
+    assert coerce_apply_mode("maintenance-assisted") == ApplyMode.MANUAL
+    assert coerce_apply_mode("maintenance_assisted") == ApplyMode.MANUAL
+    assert coerce_apply_mode("unknown") == ApplyMode.LIVE
 
 
 # ---------------------------------------------------------------------------

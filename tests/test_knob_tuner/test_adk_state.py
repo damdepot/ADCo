@@ -19,14 +19,7 @@ from src.knob_tuner.stages.models import (
     ScreenVerdict,
 )
 from src.knob_tuner.sub_agents.db_inspector.models import DbInspectorOutput
-
-
-class AdkCtx:
-    """Minimal ctx carrying a real ADK State (like the live runner)."""
-
-    def __init__(self, **seed):
-        self.state = State(value=dict(seed), delta={})
-        self.route = None
+from tests.test_knob_tuner.conftest import AdkCtx
 
 
 def _seed_inventory(ctx: AdkCtx) -> None:
@@ -62,11 +55,32 @@ def test_state_is_not_a_dict_and_not_copyable():
 
 
 def test_state_helper_returns_live_mapping():
-    ctx = AdkCtx(attempt=0)
+    ctx = AdkCtx(validation_attempt_count=0)
     live = nodes._state(ctx)
     assert live is ctx.state
-    live["attempt"] = 7
-    assert ctx.state["attempt"] == 7
+    live["validation_attempt_count"] = 7
+    assert ctx.state["validation_attempt_count"] == 7
+
+
+def test_state_helper_rejects_detached_copy():
+    """A broken ctx must raise, never yield a disconnected {}.
+
+    The old ``dict(state or {})`` fallback silently lost writes (attempt
+    counter unreachable → runaway loop); failure visibility requires the
+    loud TypeError instead.
+    """
+
+    class _BrokenCtx:
+        state = None
+
+    with pytest.raises(TypeError):
+        nodes._state(_BrokenCtx())
+
+    class _NoStateCtx:
+        pass
+
+    with pytest.raises(TypeError):
+        nodes._state(_NoStateCtx())
 
 
 def _fail_validate(**kwargs):
@@ -111,14 +125,14 @@ def test_controller_attempt_persists_to_cap_with_real_state():
             ctx, _compiled_fail(exp_name=f"e{i}"), validate_fn=_fail_validate
         )
         assert verdict.status == "FAIL"
-        assert ctx.state["attempt"] == expected  # persisted, not recomputed
+        assert ctx.state["validation_attempt_count"] == expected  # persisted, not recomputed
         out = nodes.confirmation_controller(
             ctx,
             DiagnosisOutput(
                 correction="drop_knob", targets=["work_mem"], rationale="bad", confidence=0.7
             ),
         )
-        assert ctx.state["attempt"] == expected  # controller never recounts
+        assert ctx.state["validation_attempt_count"] == expected  # controller never recounts
         assert len(ctx.state["experiment_history"]) == expected
         routes.append(out["route"])
     assert routes == ["retry", "retry", "done"]
@@ -195,7 +209,7 @@ def test_prepare_run_persists_max_attempts_with_real_state(tmp_path):
             ),
         )
         last_route = out["route"]
-    assert out["attempt"] == 4
+    assert out["validation_attempt_count"] == 4
     assert last_route == "done"
     assert out.get("reason") == "attempt_cap"
 

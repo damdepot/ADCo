@@ -1,5 +1,3 @@
-import pytest
-from src.code_rewriter.models.ast_models import SourceLocation
 from src.code_rewriter.tools.ast_analyzer import analyze_source
 from src.code_rewriter.tools.rewrite_contract import build_rewrite_contract
 from src.code_rewriter.models.rewrite_models import RewriteTarget
@@ -295,7 +293,7 @@ def batched(cursor, ids):
 """
     analysis = analyze_source(source, "test.py")
     func = next(f for f in analysis.functions if f.name == "batched")
-    by_line = {op.source_location.start_line: op for op in func.database_operations}
+    _by_line = {op.source_location.start_line: op for op in func.database_operations}
 
     fetchall_op = next(op for op in func.database_operations if op.call_name == "fetchall")
     assert fetchall_op.inside_loop is False

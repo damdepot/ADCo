@@ -32,7 +32,7 @@ def _state(**overrides) -> dict:
         },
         "rejected_history": ["no improvement"],
         "resource_budget": {"cpu": 4, "memory_gb": 8},
-        "attempt": 2,
+        "validation_attempt_count": 2,
         "max_attempts": 6,
     }
     state.update(overrides)
@@ -48,6 +48,44 @@ def test_bundle_table_correctness():
     assert "Last verdict" in text
     assert "+2.00%" in text  # last-verdict mean
     assert "no improvement" in text
+
+
+def test_bundle_resource_line_prefers_cpu_cores():
+    text = build_evidence_bundle(
+        _state(resource_budget={"cpu_cores": 16, "memory_gb": 8})
+    )
+    assert "cpu=16" in text
+    # Legacy keys still render as a fallback.
+    text_legacy = build_evidence_bundle(
+        _state(resource_budget={"cpu": 4, "memory_gb": 8})
+    )
+    assert "cpu=4" in text_legacy
+
+
+def test_bundle_missing_measurement_renders_na_not_zero():
+    state = _state(
+        experiment_history=[
+            {
+                "name": "exp_x",
+                "phase": "screen",
+                "n_knobs": 1,
+                "mean_delta_pct": None,
+                "lcb_pct": None,
+                "status": "FAIL",
+                "confirmed": False,
+            }
+        ],
+        last_screen_row={
+            "arm": "exp_x",
+            "phase": "screen",
+            "status": "FAIL",
+            "confirmed": False,
+            "reasons": ["boom"],
+        },
+    )
+    text = build_evidence_bundle(state)
+    assert "n/a" in text
+    assert "+0.00%" not in text
 
 
 def test_bundle_truncation_cap():
