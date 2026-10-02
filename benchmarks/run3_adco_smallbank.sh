@@ -4,21 +4,24 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="${ROOT}/benchmarks/scripts"
 
+export BENCH_CMDRUNTPCC="${SCRIPTS}/smallbank.sh"
+export ACCOUNTS="${ACCOUNTS:-1000000}"
+
 source "${SCRIPTS}/bench_lib.sh"
 
 CMDRunADCo="${SCRIPTS}/adco.sh"
 
-dir_name="tpcc"
+dir_name="smallbank"
 db_type="postgres"
-db_name="tpcc"
+db_name="smallbank"
 
-RESULTS_DIR="${ROOT}/results/tpcc"
+RESULTS_DIR="${ROOT}/results/smallbank"
 mkdir -p "${RESULTS_DIR}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 
 run_adco_tool() {
     if ! "${CMDRunADCo}" "${dir_name}" "${db_type}" "${db_name}" "${CPU_CORES}" "${MEMORY_GB}"; then
-        echo "ERROR: ADCo tuning failed; skipping post-ADCo TPCC measurement and CSV." >&2
+        echo "ERROR: ADCo tuning failed; skipping post-ADCo SmallBank measurement and CSV." >&2
         return 1
     fi
 }
@@ -30,4 +33,4 @@ bench_arm "baseline" "baseline"
 
 # ADCo rewrites the app and tunes knobs; same symmetric protocol with the tool.
 echo "----------------->> ADCo <<-----------------"
-bench_arm "adco" "tpcc_adco" run_adco_tool
+bench_arm "adco" "smallbank_adco" run_adco_tool

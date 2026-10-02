@@ -4,15 +4,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="${ROOT}/benchmarks/scripts"
 
+export BENCH_CMDRUNTPCC="${SCRIPTS}/smallbank.sh"
+export ACCOUNTS="${ACCOUNTS:-1000000}"
+
 source "${SCRIPTS}/bench_lib.sh"
 
 CMDRunACo="${SCRIPTS}/aco.sh"
 
-dir_name="tpcc"
+dir_name="smallbank"
 db_type="postgres"
-db_name="tpcc"
+db_name="smallbank"
 
-RESULTS_DIR="${ROOT}/results/tpcc"
+RESULTS_DIR="${ROOT}/results/smallbank"
 mkdir -p "${RESULTS_DIR}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 
@@ -28,4 +31,4 @@ bench_arm "baseline" "baseline"
 # ACo is rewrite-only: it does not tune the DB. The same reset -> load -> tool
 # -> restart -> clean reload -> measure protocol is applied for uniformity.
 echo "----------------->> ACo <<-----------------"
-bench_arm "aco" "tpcc_aco" run_aco_tool
+bench_arm "aco" "smallbank_aco" run_aco_tool

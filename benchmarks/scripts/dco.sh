@@ -14,24 +14,25 @@ exp_path="$(cd "$(dirname "$0")/../.." && pwd)"
 source_dir="${exp_path}/benchmarks/tools/$dir_name"
 
 
-# Durability policy is opt-in via the environment; default stays strict.
-durability_profile="${DURABILITY_PROFILE:-strict}"
-
 # Screening dataset sizing. Raise SCREEN_MAX_ROWS when the target's working set
 # exceeds the instance memory: otherwise the proxy dataset stays cache-resident
 # and the gate is blind to memory-knob improvements.
 screen_total_rows="${SCREEN_TOTAL_ROWS:-0}"
 screen_max_rows="${SCREEN_MAX_ROWS:-5000000}"
-confirm_repetitions="${CONFIRM_REPETITIONS:-5}"
 
 # Screening gate measurement: sysbench OLTP (default) or pgbench sort/hash.
 screening_benchmark="${SCREENING_BENCHMARK:-sysbench}"
 
-# Human-readable production workload context shown to the recommender.
-workload_hint="${WORKLOAD_HINT:-}"
+# Measurement timing. Defaults match the tuner CLI (10/10/2/4).
+measure_reps="${MEASURE_REPS:-10}"
+measure_seconds="${MEASURE_SECONDS:-10}"
+measure_warmup_seconds="${MEASURE_WARMUP_SECONDS:-2}"
+early_stop_min_reps="${EARLY_STOP_MIN_REPS:-4}"
 
-# Arguments are passed positionally (rather than through a word-split command
-# string) so a multi-word workload hint survives as a single argv element.
+# Tuner loop caps. Defaults match the tuner (10/20).
+max_attempts="${MAX_ATTEMPTS:-10}"
+max_set_knobs="${MAX_SET_KNOBS:-20}"
+
 uv run python -m src.adco "$source_dir" \
     --model=gemini-3.5-flash-lite \
     --mode=tune-only \
@@ -39,11 +40,14 @@ uv run python -m src.adco "$source_dir" \
     --db-name="$db_name" \
     --cpu-cores="$cpu_cores" \
     --memory="$memory_gb" \
-    --apply-mode=persist-static \
-    --durability-profile="$durability_profile" \
+    --apply-mode=live \
     --screen-total-rows="$screen_total_rows" \
     --screen-max-rows="$screen_max_rows" \
-    --confirm-repetitions="$confirm_repetitions" \
     --screening-benchmark="$screening_benchmark" \
-    --workload-hint="$workload_hint" \
+    --measure-reps="$measure_reps" \
+    --measure-seconds="$measure_seconds" \
+    --measure-warmup-seconds="$measure_warmup_seconds" \
+    --early-stop-min-reps="$early_stop_min_reps" \
+    --max-attempts="$max_attempts" \
+    --max-set-knobs="$max_set_knobs" \
     --verbose

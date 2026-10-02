@@ -22,6 +22,6 @@ CMD="uv run python -m src.adco $source_dir \
             --db-name=$db_name \
             --cpu-cores=$cpu_cores \
             --memory=$memory_gb \
-            --apply-mode=persist-static \
+            --apply-mode=live \
             --verbose"
 $CMD
