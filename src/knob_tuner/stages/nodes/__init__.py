@@ -22,12 +22,15 @@ from src.knob_tuner.stages.nodes.accounting import (
     structure_staging_issues as structure_staging_issues,
 )
 from src.knob_tuner.stages.nodes.preflight_decision import (
-    _extract_winner_plan as _extract_winner_plan,
-)
-from src.knob_tuner.stages.nodes.preflight_decision import (
     decision,
     prepare_run,
     production_preflight,
+)
+from src.knob_tuner.stages.nodes.preflight_decision import (
+    _extract_winner_plan as _extract_winner_plan,
+)
+from src.knob_tuner.stages.nodes.preflight_decision import (
+    confirm_winner as confirm_winner,
 )
 from src.knob_tuner.stages.nodes.stats_coercion import (
     _baseline_cache_key as _baseline_cache_key,
@@ -42,6 +45,7 @@ from src.knob_tuner.stages.nodes.stats_coercion import (
 __all__ = [
     "compile_candidate",
     "confirmation_controller",
+    "confirm_winner",
     "decision",
     "materialize_inventory",
     "prepare_run",

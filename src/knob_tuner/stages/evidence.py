@@ -193,6 +193,27 @@ def _last_verdict_lines(state: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _winners_line(state: Mapping[str, Any]) -> str:
+    """Render the compounding-campaign winner progress line.
+
+    ``Winners 3/10 (lcb >= 5.0%)`` — found/target plus the bar, so the
+    diagnosis agent can see a winner stop is premature while short of target.
+    Never throws.
+    """
+    try:
+        found = int(state.get("winners_found", 0) or 0)
+    except (TypeError, ValueError):
+        found = 0
+    try:
+        target = int(state.get("success_candidates_target", 0) or 0)
+    except (TypeError, ValueError):
+        target = 0
+    min_pct = state.get("min_improvement_pct_state")
+    if min_pct is None:
+        min_pct = 0.0
+    return f"Winners {found}/{target} (lcb >= {_num(min_pct):.1f}%)"
+
+
 def build_evidence_bundle(state: Mapping[str, Any] | None) -> str:
     """Render a capped markdown evidence bundle from a state mapping."""
     try:
@@ -210,6 +231,7 @@ def build_evidence_bundle(state: Mapping[str, Any] | None) -> str:
         head = [
             "## Evidence bundle",
             f"Attempt {attempt_s}/{total_s}",
+            _winners_line(state),
             _resource_line(state),
             f"### Experiment history ({len(rows)} runs)",
         ]

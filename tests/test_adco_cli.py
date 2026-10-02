@@ -60,6 +60,7 @@ def test_build_parser():
     assert args.buffer_time == 0.0
     assert args.screening_benchmark == "sysbench"
     assert args.max_attempts == 10
+    assert args.success_candidates == 10
     assert args.measure_reps == 10
     assert args.measure_seconds == 10
     assert args.measure_warmup_seconds == 2
@@ -86,6 +87,7 @@ def test_build_parser_custom_options():
         "--measure-warmup-seconds", "1",
         "--early-stop-min-reps", "2",
         "--max-attempts", "7",
+        "--success-candidates", "3",
     ])
     assert args.target == "my_target"
     assert args.db_name == "my_db"
@@ -104,6 +106,7 @@ def test_build_parser_custom_options():
     assert args.measure_warmup_seconds == 1
     assert args.early_stop_min_reps == 2
     assert args.max_attempts == 7
+    assert args.success_candidates == 3
 
 
 def test_build_parser_apply_mode_choices_are_canonical_only():

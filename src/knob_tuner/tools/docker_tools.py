@@ -323,6 +323,124 @@ def cleanup_orphan_containers() -> int:
         return 0
 
 
+def _parse_pruned_volume_count(output: str) -> int:
+    """Count volume names under the ``Deleted Volumes:`` block of prune output.
+
+    Returns 0 when the block is absent or unparseable (best-effort).
+    """
+    count = 0
+    in_block = False
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("deleted volumes"):
+            in_block = True
+            continue
+        if in_block:
+            if not stripped:
+                break
+            count += 1
+    return count
+
+
+def prune_staging_artifacts() -> dict[str, int]:
+    """Best-effort removal of leftover staging containers, snapshots and volumes.
+
+    Removes containers labeled ``managed-by=adco-knob-tuner``, any remaining
+    containers named ``adco-staging-*``, snapshot images tagged
+    ``adco-staging-ready:*``, and prunes dangling anonymous volumes.
+
+    Returns:
+        Dict of removed artifact counts with keys ``containers``, ``images`` and
+        ``volumes``. Never raises; any failed step contributes 0.
+    """
+    counts = {"containers": 0, "images": 0, "volumes": 0}
+
+    # 1. Containers explicitly labeled as managed by knob_tuner.
+    try:
+        counts["containers"] += cleanup_orphan_containers()
+    except Exception:
+        pass
+
+    # 2. Any remaining adco-staging-* containers (stopped, created or running).
+    try:
+        proc = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", "name=adco-staging-"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode == 0:
+            container_ids = [
+                cid.strip() for cid in proc.stdout.strip().split() if cid.strip()
+            ]
+            if container_ids:
+                rm_proc = subprocess.run(
+                    ["docker", "rm", "-f", "-v"] + container_ids,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if rm_proc.returncode == 0:
+                    counts["containers"] += len(container_ids)
+                else:
+                    counts["containers"] += len(
+                        [
+                            line
+                            for line in rm_proc.stdout.strip().splitlines()
+                            if line.strip()
+                        ]
+                    )
+    except Exception:
+        pass
+
+    # 3. Prepared-dataset snapshot images tagged adco-staging-ready:*.
+    try:
+        proc = subprocess.run(
+            ["docker", "images", "-q", "--filter", "reference=adco-staging-ready:*"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode == 0:
+            image_ids = [
+                iid.strip() for iid in proc.stdout.strip().split() if iid.strip()
+            ]
+            if image_ids:
+                rm_proc = subprocess.run(
+                    ["docker", "rmi", "-f"] + image_ids,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if rm_proc.returncode == 0:
+                    counts["images"] += len(image_ids)
+                else:
+                    counts["images"] += len(
+                        [
+                            line
+                            for line in rm_proc.stdout.strip().splitlines()
+                            if line.strip()
+                        ]
+                    )
+    except Exception:
+        pass
+
+    # 4. Dangling anonymous volumes left behind by the postgres image VOLUME.
+    try:
+        proc = subprocess.run(
+            ["docker", "volume", "prune", "-f"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if proc.returncode == 0:
+            counts["volumes"] += _parse_pruned_volume_count(proc.stdout)
+    except Exception:
+        pass
+
+    return counts
+
+
 def verify_container_resources(
     container_name: str, budget: ResourceBudget
 ) -> tuple[bool, str]:

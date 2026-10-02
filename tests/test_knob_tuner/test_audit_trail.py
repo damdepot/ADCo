@@ -335,3 +335,23 @@ def test_crash_still_leaves_manifest_and_result(tmp_path: Path):
     assert any("Runner crashed" in err for err in manifest["errors"])
     assert result["status"] == "FAIL"
     assert os.path.isfile(run_dirs[0] / "result.json")
+
+
+def test_snapshot_cleanup_deferred_to_finalize_not_decision():
+    # Regression: the confirmation node runs AFTER decision_node and reuses the
+    # prepared-dataset snapshot. decision_node must NOT delete snapshot images,
+    # or the confirmation silently falls back to an empty stock image and the
+    # sysbench measurement crashes. Cleanup belongs in finalize_node.
+    state = {
+        "min_improvement_pct": 2.0,
+        "success_candidates": 1,
+        "all_rows": [],
+        "snapshot_registry": {"images": {"pg:17:10x10000": "adco-snapshot:pg17"}},
+    }
+    ctx = _FakeContext(state)
+    with patch("src.knob_tuner.workflow.cleanup_snapshot_image") as mock_cleanup:
+        decision_node(ctx)
+        assert not mock_cleanup.called, "decision_node must not delete snapshots"
+        finalize_node(ctx)
+        assert mock_cleanup.called, "finalize_node must delete run-scoped snapshots"
+        assert "adco-snapshot:pg17" in [c.args[0] for c in mock_cleanup.call_args_list]

@@ -123,3 +123,35 @@ def test_belief_table_cap_and_empty():
     assert len(data_rows) == 20
     assert "omitted" in text
     assert render_belief_table({}) == "No knob beliefs yet."
+
+
+# --- compounding campaign signals (Part 2) ---
+
+
+def test_bundle_shows_winners_progress_line():
+    text = build_evidence_bundle(
+        _state(
+            winners_found=3,
+            success_candidates_target=10,
+            min_improvement_pct_state=5.0,
+        )
+    )
+    assert "Winners 3/10" in text
+    assert "lcb >= 5.0%" in text
+
+
+def test_belief_table_has_cleared_column():
+    beliefs = {
+        "work_mem": {"best_delta_pct": 12.0, "n_seen": 2, "last_phase": "screen",
+                      "cleared": True},
+        "shared_buffers": {"best_delta_pct": 1.0, "n_seen": 1,
+                           "last_phase": "screen", "cleared": False},
+    }
+    text = render_belief_table(beliefs)
+    assert "cleared" in text
+    assert "yes" in text and "no" in text
+
+
+def test_belief_model_cleared_defaults_false():
+    assert KnobBelief().cleared is False
+    assert KnobBelief(cleared=True).cleared is True

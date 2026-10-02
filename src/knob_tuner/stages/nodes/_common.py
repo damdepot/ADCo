@@ -270,6 +270,123 @@ def _known_plan_hashes(state: Any) -> set[str]:
     return known
 
 
+def _plan_knob_names(plan: Any) -> set[str]:
+    """Return the lowercase distinct knob names in a plan dump (never throws)."""
+    names: set[str] = set()
+    try:
+        if isinstance(plan, dict) and isinstance(plan.get("knobs"), list):
+            for spec in plan["knobs"]:
+                if isinstance(spec, dict) and spec.get("name"):
+                    names.add(str(spec["name"]).strip().lower())
+    except Exception:
+        pass
+    return names
+
+
+def count_success_candidates(state: Any) -> int:
+    """Count LCB-clearing winner rows in ``experiment_history``.
+
+    A success candidate is a screen row whose ``lcb_pct`` exceeds the current
+    ``min_improvement_pct`` — the SAME definition the winner gate uses, so
+    "winner" has one meaning in the codebase. Pure read of persisted history;
+    no counter, so extra controller visits cannot double-count. Never throws.
+    """
+    threshold = get_min_improvement_pct(state)
+    count = 0
+    try:
+        hist = state.get("experiment_history") if hasattr(state, "get") else None
+        if isinstance(hist, list):
+            for entry in hist:
+                if not isinstance(entry, dict):
+                    continue
+                raw = entry.get("lcb_pct")
+                if raw is None:
+                    continue
+                try:
+                    lcb = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if lcb > threshold:
+                    count += 1
+    except Exception:
+        return 0
+    return count
+
+
+def _cleared_knob_sets(state: Any) -> list[set[str]]:
+    """Return the distinct knob sets of LCB-clearing arms (from ``all_rows``).
+
+    ``experiment_history`` rows carry only ``plan_hash`` (no knob list), so the
+    plan names come from ``all_rows``/``candidates``, joined by hash. Used by
+    the knob-set distinctness guard. Never throws.
+    """
+    threshold = get_min_improvement_pct(state)
+    wanted_hashes: set[str] = set()
+    try:
+        hist = state.get("experiment_history") if hasattr(state, "get") else None
+        if not isinstance(hist, list):
+            return []
+        for entry in hist:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("lcb_pct")
+            plan_hash = entry.get("plan_hash")
+            if raw is None or not plan_hash:
+                continue
+            try:
+                lcb = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if lcb > threshold:
+                wanted_hashes.add(str(plan_hash))
+    except Exception:
+        return []
+    if not wanted_hashes:
+        return []
+    by_hash: dict[str, set[str]] = {}
+    try:
+        for key in ("all_rows", "candidates"):
+            items = state.get(key) if hasattr(state, "get") else None
+            if not isinstance(items, list):
+                continue
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                plan_hash = entry.get("plan_hash")
+                if not plan_hash or str(plan_hash) not in wanted_hashes:
+                    continue
+                names = _plan_knob_names(entry.get("plan"))
+                if names:
+                    by_hash[str(plan_hash)] = names
+    except Exception:
+        return []
+    seen: set[frozenset[str]] = set()
+    out: list[set[str]] = []
+    for names in by_hash.values():
+        key = frozenset(names)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(names)
+    return out
+
+
+def success_knob_counts(state: Any) -> dict[str, int]:
+    """Count how many LCB-clearing arms each knob appeared in (never throws).
+
+    The exploitation signal the generator has never had: "these knobs are
+    known good". A knob credited across several clearing arms ranks highest.
+    Sourced from the clearing arms' knob sets (all_rows + history hashes).
+    """
+    counts: dict[str, int] = {}
+    try:
+        for names in _cleared_knob_sets(state):
+            for name in names:
+                counts[name] = counts.get(name, 0) + 1
+    except Exception:
+        return {}
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Loop accounting (attempt counting lives in the outcome producers)
 # ---------------------------------------------------------------------------

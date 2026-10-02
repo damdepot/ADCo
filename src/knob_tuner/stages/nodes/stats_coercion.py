@@ -21,6 +21,7 @@ from src.knob_tuner.contracts import (
     get_early_stop_min_reps,
     get_max_set_knobs,
     get_min_improvement_pct,
+    get_success_candidates,
     get_validation_attempt,
 )
 from src.knob_tuner.stages.memory_guard import clamp_memory_knobs
@@ -38,6 +39,7 @@ from src.knob_tuner.tools.knobs import build_plan
 from src.knob_tuner.tools.stats import p_win as _welch_p_win
 from src.knob_tuner.stages.nodes._common import (
     _VALID_EXPERIMENT_PHASES,
+    _cleared_knob_sets,
     _context_map_from_knobs_info,
     _inventory_by_name,
     _jsonable,
@@ -49,6 +51,7 @@ from src.knob_tuner.stages.nodes._common import (
     _resolve_db_config_for_context,
     _state,
     _validate_recommendations,
+    count_success_candidates,
 )
 from src.knob_tuner.stages.nodes.accounting import (
     _commit_rejection_accounting,
@@ -584,11 +587,23 @@ def _compile_candidate_inner(
             prev_map: dict[str, Any] | None = None
             violations: list[str] = []
             violation_errors: list[str] = []
+            # Compounding-DOE: a winner stop is only binding once the LCB
+            # quota is met. While collecting, the controller downgrades a
+            # winner stop to retry (quota_not_met); the stop must then NOT veto
+            # the generator's next proposal, or the campaign can never collect.
+            # Futility stops stay binding (the campaign is genuinely over).
+            quota_target = get_success_candidates(state)
+            winners_found = count_success_candidates(state)
             for diag in diags:
                 correction = _correction_str(diag)
                 targets = [str(t) for t in (diag.targets or [])]
                 targets_lower = {t.strip().lower() for t in targets if t.strip()}
                 if correction == "stop":
+                    if (
+                        _stop_reason_str(diag) == "winner"
+                        and winners_found < quota_target
+                    ):
+                        continue
                     violations.append(
                         f"stop: halted by diagnosis ({diag.rationale or 'no rationale'})"
                     )
@@ -682,6 +697,29 @@ def _compile_candidate_inner(
                     errors=[f"repeat plan_hash {proposed_hash}"],
                     design_name=exp_name,
                 )
+        except Exception:
+            pass
+        # Wave 2 / compounding campaign: distinctness guard on the knob SET
+        # (values ignored). An arm whose knob set already cleared the LCB bar
+        # must not be re-proposed — "10 successes" must mean 10 genuinely
+        # different combinations. Value-nudged variants of a NON-clearing set
+        # stay allowed; only clearing arms consume their set.
+        try:
+            proposed_names = frozenset(
+                str(spec.name).strip().lower() for spec in plan.knobs
+            )
+            if proposed_names:
+                for cleared in _cleared_knob_sets(state):
+                    if frozenset(cleared) == proposed_names:
+                        names = ", ".join(sorted(proposed_names))
+                        return CompileRejection(
+                            reason=(
+                                f"repeat knob set: {names} already cleared the "
+                                "lcb bar"
+                            ),
+                            errors=[f"repeat knob set: {names}"],
+                            design_name=exp_name,
+                        )
         except Exception:
             pass
         return CompiledPlan(
@@ -1176,6 +1214,12 @@ def confirmation_controller(
         route = "retry"
         reason = ""
         gate_info: dict[str, Any] = {}
+        # Compounding-DOE quota: a winner stop is premature while fewer than
+        # `target` arms have cleared the win gate. Same definition of winner
+        # as the winner gate (lcb_pct > min_improvement_pct), read from
+        # history so extra controller visits cannot double-count.
+        target = get_success_candidates(state)
+        winners_found = count_success_candidates(state)
         latest = _latest_diagnosis(state)
         if latest is not None and _correction_str(latest) == "stop":
             # Two-score STOP/NEXT gate: a stop halts only when the diagnosis
@@ -1198,6 +1242,11 @@ def confirmation_controller(
                         agreed, gate = True, "stop_agree_winner"
                 elif stat_p is None or stat_p <= fut_max:
                     agreed, gate = True, "stop_agree_futility"
+            if agreed and stop_reason == "winner" and winners_found < target:
+                # Quota not yet met: a winner stop becomes a continue. Futility
+                # stops still end the run (a dead campaign should not spin).
+                gate = "quota_not_met"
+                agreed = False
             gate_info = {
                 "diag_confidence": diag_conf,
                 "stat_p_win": stat_p,
@@ -1212,24 +1261,40 @@ def confirmation_controller(
             if agreed:
                 route = "done"
                 reason = "stopped_by_diagnosis"
+            elif gate == "quota_not_met":
+                reason = "quota_not_met"
             else:
                 reason = "diag_stat_disagree"
-        if route == "retry":
+        if route == "retry" or reason == "quota_not_met":
+            # Backstop: a latest confident win ends the campaign once the quota
+            # is met. While the quota is unmet the loop keeps collecting, but
+            # the caps below MUST still run — otherwise the campaign can never
+            # exit while collecting (infinite loop).
             mean, lcb, found = _latest_verdict_stats(state, node_input)
             if found and mean > 0 and lcb > _min_improvement_pct(state):
+                if winners_found >= target:
+                    route = "done"
+                    reason = "confident_win_backstop"
+                elif reason != "quota_not_met":
+                    # Keep the stop-downgrade reason when present; otherwise
+                    # name the collecting state explicitly.
+                    route = "retry"
+                    reason = "collecting_success_candidates"
+            try:
+                rc = int(state.get("retry_same_count", 0) or 0)
+            except (TypeError, ValueError):
+                rc = 0
+            if rc >= 2:
                 route = "done"
-                reason = "confident_win_backstop"
-            else:
-                try:
-                    rc = int(state.get("retry_same_count", 0) or 0)
-                except (TypeError, ValueError):
-                    rc = 0
-                if rc >= 2:
-                    route = "done"
-                    reason = "retry_same_exhausted"
-                elif attempt >= max_attempts:
-                    route = "done"
-                    reason = "attempt_cap"
+                reason = "retry_same_exhausted"
+            elif attempt >= max_attempts:
+                route = "done"
+                reason = "attempt_cap"
+        gate_info["success_candidates"] = {
+            "found": winners_found,
+            "target": target,
+            "min_improvement_pct": _min_improvement_pct(state),
+        }
         with contextlib.suppress(Exception):
             ctx.route = route
         out: dict[str, Any] = {

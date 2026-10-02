@@ -151,6 +151,7 @@ class KnobBelief(BaseModel):
     best_delta_pct: float = 0.0
     n_seen: int = 0
     last_phase: str = ""
+    cleared: bool = False
 
 
 def render_belief_table(beliefs: dict[str, KnobBelief]) -> str:
@@ -160,13 +161,14 @@ def render_belief_table(beliefs: dict[str, KnobBelief]) -> str:
     Never throws: bad input yields a short placeholder string.
     """
     try:
-        items: list[tuple[str, float, int, str]] = []
+        items: list[tuple[str, float, int, str, bool]] = []
         for name, belief in (beliefs or {}).items():
             if isinstance(belief, KnobBelief):
-                best, seen, phase = (
+                best, seen, phase, cleared = (
                     belief.best_delta_pct,
                     belief.n_seen,
                     belief.last_phase,
+                    belief.cleared,
                 )
             elif isinstance(belief, dict):
                 try:
@@ -178,18 +180,22 @@ def render_belief_table(beliefs: dict[str, KnobBelief]) -> str:
                 except (TypeError, ValueError):
                     seen = 0
                 phase = str(belief.get("last_phase", "") or "")
+                cleared = bool(belief.get("cleared", False))
             else:
                 continue
-            items.append((str(name), best, seen, phase))
+            items.append((str(name), best, seen, phase, cleared))
         if not items:
             return "No knob beliefs yet."
         items.sort(key=lambda item: item[1], reverse=True)
         lines = [
-            "| knob | best_delta_pct | n_seen | last_phase |",
-            "| --- | --- | --- | --- |",
+            "| knob | best_delta_pct | n_seen | last_phase | cleared |",
+            "| --- | --- | --- | --- | --- |",
         ]
-        for name, best, seen, phase in items[:20]:
-            lines.append(f"| {name} | {best:+.2f}% | {seen} | {phase} |")
+        for name, best, seen, phase, cleared in items[:20]:
+            lines.append(
+                f"| {name} | {best:+.2f}% | {seen} | {phase} | "
+                f"{'yes' if cleared else 'no'} |"
+            )
         if len(items) > 20:
             lines.append(f"... +{len(items) - 20} more omitted (cap 20)")
         return "\n".join(lines)

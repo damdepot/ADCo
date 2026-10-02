@@ -16,6 +16,8 @@ CANDIDATE_GENERATOR_PROMPT = """You are an expert database administrator (DBA) a
 - Diagnosis of the last failure: {diagnosis_output?}
 - Evidence bundle (quantitative history — prefer over prose when present): {evidence_bundle?}
 - Knob beliefs (best observed delta per knob, best first): {belief_table?}
+- Confirmed building blocks (knobs that cleared the win gate, most-cleared first): {success_knobs?}
+- Campaign directive (computed steering for this attempt): {campaign_directive?}
 - Hard constraints: excluded_knobs={excluded_knobs?} required_phase={required_phase?} max_knobs={max_knobs?}
 On the first iteration the history and diagnosis keys are empty: propose a fresh screen. On later iterations they carry the correction strategy and rejected sets you must respect. When {evidence_bundle?} or {belief_table?} are absent, fall back to {rejected_history?} and {diagnosis_output?} prose.
 
@@ -24,6 +26,7 @@ On the first iteration the history and diagnosis keys are empty: propose a fresh
 - Use ONLY knob names from the inspector findings / available-knob list. Never invent a knob.
 - Every level value MUST come from `read_knob_details` output (vartype, enumvals, min/max) and MUST DIFFER from its live current value.
 - Cap: at most 20 distinct knobs per proposal. Larger sets are rejected — keep every experiment attributable and cheap.
+- Obey the campaign directive ({campaign_directive?}): in EXPLOIT+EXPLORE mode seed the next arm from the confirmed building blocks ({success_knobs?}) and keep it to 2-4 knobs; in EXPLORE mode sweep untried knobs broadly. Never re-propose an arm whose knob set already cleared the win gate.
 - Apply the diagnosis strategy when present (shrink the set, change phase, drop a knob, adjust a value, retry, or stop); never repeat an identical rejected knob set.
 - Never persist, save, or record the proposal anywhere: return it only as the structured `CandidateProposal`.
 
@@ -59,7 +62,7 @@ When a diagnosis is present, apply its enum exactly:
 
 ## Method (chain-of-thought: characterize -> review -> shortlist -> fetch -> propose -> verify)
 1. Characterize the workload: read/write mix, concurrency, working-set vs buffer pool, likely bottleneck (cached reads vs commit/fsync vs locks vs checkpoint I/O).
- 2. Review history and diagnosis: read the evidence bundle table first (quantitative), then the diagnosis prose. Favor high-belief knobs from {belief_table?}; avoid knobs with repeated ~0 or negative mean deltas.
+ 2. Review history and diagnosis: read the evidence bundle table first (quantitative), then the diagnosis prose. Favor high-belief knobs from {belief_table?}; prefer knobs listed in {success_knobs?} (confirmed building blocks) when exploiting; avoid knobs with repeated ~0 or negative mean deltas.
  3. Shortlist only knobs plausibly affecting that bottleneck, spanning memory, checkpoint/WAL, planner, autovacuum, parallelism, I/O, client limits. Respect excluded knobs, required phase, and max-knobs constraints above.
 4. Fetch details with `read_knob_details` (comma-separated names) and strategy formulas with `get_knob_strategies`. Never guess a current value or constraint.
 5. Propose exactly ONE next experiment: pick the phase, choose levels differing from live.
@@ -74,6 +77,7 @@ When a diagnosis is present, apply its enum exactly:
 Before returning, verify:
 - [ ] Single experiment only: one name, one phase, one level set of at most 20 distinct knobs.
 - [ ] Phase is screen, interaction, or refinement.
+- [ ] Campaign directive honored: in EXPLOIT+EXPLORE the arm seeds from {success_knobs?} and stays small (2-4 knobs); no arm repeats a knob set that already cleared the win gate.
 - [ ] Set is not identical to any prior arm (evidence table); confirmed movers kept, rejected ones varied per diagnosis (retry_same is the only exception).
 - [ ] Correction enum honored (drop/shrink/phase/value/retry/stop) and hard constraints hold: no excluded knobs, phase equals required phase when set, knob count within max_knobs and 20.
 - [ ] Every level value came from `read_knob_details`, respects vartype/enumvals/min/max, and differs from live.

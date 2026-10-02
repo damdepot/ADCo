@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.knob_tuner.contracts import get_min_improvement_pct
 from src.knob_tuner.stages.nodes._common import (
     _ensure_list,
     _jsonable,
@@ -123,7 +124,19 @@ def _commit_screen_accounting(
     state["experiment_history"] = experiment_history
     state["rejected_history"] = rejected_history
     state["last_failure"] = list(rejected_history)
-    _credit_beliefs(state, _arm_knobs_for_beliefs(state), mean, phase or "screen")
+    cleared = False
+    try:
+        if lcb is not None:
+            cleared = float(lcb) > get_min_improvement_pct(state)
+    except (TypeError, ValueError):
+        cleared = False
+    _credit_beliefs(
+        state,
+        _arm_knobs_for_beliefs(state),
+        mean,
+        phase or "screen",
+        cleared=cleared,
+    )
     _sync_prompt_constraints(state)
     _refresh_memory(state)
     return new_attempt

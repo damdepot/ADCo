@@ -40,6 +40,7 @@ def _seed_inventory(ctx: AdkCtx) -> None:
             "durability_profile": "strict",
             "max_set_knobs": 20,
             "max_attempts": 6,
+            "success_candidates": 1,
         }
     )
 
@@ -506,3 +507,238 @@ def test_inactive_with_empty_history():
     assert ctx.state.get("excluded_knobs") == []
     assert ctx.state.get("required_phase") == ""
     assert ctx.state.get("max_knobs") == ""
+
+
+# --- compounding campaign signals (Part 2) ---
+
+
+def _campaign_state(**over):
+    state = {
+        "min_improvement_pct": 5.0,
+        "success_candidates": 3,
+        "validation_attempt_count": 2,
+        "max_attempts": 20,
+        "available_knob_names": ["work_mem", "shared_buffers", "wal_buffers",
+                                 "max_wal_size", "random_page_cost"],
+        "experiment_history": [
+            {"name": "e1", "phase": "screen", "n_knobs": 2,
+             "mean_delta_pct": 9.0, "lcb_pct": 6.0, "status": "PASS",
+             "confirmed": True, "plan_hash": "h1"},
+            {"name": "e2", "phase": "screen", "n_knobs": 2,
+             "mean_delta_pct": 7.0, "lcb_pct": 5.5, "status": "PASS",
+             "confirmed": True, "plan_hash": "h2"},
+            {"name": "e3", "phase": "screen", "n_knobs": 1,
+             "mean_delta_pct": 0.5, "lcb_pct": -0.5, "status": "FAIL",
+             "confirmed": False, "plan_hash": "h3"},
+        ],
+        "all_rows": [
+            {"plan_hash": "h1", "plan": {"knobs": [
+                {"name": "work_mem"}, {"name": "shared_buffers"}]}},
+            {"plan_hash": "h2", "plan": {"knobs": [
+                {"name": "work_mem"}, {"name": "max_wal_size"}]}},
+            {"plan_hash": "h3", "plan": {"knobs": [
+                {"name": "random_page_cost"}]}},
+        ],
+        "candidates": [],
+        "knob_beliefs": {
+            "work_mem": {"best_delta_pct": 9.0, "n_seen": 2,
+                          "last_phase": "screen", "cleared": True},
+            "random_page_cost": {"best_delta_pct": 0.5, "n_seen": 1,
+                                 "last_phase": "screen", "cleared": False},
+        },
+    }
+    state.update(over)
+    return state
+
+
+def test_success_knobs_only_from_clearing_arms():
+    from src.knob_tuner.stages.nodes import _common
+
+    counts = _common.success_knob_counts(_campaign_state())
+    # work_mem appeared in both clearing arms; random_page_cost only in the
+    # non-clearing arm and must be absent.
+    assert counts == {"work_mem": 2, "shared_buffers": 1, "max_wal_size": 1}
+    assert "random_page_cost" not in counts
+
+
+def test_success_knobs_rendered_ranked():
+    from src.knob_tuner.stages.nodes.diagnosis import render_success_knobs
+
+    text = render_success_knobs({"work_mem": 2, "shared_buffers": 1})
+    assert "work_mem" in text
+    # work_mem (2) ranks above shared_buffers (1)
+    assert text.index("work_mem") < text.index("shared_buffers")
+    assert render_success_knobs({}).startswith("No confirmed")
+
+
+def test_campaign_directive_explore_when_no_winners():
+    from src.knob_tuner.stages.nodes.diagnosis import _campaign_directive
+
+    state = _campaign_state(experiment_history=[], all_rows=[])
+    text = _campaign_directive(state, {})
+    assert text.startswith("Mode: EXPLORE")
+
+
+def test_campaign_directive_exploit_when_partial():
+    from src.knob_tuner.stages.nodes.diagnosis import _campaign_directive
+
+    state = _campaign_state()
+    counts = {"work_mem": 2, "shared_buffers": 1, "max_wal_size": 1}
+    text = _campaign_directive(state, counts)
+    assert text.startswith("Mode: EXPLOIT+EXPLORE")
+    assert "2/3" in text
+    assert "work_mem" in text
+    assert "2-4 knobs" in text
+
+
+def test_campaign_directive_stop_when_quota_met():
+    from src.knob_tuner.stages.nodes.diagnosis import _campaign_directive
+
+    extra = {"name": "e4", "phase": "screen", "n_knobs": 1,
+             "mean_delta_pct": 8.0, "lcb_pct": 6.0, "status": "PASS",
+             "confirmed": True, "plan_hash": "h4"}
+    state = _campaign_state(
+        experiment_history=_campaign_state()["experiment_history"] + [extra]
+    )
+    text = _campaign_directive(state, {"work_mem": 3})
+    assert text.startswith("Mode: STOP")
+
+
+def test_refresh_memory_writes_campaign_keys():
+    from src.knob_tuner.stages.nodes.diagnosis import _refresh_memory
+
+    state = _campaign_state()
+    _refresh_memory(state)
+    assert "success_knobs" in state and "work_mem" in state["success_knobs"]
+    assert state["campaign_directive"].startswith("Mode: EXPLOIT+EXPLORE")
+    assert "Winners 2/3" in state["evidence_bundle"]
+    assert "cleared" in state["belief_table"]
+
+
+# --- distinctness guard: knob set, not plan hash (Part 3) ---
+
+
+def _cleared_ctx(threshold=5.0):
+    """Ctx with one clearing arm whose knob set is {work_mem}. Value 64MB."""
+    ctx = _ctx()
+    ctx.state.update({"min_improvement_pct": threshold, "success_candidates": 3})
+    ctx.state.update(
+        {
+            "experiment_history": [
+                {"name": "clear", "phase": "screen", "n_knobs": 1,
+                 "mean_delta_pct": 9.0, "lcb_pct": 6.0, "status": "PASS",
+                 "confirmed": True, "plan_hash": "hc"},
+            ],
+            "all_rows": [
+                {"plan_hash": "hc",
+                 "plan": {"knobs": [{"name": "work_mem", "value": "64MB"}]}},
+            ],
+            "candidates": [],
+        }
+    )
+    return ctx
+
+
+def test_knob_set_guard_rejects_value_nudge_of_cleared_set():
+    ctx = _cleared_ctx()
+    # Same knob name, DIFFERENT value: the set already cleared → reject.
+    bad = nodes.compile_candidate(
+        ctx, _proposal(name="nudge", levels=[{"knob": "work_mem", "value": "128MB"}])
+    )
+    assert isinstance(bad, CompileRejection)
+    assert "repeat knob set" in bad.reason and "work_mem" in bad.reason
+
+
+def test_knob_set_guard_allows_nudge_of_non_clearing_set():
+    ctx = _ctx()
+    ctx.state.update({"min_improvement_pct": 5.0, "success_candidates": 3})
+    # A NON-clearing arm (lcb below bar) does not consume its knob set.
+    ctx.state.update(
+        {
+            "experiment_history": [
+                {"name": "weak", "phase": "screen", "n_knobs": 1,
+                 "mean_delta_pct": 0.5, "lcb_pct": -1.0, "status": "FAIL",
+                 "confirmed": False, "plan_hash": "hw"},
+            ],
+            "all_rows": [
+                {"plan_hash": "hw",
+                 "plan": {"knobs": [{"name": "work_mem", "value": "32MB"}]}},
+            ],
+            "candidates": [],
+        }
+    )
+    good = nodes.compile_candidate(
+        ctx, _proposal(name="nudge", levels=[{"knob": "work_mem", "value": "64MB"}])
+    )
+    assert isinstance(good, CompiledPlan)
+
+
+def test_knob_set_guard_ignores_superset_and_subset():
+    ctx = _cleared_ctx()
+    # A superset of the cleared set is a genuinely different arm → allowed.
+    bigger = nodes.compile_candidate(
+        ctx,
+        _proposal(
+            name="bigger",
+            levels=[
+                {"knob": "work_mem", "value": "64MB"},
+                {"knob": "shared_buffers", "value": "256MB"},
+            ],
+        ),
+    )
+    assert isinstance(bigger, CompiledPlan)
+
+
+def test_winner_stop_non_binding_while_quota_unmet():
+    # A winner stop must not veto the next proposal while the quota is unmet
+    # (otherwise the compounded campaign can never collect candidates).
+    ctx = _ctx()
+    ctx.state.update({"min_improvement_pct": 5.0, "success_candidates": 3})
+    nodes.confirmation_controller(
+        ctx,
+        DiagnosisOutput(correction="stop", targets=[], rationale="winner!",
+                        confidence=0.95, stop_reason="winner"),
+    )
+    # No clearing rows yet -> quota unmet -> stop is non-binding.
+    good = nodes.compile_candidate(ctx, _proposal(name="next-winner"))
+    assert isinstance(good, CompiledPlan)
+
+
+def test_winner_stop_binding_once_quota_met():
+    ctx = _ctx()
+    ctx.state.update({"min_improvement_pct": 5.0, "success_candidates": 1})
+    ctx.state.update(
+        {
+            "experiment_history": [
+                {"name": "c1", "phase": "screen", "n_knobs": 1,
+                 "mean_delta_pct": 9.0, "lcb_pct": 6.0, "status": "PASS",
+                 "confirmed": True, "plan_hash": "h1"},
+            ],
+            "all_rows": [
+                {"plan_hash": "h1",
+                 "plan": {"knobs": [{"name": "work_mem", "value": "64MB"}]}},
+            ],
+        }
+    )
+    nodes.confirmation_controller(
+        ctx,
+        DiagnosisOutput(correction="stop", targets=[], rationale="winner!",
+                        confidence=0.95, stop_reason="winner"),
+    )
+    # Quota (1) met -> the stop binds and vetoes the next proposal.
+    bad = nodes.compile_candidate(ctx, _proposal(name="after-stop"))
+    assert isinstance(bad, CompileRejection)
+    assert "stop" in bad.reason
+
+
+def test_futility_stop_stays_binding_while_quota_unmet():
+    ctx = _ctx()
+    ctx.state.update({"min_improvement_pct": 5.0, "success_candidates": 3})
+    nodes.confirmation_controller(
+        ctx,
+        DiagnosisOutput(correction="stop", targets=[], rationale="hopeless",
+                        confidence=0.9, stop_reason="futility"),
+    )
+    bad = nodes.compile_candidate(ctx, _proposal(name="after-futility"))
+    assert isinstance(bad, CompileRejection)
+    assert "stop" in bad.reason

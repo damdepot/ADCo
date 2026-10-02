@@ -11,6 +11,7 @@ from src.knob_tuner.tools.docker_tools import (
     cleanup_orphan_containers,
     cleanup_snapshot_image,
     commit_staging_db,
+    prune_staging_artifacts,
     recreate_docker_db,
     resolve_docker_image,
     start_staging_db,
@@ -143,6 +144,120 @@ def test_cleanup_orphan_containers_exception_handling():
     with patch("subprocess.run", side_effect=Exception("Docker crashed")):
         count = cleanup_orphan_containers()
         assert count == 0
+
+
+# =====================================================================
+# prune_staging_artifacts tests
+# =====================================================================
+
+
+def test_prune_staging_artifacts_removes_expected_artifacts():
+    ps_res = MagicMock(returncode=0, stdout="c1\nc2\n", stderr="")
+    rm_res = MagicMock(returncode=0, stdout="c1\nc2\n", stderr="")
+    images_res = MagicMock(returncode=0, stdout="img1\nimg2\nimg3\n", stderr="")
+    rmi_res = MagicMock(returncode=0, stdout="img1\nimg2\nimg3\n", stderr="")
+    volume_res = MagicMock(
+        returncode=0,
+        stdout="Deleted Volumes:\nvol1\nvol2\n\nTotal reclaimed space: 1.5MB\n",
+        stderr="",
+    )
+
+    with patch(
+        "src.knob_tuner.tools.docker_tools.cleanup_orphan_containers", return_value=2
+    ), patch(
+        "subprocess.run",
+        side_effect=[ps_res, rm_res, images_res, rmi_res, volume_res],
+    ) as mock_run:
+        counts = prune_staging_artifacts()
+
+        assert counts == {"containers": 4, "images": 3, "volumes": 2}
+        assert all(isinstance(v, int) for v in counts.values())
+        mock_run.assert_has_calls(
+            [
+                call(
+                    ["docker", "ps", "-aq", "--filter", "name=adco-staging-"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                ),
+                call(
+                    ["docker", "rm", "-f", "-v", "c1", "c2"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                ),
+                call(
+                    [
+                        "docker",
+                        "images",
+                        "-q",
+                        "--filter",
+                        "reference=adco-staging-ready:*",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                ),
+                call(
+                    ["docker", "rmi", "-f", "img1", "img2", "img3"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                ),
+                call(
+                    ["docker", "volume", "prune", "-f"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                ),
+            ]
+        )
+
+
+def test_prune_staging_artifacts_never_raises_on_subprocess_failure():
+    with patch("subprocess.run", side_effect=Exception("Docker daemon died")):
+        counts = prune_staging_artifacts()
+        assert counts == {"containers": 0, "images": 0, "volumes": 0}
+
+
+def test_prune_staging_artifacts_never_raises_on_nonzero_returns():
+    failed = MagicMock(returncode=1, stdout="", stderr="docker error")
+    with patch("subprocess.run", return_value=failed):
+        counts = prune_staging_artifacts()
+        assert counts == {"containers": 0, "images": 0, "volumes": 0}
+
+
+def test_prune_staging_artifacts_nothing_to_remove():
+    empty_ps = MagicMock(returncode=0, stdout="", stderr="")
+    empty_images = MagicMock(returncode=0, stdout="", stderr="")
+    volume_res = MagicMock(returncode=0, stdout="Total reclaimed space: 0B\n", stderr="")
+
+    with patch(
+        "src.knob_tuner.tools.docker_tools.cleanup_orphan_containers", return_value=0
+    ), patch(
+        "subprocess.run", side_effect=[empty_ps, empty_images, volume_res]
+    ) as mock_run:
+        counts = prune_staging_artifacts()
+
+        assert counts == {"containers": 0, "images": 0, "volumes": 0}
+        # No rm/rmi should be issued when there are no ids.
+        assert mock_run.call_count == 3
+        called_cmds = [c[0][0] for c in mock_run.call_args_list]
+        for cmd in called_cmds:
+            assert cmd[:4] != ["docker", "rm", "-f", "-v"]
+            assert cmd[:3] != ["docker", "rmi", "-f"]
+
+
+def test_prune_staging_artifacts_unparseable_volume_output():
+    empty_ps = MagicMock(returncode=0, stdout="", stderr="")
+    empty_images = MagicMock(returncode=0, stdout="", stderr="")
+    volume_res = MagicMock(returncode=0, stdout="no deleted volumes here\n", stderr="")
+
+    with patch(
+        "src.knob_tuner.tools.docker_tools.cleanup_orphan_containers", return_value=0
+    ), patch("subprocess.run", side_effect=[empty_ps, empty_images, volume_res]):
+        counts = prune_staging_artifacts()
+        assert counts == {"containers": 0, "images": 0, "volumes": 0}
 
 
 # =====================================================================

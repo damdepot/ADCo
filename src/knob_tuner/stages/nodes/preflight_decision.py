@@ -24,8 +24,13 @@ from src.knob_tuner.contracts import (
     get_measure_seconds,
     get_measure_warmup_seconds,
     get_min_improvement_pct,
+    get_success_candidates,
 )
-from src.knob_tuner.stages.models import PreflightVerdict, TerminalDecision
+from src.knob_tuner.stages.models import (
+    CompiledPlan,
+    PreflightVerdict,
+    TerminalDecision,
+)
 from src.knob_tuner.tools.knob_scope import requires_restart
 from src.knob_tuner.tools.knobs import coerce_apply_mode, coerce_profile
 from src.knob_tuner.stages.nodes._common import _jsonable, _state
@@ -93,11 +98,13 @@ def decision(
     ``workflow`` (lines 869-974) plus the archive payload (returned as data —
     no file writes). Never returns ``None``.
 
-    Phase 1.7: a confirmed PASS applies (``apply_winner``) regardless of
-    ``min_improvement_pct`` — the best confirmed PASS row (highest mean,
-    tie-broken by LCB) wins. ``min_improvement_pct`` is retained for
-    reporting/archive only. Only failures, unconfirmed rows, or futility
-    (no confirmed PASS) withhold, yielding ``inconclusive``/``fail``.
+    Phase 1.7 / compounding quota: a confirmed PASS applies
+    (``apply_winner``) only when its LCB exceeds ``min_improvement_pct`` — the
+    best such row (highest mean, tie-broken by LCB) wins. This is the SAME
+    definition the campaign's success-candidate quota uses, so "winner" has
+    one meaning in the codebase. Only failures, unconfirmed rows, rows whose
+    LCB misses the bar, or futility (no qualifying PASS) withhold, yielding
+    ``inconclusive``/``fail``.
     """
     state = _state(ctx)
     try:
@@ -143,14 +150,16 @@ def decision(
 
         winner_row: dict[str, Any] | None = None
         outcome = "fail"
-        # Phase 1.7: a confirmed PASS applies regardless of min_improvement_pct
-        # (retained for reporting/archive only). Pick the best confirmed PASS
-        # row — highest mean, tie-broken by LCB — not the first one seen.
+        # Phase 1.7 / compounding quota: a confirmed PASS applies only when its
+        # LCB clears min_improvement_pct — the SAME definition the campaign's
+        # success-candidate quota uses, so "winner" has one meaning. Pick the
+        # best such row — highest mean, tie-broken by LCB — not the first seen.
         confirmed_pass_rows = [
             row
             for row in rows
             if str(row.get("status", "")).upper() == "PASS"
             and bool(row.get("confirmed", False))
+            and _row_float(row, "lcb_pct") > float(min_improvement_pct)
         ]
         if confirmed_pass_rows:
             winner_row = max(
@@ -239,6 +248,10 @@ def decision(
             ),
             "experiment_history": _jsonable(experiment_history),
             "experiments_run": experiments_run,
+            "success_candidates": get_success_candidates(state),
+            "winners_found": len(confirmed_pass_rows),
+            "success_knobs": _jsonable(state.get("success_knobs") or ""),
+            "confirmation": _jsonable(state.get("confirmation") or {}),
         }
         reasons = [str(r) for row in rows for r in (row.get("reasons") or [])]
         # Audit trail: compile rejections never produce screen rows, so row
@@ -312,9 +325,181 @@ def decision(
 
 
 # ---------------------------------------------------------------------------
-# 7. production_preflight
+# 6b. confirm_winner (anti-winner's-curse re-measurement)
 # ---------------------------------------------------------------------------
 
+
+def _qualifies(row: dict[str, Any], min_pct: float) -> bool:
+    """Whether a row is a confirmed PASS clearing the LCB bar."""
+    try:
+        return (
+            str(row.get("status", "")).upper() == "PASS"
+            and bool(row.get("confirmed", False))
+            and _row_float(row, "lcb_pct") > min_pct
+        )
+    except Exception:
+        return False
+
+
+def _candidate_pool(state: Any, min_pct: float) -> list[dict[str, Any]]:
+    """Rank the confirming candidate pool: clearing rows first, by mean/lcb.
+
+    When the winner quota target is > 1, only LCB-clearing rows are eligible;
+    otherwise fall back to confirmed PASS rows (today's pool) so a
+    single-winner campaign still confirms the row the decision picked.
+    """
+    rows = [r for r in (state.get("all_rows") or []) if isinstance(r, dict)]
+    try:
+        target = get_success_candidates(state)
+    except Exception:
+        target = 1
+    pool = [r for r in rows if _qualifies(r, min_pct)]
+    if not pool and target <= 1:
+        pool = [
+            r
+            for r in rows
+            if str(r.get("status", "")).upper() == "PASS"
+            and bool(r.get("confirmed", False))
+        ]
+    pool.sort(
+        key=lambda r: (_row_float(r, "mean_delta_pct"), _row_float(r, "lcb_pct")),
+        reverse=True,
+    )
+    return pool
+
+
+def confirm_winner(
+    ctx: Any,
+    node_input: Any,
+    validate_fn: Any = None,
+    run_profile: Any = None,
+) -> TerminalDecision:
+    """Re-measure terminal candidates with fresh reps (winner's-curse guard).
+
+    Runs AFTER the loop, so it cannot affect the quota or the attempt cap. It
+    walks the ranked candidate pool best-first — the chosen winner, then the
+    runner-up, then 3rd, 4th, ... — re-screening each against the SAME shared
+    baseline with fresh reps, and stops at the FIRST one whose fresh verdict
+    still clears the bar. That one is applied. If NO candidate survives the
+    re-measurement, nothing is applied (inconclusive). Always returns a
+    :class:`TerminalDecision`.
+    """
+    state = _state(ctx)
+    try:
+        from src.knob_tuner.stages.nodes.stats_coercion import screen_candidate
+
+        term = node_input
+        if not isinstance(term, TerminalDecision):
+            term = TerminalDecision.model_validate(_jsonable(node_input))
+        summary = dict(term.summary or {})
+        min_pct = float(min_improvement_pct_from_state(state))
+        confirmation: dict[str, Any] = {
+            "attempted": 0,
+            "plan_hash": "",
+            "verdict": "skipped",
+            "promoted": False,
+        }
+        # Nothing to confirm unless the decision chose a winner.
+        if term.decision != "apply_winner" or not term.winner_plan:
+            summary["confirmation"] = confirmation
+            return TerminalDecision(
+                decision=term.decision, winner_plan=term.winner_plan, summary=summary
+            )
+        if validate_fn is None:
+            validate_fn = state.get("validate_fn")
+        if run_profile is None:
+            run_profile = state.get("run_profile")
+        pool = _candidate_pool(state, min_pct)
+        if not pool:
+            confirmation["verdict"] = "no_candidate"
+            summary["confirmation"] = confirmation
+            return TerminalDecision(
+                decision="inconclusive", winner_plan={}, summary=_with_note(
+                    summary,
+                    "confirmation: no confirmable candidate in pool; nothing applied",
+                )
+            )
+        tried = 0
+        promoted = False
+        last_verdict = "fail"
+        chosen: dict[str, Any] | None = None
+        last_hash = ""
+        for row in pool:
+            plan_dump = _plan_dump(_row_plan_name(row))
+            if not plan_dump or not plan_dump.get("knobs"):
+                continue
+            try:
+                last_hash = KnobPlan.model_validate(plan_dump).plan_hash()
+            except Exception:
+                last_hash = ""
+            compiled = CompiledPlan(
+                plan=plan_dump,
+                exp_name="confirm_winner",
+                phase=str(row.get("phase", "refinement") or "refinement"),
+            )
+            verdict = screen_candidate(
+                ctx, compiled, validate_fn=validate_fn, run_profile=run_profile
+            )
+            tried += 1
+            v_status = getattr(verdict, "status", "FAIL")
+            v_lcb = float(getattr(verdict, "lcb_pct", 0.0) or 0.0)
+            v_conf = bool(getattr(verdict, "confirmed", False))
+            if str(v_status).upper() == "PASS" and v_conf and v_lcb > min_pct:
+                last_verdict = "pass"
+                chosen = row
+                promoted = tried > 1
+                break
+            last_verdict = "fail"
+        confirmation.update(
+            {"attempted": tried, "plan_hash": last_hash, "verdict": last_verdict,
+             "promoted": promoted}
+        )
+        if chosen is None:
+            summary["confirmation"] = confirmation
+            return TerminalDecision(
+                decision="inconclusive",
+                winner_plan={},
+                summary=_with_note(
+                    summary,
+                    f"confirmation: no candidate cleared the bar after {tried} "
+                    "re-measurement(s); nothing applied (inconclusive)",
+                ),
+            )
+        winner_dump = _plan_dump(_row_plan_name(chosen))
+        summary["confirmation"] = confirmation
+        return TerminalDecision(
+            decision="apply_winner", winner_plan=winner_dump, summary=summary
+        )
+    except Exception as exc:
+        return TerminalDecision(
+            decision="inconclusive",
+            winner_plan={},
+            summary={"status": "INCONCLUSIVE",
+                     "reasons": [f"confirmation error: {exc}"],
+                     "confirmation": {"verdict": "error"}, "archive": {}},
+        )
+
+
+def _with_note(summary: dict[str, Any], note: str) -> dict[str, Any]:
+    reasons = list(summary.get("reasons", []) or [])
+    if note not in reasons:
+        reasons.append(note)
+    summary = dict(summary)
+    summary["reasons"] = reasons
+    return summary
+
+
+def min_improvement_pct_from_state(state: Any) -> float:
+    """Read the win-gate pct from state (never throws)."""
+    try:
+        return float(get_min_improvement_pct(state))
+    except Exception:
+        return DEFAULT_MIN_IMPROVEMENT_PCT
+
+
+# ---------------------------------------------------------------------------
+# 7. production_preflight
+# ---------------------------------------------------------------------------
 
 def _extract_winner_plan(node_input: Any, state: dict[str, Any]) -> dict[str, Any]:
     if isinstance(node_input, TerminalDecision):
@@ -428,6 +613,9 @@ def prepare_run(ctx: Any) -> dict[str, Any]:
         # Phase 4.1/4.3: canonical loop cap, persisted for downstream readers.
         max_attempts = get_max_attempts(state)
         payload["max_attempts"] = max_attempts
+        # Compounding-DOE quota target, persisted for the controller.
+        success_candidates = get_success_candidates(state)
+        payload["success_candidates"] = success_candidates
         payload["dry_run"] = bool(state.get("dry_run", False))
         payload["run_id"] = state.get("run_id", "") or ""
         payload["run_dir"] = state.get("run_dir", "") or ""
@@ -492,6 +680,7 @@ def prepare_run(ctx: Any) -> dict[str, Any]:
         # Belt-and-braces: the controller reads its cap from state, so persist
         # the resolved value explicitly (not just inside the run_config payload).
         state["max_attempts"] = max_attempts
+        state["success_candidates"] = success_candidates
         return payload
     except Exception as exc:
         return {"error": f"prepare_run failed: {exc}"}

@@ -31,7 +31,7 @@ Report your confidence that the recommended action (the correction enum) is corr
 ## STOP-vs-NEXT decision (apply to every verdict, pass or fail)
 Decide FIRST whether the campaign should halt (correction `stop`, targets empty) or continue with the most fitting NEXT strategy below:
 - STOP with `stop` when EITHER holds:
-  (a) Confident winner: the last verdict has mean_delta_pct > 0 AND lcb_pct > min_improvement_pct (default 5.0%), AND there is no prior confirmed challenger in the evidence table OR the lead is decisive (last-verdict lcb above every other row's ucb). The evidence bundle table carries the challenger ucbs — compare them. Set `stop_reason` to "winner".
+  (a) Confident winner: the last verdict has mean_delta_pct > 0 AND lcb_pct > min_improvement_pct (default 5.0%), AND there is no prior confirmed challenger in the evidence table OR the lead is decisive (last-verdict lcb above every other row's ucb). The evidence bundle table carries the challenger ucbs — compare them. **A winner stop is PREMATURE while the `Winners` line shows found < target**: the campaign must collect `target` distinct LCB-clearing building blocks first — when short of target, pick a NEXT that explores a different region instead of stopping. Set `stop_reason` to "winner" only once the Winners quota is met.
   (b) Futility: the trend is flat/negative across attempts with fewer than 2 attempts left (Attempt line vs cap), OR the same design fails repeatedly with identical reasons (repeat-hash / same-error-text notes in the rejected history). Set `stop_reason` to "futility".
 - For every NEXT correction, `stop_reason` stays "futility" (it is only read on `stop`).
 - Otherwise NEXT: emit exactly one of shrink_set, change_phase, drop_knob, adjust_value, retry_same with the knob names it applies to (targets; empty list allowed only for retry_same):
@@ -63,7 +63,7 @@ Output exactly one correction enum plus the knob names it applies to plus a rati
 
 ## Output checklist
 Before returning, verify:
-- [ ] STOP-vs-NEXT decided first: stop only for a confident winner (mean>0, lcb>min_improvement, no challenger or decisive lcb>max-ucb lead) or futility (flat/negative trend with <2 attempts left, or repeated identical failures); else a NEXT enum.
+- [ ] STOP-vs-NEXT decided first: stop only for a confident winner (mean>0, lcb>min_improvement, no challenger or decisive lcb>max-ucb lead, AND the Winners line shows found >= target) or futility (flat/negative trend with <2 attempts left, or repeated identical failures); else a NEXT enum.
 - [ ] Correction is exactly one of shrink_set, change_phase, drop_knob, adjust_value, retry_same, stop.
 - [ ] `stop_reason` is "winner" for a confident-winner stop, else "futility".
 - [ ] `confidence` is calibrated per the calibration section (0.9+ decisive reads only, 0.5-0.7 judgment calls, never 1.0).

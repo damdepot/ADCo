@@ -36,7 +36,12 @@ VALID_EXPERIMENT_PHASES: tuple[str, str, str] = (
 )
 
 #: Default maximum screening attempts before the loop stops.
-DEFAULT_MAX_ATTEMPTS: int = 10
+DEFAULT_MAX_ATTEMPTS: int = 20
+
+#: Default number of LCB-clearing winners a campaign must collect before the
+#: loop may stop on a winner (compounding DOE campaign). A winner stop is
+#: premature while fewer than this many candidates have cleared the win gate.
+DEFAULT_SUCCESS_CANDIDATES: int = 10
 
 #: Default cap on distinct knobs per experiment proposal.
 DEFAULT_MAX_SET_KNOBS: int = 20
@@ -64,6 +69,9 @@ DATABASE_STATE_KEY: str = "database"
 #: Canonical session-state key for the loop counter (Phase 4.3, R3 done).
 #: Legacy ``attempt`` mirror deleted; readers use ``validation_attempt_count``.
 ATTEMPT_STATE_KEY: str = "validation_attempt_count"
+
+#: Canonical session-state key for the winner-quota target.
+SUCCESS_CANDIDATES_STATE_KEY: str = "success_candidates"
 
 #: Canonical session-state key for the shared baseline (Phase 4.3, R3 done).
 #: Legacy ``baseline`` mirror deleted; readers use ``shared_baseline``.
@@ -130,6 +138,25 @@ def get_max_attempts(state: Any) -> int:
         return max(1, int(raw or DEFAULT_MAX_ATTEMPTS))
     except (TypeError, ValueError):
         return DEFAULT_MAX_ATTEMPTS
+
+
+def get_success_candidates(state: Any) -> int:
+    """Return the winner-quota target (default :data:`DEFAULT_SUCCESS_CANDIDATES`).
+
+    Floored at 1 so a campaign always requires at least one confirmed winner
+    before a winner stop is permitted; a missing/``None`` entry falls back to
+    the default.
+    """
+    try:
+        getter = getattr(state, "get", None)
+        raw = (
+            getter(SUCCESS_CANDIDATES_STATE_KEY, DEFAULT_SUCCESS_CANDIDATES)
+            if callable(getter)
+            else DEFAULT_SUCCESS_CANDIDATES
+        )
+        return max(1, int(raw or DEFAULT_SUCCESS_CANDIDATES))
+    except (TypeError, ValueError):
+        return DEFAULT_SUCCESS_CANDIDATES
 
 
 def get_min_improvement_pct(state: Any) -> float:

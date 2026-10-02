@@ -16,6 +16,11 @@ from src.knob_tuner.stages.models import (
     KnobBelief,
     render_belief_table,
 )
+from src.knob_tuner.contracts import get_success_candidates
+from src.knob_tuner.stages.nodes._common import (
+    count_success_candidates,
+    success_knob_counts,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +144,9 @@ def _refresh_memory(state: Any) -> None:
 
     ``build_evidence_bundle`` only accepts ``Mapping`` states, but the real
     ADK ``State`` is not a ``Mapping`` — pass a plain-dict snapshot of the
-    keys the bundle reads so history survives on the live runner.
+    keys the bundle reads so history survives on the live runner. Also derives
+    the compounding-campaign signals (``success_knobs`` + ``campaign_directive``)
+    the generator prompt consumes.
     """
     try:
         get = getattr(state, "get", None)
@@ -155,27 +162,116 @@ def _refresh_memory(state: Any) -> None:
                     # R3: canonical-only (legacy "attempt" mirror deleted).
                     "validation_attempt_count",
                     "max_attempts",
+                    "success_candidates",
                     "plan_hash",
+                    "min_improvement_pct",
                 )
             }
-            state["evidence_bundle"] = build_evidence_bundle(snapshot)
         else:
-            state["evidence_bundle"] = build_evidence_bundle(state)
+            snapshot = {}
+        # Campaign progress line for the evidence bundle header (works for
+        # both ADK State and plain-dict states).
+        snapshot["winners_found"] = count_success_candidates(state)
+        snapshot["success_candidates_target"] = get_success_candidates(state)
+        if snapshot.get("min_improvement_pct_state") is None:
+            snapshot["min_improvement_pct_state"] = (
+                snapshot.get("min_improvement_pct")
+                if snapshot.get("min_improvement_pct") is not None
+                else 0.0
+            )
+        state["evidence_bundle"] = build_evidence_bundle(snapshot)
     except Exception:
         pass
     try:
         state["belief_table"] = render_belief_table(state.get("knob_beliefs") or {})
     except Exception:
         state["belief_table"] = "No knob beliefs yet."
+    try:
+        counts = success_knob_counts(state)
+        state["success_knobs"] = render_success_knobs(counts)
+        state["campaign_directive"] = _campaign_directive(state, counts)
+    except Exception:
+        state["success_knobs"] = "No confirmed building blocks yet."
+        state["campaign_directive"] = ""
+
+
+def render_success_knobs(counts: dict[str, int]) -> str:
+    """Render the confirmed building blocks as a small markdown table.
+
+    Sorted by clearing-arm count desc, then name. Capped at 12 rows. Never
+    throws.
+    """
+    try:
+        if not counts:
+            return "No confirmed building blocks yet."
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        lines = [
+            "| knob | cleared_arms |",
+            "| --- | --- |",
+        ]
+        for name, count in ranked[:12]:
+            lines.append(f"| {name} | {count} |")
+        if len(ranked) > 12:
+            lines.append(f"... +{len(ranked) - 12} more omitted (cap 12)")
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 - render must never throw
+        return "No confirmed building blocks yet."
+
+
+def _campaign_directive(state: Any, counts: dict[str, int]) -> str:
+    """Deterministic campaign steering string (computed, never LLM-decided).
+
+    Three modes from found/target + how much of the knob space remains:
+    - found == 0            -> explore broadly (untried knobs).
+    - 0 < found < target    -> exploit + explore: seed the next arm from the
+                               confirmed building blocks, keep it small.
+    - found >= target       -> stop (the loop already ended).
+    Never throws.
+    """
+    try:
+        found = count_success_candidates(state)
+        target = get_success_candidates(state)
+        if found >= target:
+            return (
+                f"Mode: STOP. {found}/{target} building blocks confirmed — "
+                "the campaign has met its quota."
+            )
+        get = getattr(state, "get", None)
+        available = get("available_knob_names") if callable(get) else None
+        available_n = len(available) if isinstance(available, list) else 0
+        tried = len(counts)
+        if found == 0:
+            return (
+                "Mode: EXPLORE. No building blocks confirmed yet — run a broad "
+                "screen over untried knobs to find movers. Keep the arm as wide "
+                "as the attribution budget allows."
+            )
+        top = ", ".join(
+            name
+            for name, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:4]
+        )
+        return (
+            f"Mode: EXPLOIT+EXPLORE. {found}/{target} building blocks confirmed "
+            f"({tried} distinct knobs have cleared; {available_n} available). "
+            f"Seed the next arm from the confirmed movers [{top}], keep it to "
+            "2-4 knobs, and do NOT re-propose any arm that already cleared the "
+            "LCB bar. Reserve part of the budget for untried regions."
+        )
+    except Exception:
+        return ""
 
 
 def _credit_beliefs(
-    state: Any, knob_names: list[str], mean_delta: float, phase: str
+    state: Any, knob_names: list[str], mean_delta: float, phase: str,
+    cleared: bool = False,
 ) -> None:
     """Per-knob attribution: credit verdict mean to each knob, keep best.
 
     Phase 4.5: read-copy-reassign — never mutate the live state mapping
     in place; the copy is written back so ADK State persistence sees it.
+    ``cleared`` marks that the crediting arm cleared the win gate; it is
+    sticky (once true for a knob, it stays true) so the recommender can see
+    which knobs are known-good building blocks.
     """
     try:
         current = state.get("knob_beliefs")
@@ -185,6 +281,7 @@ def _credit_beliefs(
             if not name:
                 continue
             cur = beliefs.get(name)
+            was_cleared = False
             if isinstance(cur, dict):
                 try:
                     best = float(cur.get("best_delta_pct", 0.0) or 0.0)
@@ -195,12 +292,14 @@ def _credit_beliefs(
                 except (TypeError, ValueError):
                     seen = 0
                 last_phase = str(cur.get("last_phase", "") or "")
+                was_cleared = bool(cur.get("cleared", False))
             elif isinstance(cur, KnobBelief):
                 best, seen, last_phase = (
                     cur.best_delta_pct,
                     cur.n_seen,
                     cur.last_phase,
                 )
+                was_cleared = bool(cur.cleared)
             else:
                 best, seen, last_phase = 0.0, 0, ""
             try:
@@ -211,6 +310,7 @@ def _credit_beliefs(
                 "best_delta_pct": max(best, mean_f),
                 "n_seen": seen + 1,
                 "last_phase": str(phase or last_phase or ""),
+                "cleared": bool(was_cleared or cleared),
             }
         state["knob_beliefs"] = beliefs
     except Exception:

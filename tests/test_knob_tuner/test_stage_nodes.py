@@ -182,6 +182,7 @@ def _routed_state(**over):
         "max_attempts": 3,
         "validation_attempt_count": 1,
         "min_improvement_pct": 2.0,
+        "success_candidates": 1,
         "experiment_history": [
             {
                 "name": "e1",
@@ -293,6 +294,7 @@ def test_screen_records_row_and_bumps_attempt_once():
             "baseline_cache_key": nodes._baseline_cache_key(None, None),
             "min_improvement_pct": 2.0,
             "max_attempts": 6,
+            "success_candidates": 1,
         }
     )
     out = nodes.screen_candidate(ctx, _compiled(), validate_fn=_mock_validate_ok)
@@ -439,20 +441,22 @@ def test_decision_inconclusive_vs_fail():
     assert out2.decision == "fail"
 
 
-def test_decision_confirmed_pass_below_threshold_still_applies():
+def test_decision_confirmed_pass_below_threshold_withholds():
+    # Compounding quota unification: "winner" means lcb > min_improvement_pct,
+    # so a confirmed PASS whose LCB misses the bar no longer applies.
     ctx = FakeCtx({"min_improvement_pct": 5.0})
     row = _row(mean=1.0, lcb=0.5)
     out = nodes.decision(ctx, all_rows=[row], baseline_tps=[100.0])
-    assert out.decision == "apply_winner"
-    assert out.winner_plan["knobs"][0]["name"] == "work_mem"
+    assert out.decision != "apply_winner"
+    assert out.winner_plan == {}
 
 
 def test_decision_picks_best_confirmed_pass():
     ctx = FakeCtx({"min_improvement_pct": 5.0})
-    rows = [_row(mean=1.0, lcb=0.5), _row(mean=3.0, lcb=1.0)]
+    rows = [_row(mean=8.0, lcb=6.0), _row(mean=12.0, lcb=9.0)]
     out = nodes.decision(ctx, all_rows=rows, baseline_tps=[100.0])
     assert out.decision == "apply_winner"
-    assert out.summary["stats"]["mean_delta_pct"] == 3.0
+    assert out.summary["stats"]["mean_delta_pct"] == 12.0
 
 
 def test_decision_unconfirmed_pass_withholds():
@@ -555,3 +559,163 @@ def test_prepare_run_resolves_and_inits(tmp_path):
     assert ctx.state["validation_attempt_count"] == 0
     assert ctx.state["experiment_history"] == []
     assert ctx.state["run_config"]["run_id"] == "r1"
+
+
+# --- confirmation run (Part 4) ---
+
+
+def _confirm_row(value, mean=12.0, lcb=9.0, status="PASS", confirmed=True):
+    from src.knob_tuner.contracts import KnobPlan
+
+    plan = KnobPlan.model_validate(
+        {"knobs": [{"name": "work_mem", "value": value, "scope": "user"}]}
+    )
+    return {
+        "arm": "e",
+        "phase": "screen",
+        "status": status,
+        "mean_delta_pct": mean,
+        "lcb_pct": lcb,
+        "ucb_pct": mean + 1.0,
+        "confirmed": confirmed,
+        "improvement_confident": lcb > 2.0,
+        "paired": {"baseline": {}, "tuned": {}},
+        "reasons": [],
+        "plan": plan,
+    }
+
+
+def _confirm_ctx(rows, **over):
+    state = {
+        "min_improvement_pct": 5.0,
+        "max_attempts": 20,
+        "success_candidates": 3,
+        "shared_baseline": {"per_run_tps": [100.0, 101.0, 102.0]},
+        "baseline_cache_key": nodes._baseline_cache_key(None, None),
+        "experiment_history": [],
+        "all_rows": rows,
+    }
+    state.update(over)
+    return FakeCtx(state)
+
+
+def _validate_by_value(pass_values):
+    """Return a validate_fn that PASSes only plans whose work_mem value is in
+    pass_values; otherwise FAILs. Baseline-only calls return a baseline."""
+
+    def _v(plan=None, run_profile=None, shared_baseline=None, attempt=0,
+           early_stop_min_reps=None, baseline_only=False, **kwargs):
+        if baseline_only:
+            return {"baseline": {"per_run_tps": [100.0, 101.0, 102.0]}}
+        v = None
+        for spec in getattr(plan, "knobs", []) or []:
+            if getattr(spec, "name", "") == "work_mem":
+                v = spec.value
+        if v in pass_values:
+            return {"status": "PASS",
+                    "paired": {"baseline": {"per_run_tps": [100.0, 101.0, 102.0]},
+                               "tuned": {"per_run_tps": [112.0, 113.0, 114.0]}},
+                    "reasons": [], "stopped_early": False}
+        return {"status": "FAIL",
+                "paired": {"baseline": {"per_run_tps": [100.0, 101.0, 102.0]},
+                           "tuned": {"per_run_tps": [99.0, 98.0, 97.0]}},
+                "reasons": ["no improvement"], "stopped_early": False}
+
+    return _v
+
+
+def _term(rows):
+    winner = _plan_dump(rows[0]["plan"])
+    return TerminalDecision(
+        decision="apply_winner",
+        winner_plan=winner,
+        summary={"status": "PASS", "plan_hash": "", "reasons": []},
+    )
+
+
+def test_confirm_winner_keeps_winner_when_fresh_verdict_passes():
+    rows = [_confirm_row("64MB", mean=12.0), _confirm_row("32MB", mean=9.0)]
+    ctx = _confirm_ctx(rows)
+    out = nodes.confirm_winner(
+        ctx, _term(rows), validate_fn=_validate_by_value({"64MB"})
+    )
+    assert out.decision == "apply_winner"
+    assert out.summary["confirmation"]["verdict"] == "pass"
+    assert out.summary["confirmation"]["promoted"] is False
+    assert out.summary["confirmation"]["attempted"] == 1
+
+
+def test_confirm_winner_promotes_runner_up_when_winner_fails():
+    rows = [_confirm_row("64MB", mean=12.0), _confirm_row("32MB", mean=9.0)]
+    ctx = _confirm_ctx(rows)
+    out = nodes.confirm_winner(
+        ctx, _term(rows), validate_fn=_validate_by_value({"32MB"})
+    )
+    assert out.decision == "apply_winner"
+    assert out.summary["confirmation"]["verdict"] == "pass"
+    assert out.summary["confirmation"]["promoted"] is True
+    assert out.summary["confirmation"]["attempted"] == 2
+    assert out.winner_plan["knobs"][0]["value"] == "32MB"
+
+
+def test_confirm_winner_withholds_when_both_fail():
+    rows = [_confirm_row("64MB", mean=12.0), _confirm_row("32MB", mean=9.0)]
+    ctx = _confirm_ctx(rows)
+    out = nodes.confirm_winner(
+        ctx, _term(rows), validate_fn=_validate_by_value(set())
+    )
+    assert out.decision == "inconclusive"
+    assert out.winner_plan == {}
+    assert out.summary["confirmation"]["verdict"] == "fail"
+    assert out.summary["confirmation"]["attempted"] == 2
+    assert any("confirmation" in r for r in out.summary["reasons"])
+
+
+def test_confirm_winner_skips_non_winner_decision():
+    ctx = _confirm_ctx([])
+    term = TerminalDecision(decision="inconclusive", winner_plan={},
+                            summary={"reasons": []})
+    out = nodes.confirm_winner(ctx, term, validate_fn=_validate_by_value({"64MB"}))
+    assert out.decision == "inconclusive"
+    assert out.summary["confirmation"]["verdict"] == "skipped"
+
+
+def _plan_dump(plan):
+    from src.knob_tuner.contracts import KnobPlan
+
+    if isinstance(plan, KnobPlan):
+        return plan.model_dump()
+    return dict(plan)
+
+
+def test_confirm_winner_walks_pool_to_a_lower_candidate_without_cap():
+    # No fixed confirmation cap: the 1st and 2nd candidates fail, the 3rd
+    # passes → the 3rd is applied (proves the walk continues past 2).
+    rows = [
+        _confirm_row("64MB", mean=12.0),
+        _confirm_row("32MB", mean=9.0),
+        _confirm_row("16MB", mean=7.0),
+    ]
+    ctx = _confirm_ctx(rows)
+    out = nodes.confirm_winner(
+        ctx, _term(rows), validate_fn=_validate_by_value({"16MB"})
+    )
+    assert out.decision == "apply_winner"
+    assert out.summary["confirmation"]["attempted"] == 3
+    assert out.summary["confirmation"]["promoted"] is True
+    assert out.winner_plan["knobs"][0]["value"] == "16MB"
+
+
+def test_confirm_winner_no_cap_walks_whole_pool_when_none_pass():
+    rows = [
+        _confirm_row("64MB", mean=12.0),
+        _confirm_row("32MB", mean=9.0),
+        _confirm_row("16MB", mean=7.0),
+        _confirm_row("8MB", mean=6.0),
+    ]
+    ctx = _confirm_ctx(rows)
+    out = nodes.confirm_winner(
+        ctx, _term(rows), validate_fn=_validate_by_value(set())
+    )
+    assert out.decision == "inconclusive"
+    assert out.summary["confirmation"]["attempted"] == 4

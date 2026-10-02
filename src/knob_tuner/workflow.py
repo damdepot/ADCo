@@ -504,6 +504,16 @@ def finalize_node(ctx: Context, node_input: Any = None) -> Event:
         state.get("log_file"), bool(state.get("verbose", False))
     )
 
+    # Run-scoped snapshot cleanup belongs HERE (the terminal node), not in the
+    # decision node: confirmation runs after decision and still needs the
+    # prepared-dataset snapshot. Best-effort — a failed image removal never
+    # fails the run.
+    with contextlib.suppress(Exception):
+        registry = SnapshotRegistry.from_state(state.get("snapshot_registry"))
+        for image in registry.images():
+            with contextlib.suppress(Exception):
+                cleanup_snapshot_image(image)
+
     # Single source of truth: the shared builder owns db_image/errors/status
     # reconciliation (see tools.run_artifacts.build_run_manifest).
     manifest = build_run_manifest(state)
@@ -740,7 +750,6 @@ _DECISION_STATUS = {
 def decision_node(ctx: Context) -> TerminalDecision:
     """Pick the terminal outcome and bridge it into apply/finalize state keys."""
     term = stage_nodes.decision(ctx)
-    state = ctx.state
     # Phase 1.7 belt-and-braces: a non-winning plan must never bridge to an
     # apply — downgrade a stray keep_best to an empty inconclusive decision.
     if term.decision == "keep_best":
@@ -755,6 +764,17 @@ def decision_node(ctx: Context) -> TerminalDecision:
         term = TerminalDecision(
             decision="inconclusive", winner_plan={}, summary=summary
         )
+    return _bridge_terminal_to_state(ctx, term)
+
+
+def _bridge_terminal_to_state(ctx: Context, term: TerminalDecision) -> TerminalDecision:
+    """Mirror a terminal decision into the apply/finalize state keys.
+
+    Shared by ``decision_node`` and ``confirm_winner_node`` so a changed
+    winner (post-confirmation) is reflected in ``knob_plan``,
+    ``result_status`` and the staging-issue audit trail.
+    """
+    state = ctx.state
     status = _DECISION_STATUS.get(term.decision, TuningStatus.INCONCLUSIVE.value)
     winner = dict(term.winner_plan or {})
     summary = term.summary or {}
@@ -785,11 +805,28 @@ def decision_node(ctx: Context) -> TerminalDecision:
     state["improvement_confident"] = bool(
         summary.get("improvement_confident", False)
     )
-    registry = SnapshotRegistry.from_state(state.get("snapshot_registry"))
-    for image in registry.images():
-            with contextlib.suppress(Exception):
-                cleanup_snapshot_image(image)
+    if isinstance(summary.get("confirmation"), dict):
+        state["confirmation"] = summary["confirmation"]
+    # NOTE: snapshot images are NOT cleaned up here. The confirmation node runs
+    # AFTER the decision node and reuses the prepared-dataset snapshot to
+    # re-measure the winner; deleting it here would force a silent fallback to
+    # an empty stock image (see finalize_node, which owns run-scoped cleanup).
     return term
+
+
+def confirm_winner_node(ctx: Context, node_input: TerminalDecision) -> TerminalDecision:
+    """Re-measure the terminal winner with fresh reps (winner's-curse guard).
+
+    Runs after the loop (cannot affect the quota or attempt cap). Builds a
+    fresh validate_fn/run_profile against the same shared baseline, re-screens
+    the winner, and promotes the runner-up if the fresh verdict no longer
+    clears the bar. Re-bridges state so a changed winner flows to apply.
+    """
+    validate_fn, run_profile = _screen_runtime(ctx)
+    term = stage_nodes.confirm_winner(
+        ctx, node_input, validate_fn=validate_fn, run_profile=run_profile
+    )
+    return _bridge_terminal_to_state(ctx, term)
 
 
 def production_preflight_node(
@@ -857,6 +894,9 @@ def create_knob_tuner_workflow(
     decide_node = FunctionNode(
         func=decision_node, name="decision_node", rerun_on_resume=True
     )
+    confirm_node = FunctionNode(
+        func=confirm_winner_node, name="confirm_winner_node", rerun_on_resume=True
+    )
     preflight_node = FunctionNode(
         func=production_preflight_node,
         name="production_preflight_node",
@@ -867,7 +907,7 @@ def create_knob_tuner_workflow(
         name="adco_knob_tuner",
         description=(
             "ADCo knob_tuner — staged recommend/compile/screen/diagnose/"
-            "decide/preflight/apply workflow."
+            "decide/confirm/preflight/apply workflow."
         ),
         edges=[
             ("START", validate_budget_node, prepare_node, inspector_agent),
@@ -883,7 +923,8 @@ def create_knob_tuner_workflow(
                  route=["pass", "fail"]),
             (diagnosis_agent, controller_node),
             (controller_node, {"retry": candidate_agent, "done": decide_node}),
-            (decide_node, preflight_node),
+            (decide_node, confirm_node),
+            (confirm_node, preflight_node),
             (preflight_node, apply_live_node),
             (apply_live_node, finalize_node),
         ],

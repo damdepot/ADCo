@@ -40,6 +40,8 @@ from src.knob_tuner.contracts import (
     DEFAULT_MEASURE_REPS,
     DEFAULT_MEASURE_SECONDS,
     DEFAULT_MEASURE_WARMUP_SECONDS,
+    DEFAULT_MIN_IMPROVEMENT_PCT,
+    DEFAULT_SUCCESS_CANDIDATES,
     ResourceBudget,
     RunManifest,
     SysbenchProfile,
@@ -54,6 +56,7 @@ from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
 from src.knob_tuner.tools.docker_tools import (
     ACTIVE_CONTAINERS,
     cleanup_orphan_containers,
+    prune_staging_artifacts,
     stop_staging_db,
 )
 from src.knob_tuner.tools.run_artifacts import (
@@ -334,6 +337,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--success-candidates",
+        type=int,
+        default=DEFAULT_SUCCESS_CANDIDATES,
+        help=(
+            "Number of LCB-clearing winners to collect before a winner stop is "
+            "allowed; a winner stop is premature while fewer have cleared the "
+            f"win gate (default: {DEFAULT_SUCCESS_CANDIDATES})"
+        ),
+    )
+    parser.add_argument(
+        "--min-improvement-pct",
+        type=float,
+        default=DEFAULT_MIN_IMPROVEMENT_PCT,
+        help=(
+            "Minimum LCB on throughput (percent) a candidate must exceed to "
+            "count as a winner / clear the win gate "
+            f"(default: {DEFAULT_MIN_IMPROVEMENT_PCT})"
+        ),
+    )
+    parser.add_argument(
         "--results-dir",
         default="results/dco",
         help="Base directory for run-scoped artifacts (default: results/dco)",
@@ -402,6 +425,8 @@ def build_initial_state(
     early_stop_min_reps: int = DEFAULT_EARLY_STOP_MIN_REPS,
     max_set_knobs: int = DEFAULT_MAX_SET_KNOBS,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    success_candidates: int = DEFAULT_SUCCESS_CANDIDATES,
+    min_improvement_pct: float = DEFAULT_MIN_IMPROVEMENT_PCT,
 ) -> dict[str, Any]:
     """Construct the initial session state for the knob tuner workflow."""
     profile = profile or SysbenchProfile()
@@ -423,6 +448,10 @@ def build_initial_state(
         "dry_run": dry_run,
         "validation_attempt_count": 0,
         "max_attempts": max(1, int(max_attempts or DEFAULT_MAX_ATTEMPTS)),
+        "success_candidates": max(
+            1, int(success_candidates or DEFAULT_SUCCESS_CANDIDATES)
+        ),
+        "min_improvement_pct": float(min_improvement_pct),
         "screen_total_rows": int(screen_total_rows),
         "screen_max_rows": int(screen_max_rows),
         "durability_profile": "strict",
@@ -593,13 +622,16 @@ async def run_pipeline(
     early_stop_min_reps: int = DEFAULT_EARLY_STOP_MIN_REPS,
     max_set_knobs: int = DEFAULT_MAX_SET_KNOBS,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    success_candidates: int = DEFAULT_SUCCESS_CANDIDATES,
+    min_improvement_pct: float = DEFAULT_MIN_IMPROVEMENT_PCT,
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using the ADK Runner and session service."""
     # 1. Resource contract FIRST: fail before any side effect.
     budget = _parse_budget(cpu_cores_arg, memory_arg)
     # Sysbench profile always defaults (pareto rand_type); durability always
     # strict; unconfirmed plans are never applied; orphans always cleaned up.
-    profile = SysbenchProfile()
+    # The win-gate pct is the one profile field exposed on the CLI.
+    profile = SysbenchProfile(min_improvement_pct=float(min_improvement_pct))
 
     target_abs = os.path.abspath(target)
     db_config_abs = os.path.abspath(db_config)
@@ -629,6 +661,23 @@ async def run_pipeline(
     except Exception as exc:
         _log_event(f"Orphan cleanup warning: {exc}", log_file=log_file_abs, verbose=verbose)
 
+    # Broad best-effort prune of prior runs' containers, snapshot images and
+    # dangling volumes. Skipped in dry-run mode since it mutates the host.
+    if not dry_run:
+        try:
+            pruned = prune_staging_artifacts()
+            _log_event(
+                f"Pruned {pruned.get('containers', 0)} stale container(s), "
+                f"{pruned.get('images', 0)} snapshot image(s), "
+                f"{pruned.get('volumes', 0)} dangling volume(s)",
+                log_file=log_file_abs,
+                verbose=verbose,
+            )
+        except Exception as exc:
+            _log_event(
+                f"Staging prune warning: {exc}", log_file=log_file_abs, verbose=verbose
+            )
+
     initial_state = build_initial_state(
         target=target_abs,
         db_type=db_type,
@@ -651,6 +700,8 @@ async def run_pipeline(
         early_stop_min_reps=early_stop_min_reps,
         max_set_knobs=max_set_knobs,
         max_attempts=max_attempts,
+        success_candidates=success_candidates,
+        min_improvement_pct=min_improvement_pct,
     )
 
     initial_state["verbose"] = verbose
@@ -857,6 +908,8 @@ def main() -> None:
                 early_stop_min_reps=args.early_stop_min_reps,
                 max_set_knobs=args.max_set_knobs,
                 max_attempts=args.max_attempts,
+                success_candidates=args.success_candidates,
+                min_improvement_pct=args.min_improvement_pct,
             )
         )
     except Exception as exc:

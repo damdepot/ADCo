@@ -30,6 +30,8 @@ from src.knob_tuner.contracts import (
     DEFAULT_MEASURE_REPS,
     DEFAULT_MEASURE_SECONDS,
     DEFAULT_MEASURE_WARMUP_SECONDS,
+    DEFAULT_MIN_IMPROVEMENT_PCT,
+    DEFAULT_SUCCESS_CANDIDATES,
     get_early_stop_min_reps,
     get_measure_reps,
     get_measure_seconds,
@@ -203,6 +205,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum tuner screening attempts before the loop stops (default: 10)",
     )
     p.add_argument(
+        "--success-candidates",
+        type=int,
+        default=DEFAULT_SUCCESS_CANDIDATES,
+        help=(
+            "Number of LCB-clearing winners to collect before a winner stop is "
+            "allowed (default: "
+            f"{DEFAULT_SUCCESS_CANDIDATES})"
+        ),
+    )
+    p.add_argument(
+        "--min-improvement-pct",
+        type=float,
+        default=DEFAULT_MIN_IMPROVEMENT_PCT,
+        help=(
+            "Minimum LCB on throughput (percent) a candidate must exceed to "
+            f"count as a winner (default: {DEFAULT_MIN_IMPROVEMENT_PCT})"
+        ),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
@@ -244,6 +265,8 @@ async def run_pipeline(
     early_stop_min_reps: int = DEFAULT_EARLY_STOP_MIN_REPS,
     max_set_knobs: int = DEFAULT_MAX_SET_KNOBS,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    success_candidates: int = DEFAULT_SUCCESS_CANDIDATES,
+    min_improvement_pct: float = DEFAULT_MIN_IMPROVEMENT_PCT,
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
 
@@ -355,6 +378,7 @@ async def run_pipeline(
         tuner_extra_state["early_stop_min_reps"] = get_early_stop_min_reps(timing)
         tuner_extra_state["max_set_knobs"] = max_set_knobs
         tuner_extra_state["max_attempts"] = max_attempts
+        tuner_extra_state["success_candidates"] = max(1, int(success_candidates or DEFAULT_SUCCESS_CANDIDATES))
 
         tuner_state = await tuner_pipeline(
             target=sandbox,
@@ -370,6 +394,7 @@ async def run_pipeline(
             extra_initial_state=tuner_extra_state,
             buffer_time=buffer_time,
             apply_mode=apply_mode,
+            min_improvement_pct=min_improvement_pct,
         )
     else:
         if verbose:
@@ -470,6 +495,12 @@ def main() -> None:
                 early_stop_min_reps=args.early_stop_min_reps,
                 max_set_knobs=getattr(args, "max_set_knobs", 20),
                 max_attempts=getattr(args, "max_attempts", 10),
+                success_candidates=getattr(
+                    args, "success_candidates", DEFAULT_SUCCESS_CANDIDATES
+                ),
+                min_improvement_pct=getattr(
+                    args, "min_improvement_pct", DEFAULT_MIN_IMPROVEMENT_PCT
+                ),
             )
         )
     except Exception as exc:

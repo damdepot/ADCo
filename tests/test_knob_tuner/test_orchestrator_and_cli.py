@@ -101,6 +101,7 @@ def test_create_root_agent_returns_workflow():
         "confirmation_controller",
         "diagnosis_agent",
         "decision_node",
+        "confirm_winner_node",
         "production_preflight_node",
         "apply_live_node",
         "finalize_node",
@@ -124,7 +125,8 @@ def test_workflow_edge_order():
         ("diagnosis_agent", "confirmation_controller"),
         ("confirmation_controller", "candidate_generation_agent"),
         ("confirmation_controller", "decision_node"),
-        ("decision_node", "production_preflight_node"),
+        ("decision_node", "confirm_winner_node"),
+        ("confirm_winner_node", "production_preflight_node"),
         ("production_preflight_node", "apply_live_node"),
         ("apply_live_node", "finalize_node"),
     ]
@@ -201,6 +203,9 @@ def _staged_state(**overrides):
         # exercise gating, not the cap. Cap tests override explicitly.
         "max_set_knobs": 99,
         "min_improvement_pct": 2.0,
+        # Quota-met by default: these tests predate the compounding campaign;
+        # quota behavior is covered by dedicated quota tests.
+        "success_candidates": 1,
     }
     state.update(overrides)
     return state
@@ -1216,14 +1221,16 @@ def _futility_state(**overrides):
     return state
 
 
-def test_decision_applies_confirmed_pass_below_threshold():
+def test_decision_withholds_confirmed_pass_below_threshold():
     from src.knob_tuner.stages import nodes as stage_nodes
 
+    # Compounding quota unification: "winner" means lcb > min_improvement_pct,
+    # so a confirmed PASS whose LCB misses the bar withholds.
     ctx = _FakeContext(_futility_state(all_rows=[_weak_row()]))
 
     dec = stage_nodes.decision(ctx)
-    assert dec.decision == "apply_winner", dec.summary
-    assert dec.winner_plan.get("knobs")
+    assert dec.decision != "apply_winner", dec.summary
+    assert dec.winner_plan == {}
 
 
 def test_decision_withholds_unconfirmed_best():
@@ -1454,6 +1461,9 @@ def test_cli_parser_defaults_with_required_resources():
     assert args.results_dir == "results/dco"
     assert args.db_config == "db.config"
     assert not hasattr(args, "production_db")
+    assert args.success_candidates == 10
+    assert args.max_attempts == 20
+    assert args.min_improvement_pct == 5.0
     assert args.log_file == "logs/knob_tuner.log"
     assert args.dry_run is False
     assert args.verbose is False
@@ -1489,7 +1499,8 @@ def test_cli_parser_defaults_with_required_resources():
     assert args.measure_warmup_seconds == 2
     assert args.early_stop_min_reps == 4
     assert args.screening_benchmark == "sysbench"
-    assert args.max_attempts == 10
+    assert args.max_attempts == 20
+    assert args.success_candidates == 10
 
 
 def test_cli_parser_max_attempts_override_and_no_legacy_flags():
@@ -1548,7 +1559,8 @@ def test_build_initial_state_sets_single_attempt_ceiling():
         knob_path="/tmp/knobs",
         dry_run=True,
     )
-    assert default["max_attempts"] == 10
+    assert default["max_attempts"] == 20
+    assert default["success_candidates"] == 10
     assert "max_validation_attempts" not in default
     assert "max_experiments" not in default
     custom = build_initial_state(
