@@ -26,3 +26,42 @@ testpaths = ["tests"]
 markers = [
     "case_study: tests that require external benchmark checkouts (e.g. TPC-C) and are excluded from the default core suite",
 ]
+
+[tool.ruff]
+# Phase 0 baseline (Ruff-only): minimal rule set the codebase meets on day one.
+target-version = "py312" # matches requires-python >= 3.12
+line-length = 88 # ruff default; E501 is NOT enabled (see deferred list below)
+
+exclude = [
+    "tests/fixtures/**", # intentional broken samples (invalid syntax, undefined names) used as checker test data
+    "datasets/**", # versioned eval samples, not linted source
+    "benchmarks/tools/**", # external benchmark checkouts (third-party code)
+    "out/**", # generated sandbox/pipeline output (may copy third-party code)
+    "logs/**", # generated run logs
+    "results/**", # generated experiment results
+]
+
+[tool.ruff.lint]
+select = [
+    "E4", # pycodestyle errors (import position, etc.)
+    "E7", # pycodestyle errors (statement structure)
+    "E9", # runtime errors (syntax errors, etc.)
+    "F", # pyflakes (unused imports/vars, undefined names)
+]
+
+ignore = [
+    # E402 waived: sys.path bootstrap import in scripts/eval_checker.py must come
+    # after sys.path.insert; tests/ use section-local imports for readability.
+    "E402",
+]
+
+# Deferred to later phases (NOT enabled: codebase cannot meet them on day one):
+# - "E501" (line-too-long): ~1300 violations; needs a formatter/line-length pass first.
+# - "I" (isort): import blocks unsorted across many files; enable alongside a `ruff check --fix` cleanup.
+# - "UP" (pyupgrade), "B" (bugbear), "SIM", "C4", "PLW", "S", "BLE", "TRY", etc.:
+#   800+ violations under a full select; adopt incrementally after the baseline is green.
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.9",
+]

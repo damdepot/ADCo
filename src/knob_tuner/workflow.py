@@ -411,9 +411,12 @@ def apply_live_node(ctx: Context, node_input: Any = None) -> Event:
             spec.name for spec in plan.knobs if requires_restart(spec)
         }
         persisted_static = [r for r in applied if r.get("knob") in restart_names]
+        persisted_names = sorted(
+            str(r.get("knob")) for r in persisted_static if r.get("knob")
+        )
         progress(
-            f"applied {len(applied)}; pending restart: "
-            f"{', '.join(sorted(restart_names)) or 'none'}"
+            f"applied live: {len(applied)}; persisted (pending restart): "
+            f"{', '.join(persisted_names) or 'none'}"
         )
         # Phase 1.4: explicit apply outcome. An empty `applied` list is never
         # reported as a success: APPLIED (all), PARTIAL (some), APPLIED_NOTHING

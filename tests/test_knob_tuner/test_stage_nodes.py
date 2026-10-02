@@ -439,6 +439,30 @@ def test_decision_inconclusive_vs_fail():
     assert out2.decision == "fail"
 
 
+def test_decision_confirmed_pass_below_threshold_still_applies():
+    ctx = FakeCtx({"min_improvement_pct": 5.0})
+    row = _row(mean=1.0, lcb=0.5)
+    out = nodes.decision(ctx, all_rows=[row], baseline_tps=[100.0])
+    assert out.decision == "apply_winner"
+    assert out.winner_plan["knobs"][0]["name"] == "work_mem"
+
+
+def test_decision_picks_best_confirmed_pass():
+    ctx = FakeCtx({"min_improvement_pct": 5.0})
+    rows = [_row(mean=1.0, lcb=0.5), _row(mean=3.0, lcb=1.0)]
+    out = nodes.decision(ctx, all_rows=rows, baseline_tps=[100.0])
+    assert out.decision == "apply_winner"
+    assert out.summary["stats"]["mean_delta_pct"] == 3.0
+
+
+def test_decision_unconfirmed_pass_withholds():
+    ctx = FakeCtx({"min_improvement_pct": 2.0})
+    row = _row(confirmed=False)
+    out = nodes.decision(ctx, all_rows=[row], baseline_tps=[100.0])
+    assert out.decision != "apply_winner"
+    assert out.winner_plan == {}
+
+
 # --- preflight routing ---
 
 
@@ -459,8 +483,21 @@ def test_preflight_auto_live():
     assert out.route == "auto"
 
 
-def test_preflight_maintenance_on_restart_knob():
-    ctx = FakeCtx({})
+def test_preflight_auto_on_restart_knob_under_live():
+    ctx = FakeCtx({"apply_mode": "live"})
+    out = nodes.production_preflight(
+        ctx,
+        _terminal(
+            [{"name": "shared_buffers", "value": "1GB", "scope": "postmaster",
+              "restart_required": True}]
+        ),
+    )
+    assert out.route == "auto"
+    assert "persisted under live" in out.reason
+
+
+def test_preflight_maintenance_on_restart_knob_under_manual():
+    ctx = FakeCtx({"apply_mode": "manual"})
     out = nodes.production_preflight(
         ctx,
         _terminal(

@@ -26,7 +26,6 @@ from src.knob_tuner.contracts import (
     get_min_improvement_pct,
 )
 from src.knob_tuner.stages.models import PreflightVerdict, TerminalDecision
-from src.knob_tuner.tools.experiments import pick_winner
 from src.knob_tuner.tools.knob_scope import requires_restart
 from src.knob_tuner.tools.knobs import coerce_apply_mode, coerce_profile
 from src.knob_tuner.stages.nodes._common import _jsonable, _state
@@ -35,6 +34,13 @@ from src.knob_tuner.stages.nodes._common import _jsonable, _state
 # ---------------------------------------------------------------------------
 # 6. decision
 # ---------------------------------------------------------------------------
+
+
+def _row_float(row: dict[str, Any], key: str) -> float:
+    try:
+        return float(row.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _row_plan_name(row: dict[str, Any]) -> Any:
@@ -87,10 +93,11 @@ def decision(
     ``workflow`` (lines 869-974) plus the archive payload (returned as data —
     no file writes). Never returns ``None``.
 
-    Phase 1.7: only a strong win (``apply_winner`` — PASS + confirmed + LCB
-    above threshold) yields a winner. A best-but-unconfirmed plan
-    (``keep_best``) is never applied; without a confirmed winner the outcome
-    is ``inconclusive``/``fail`` so nothing is applied.
+    Phase 1.7: a confirmed PASS applies (``apply_winner``) regardless of
+    ``min_improvement_pct`` — the best confirmed PASS row (highest mean,
+    tie-broken by LCB) wins. ``min_improvement_pct`` is retained for
+    reporting/archive only. Only failures, unconfirmed rows, or futility
+    (no confirmed PASS) withhold, yielding ``inconclusive``/``fail``.
     """
     state = _state(ctx)
     try:
@@ -136,27 +143,30 @@ def decision(
 
         winner_row: dict[str, Any] | None = None
         outcome = "fail"
-        for row in rows:
-            try:
-                row_lcb = float(row.get("lcb_pct", 0.0))
-            except (TypeError, ValueError):
-                row_lcb = 0.0
-            if (
-                str(row.get("status", "")).upper() == "PASS"
-                and bool(row.get("confirmed", False))
-                and row_lcb > float(min_improvement_pct)
-            ):
-                winner_row = row
-                outcome = "apply_winner"
-                break
+        # Phase 1.7: a confirmed PASS applies regardless of min_improvement_pct
+        # (retained for reporting/archive only). Pick the best confirmed PASS
+        # row — highest mean, tie-broken by LCB — not the first one seen.
+        confirmed_pass_rows = [
+            row
+            for row in rows
+            if str(row.get("status", "")).upper() == "PASS"
+            and bool(row.get("confirmed", False))
+        ]
+        if confirmed_pass_rows:
+            winner_row = max(
+                confirmed_pass_rows,
+                key=lambda row: (
+                    _row_float(row, "mean_delta_pct"),
+                    _row_float(row, "lcb_pct"),
+                ),
+            )
+            outcome = "apply_winner"
         withheld_best = False
         if winner_row is None:
-            best_row = pick_winner([r for r in rows if r.get("confirmed")])
-            if best_row is not None:
-                # Phase 1.7: a failed/inconclusive campaign (no strong
-                # winner — e.g. futility stop with no PASS verdict, or a
-                # best row below the win threshold) applies nothing.
-                withheld_best = True
+            # No confirmed PASS row exists (otherwise it would have won), so
+            # any confirmed row here is a non-PASS best: futility/unconfirmed
+            # campaigns apply nothing.
+            withheld_best = any(bool(r.get("confirmed")) for r in rows)
         winner_plan_raw: Any = None
         winner_stats: dict[str, float] = {}
         winner_paired: Any = None
@@ -372,11 +382,11 @@ def production_preflight(
         )
         if restart_names:
             return PreflightVerdict(
-                route="maintenance_assisted",
+                route="auto",
                 reason=(
                     "restart-required knobs "
-                    f"({', '.join(restart_names)}); durability={durability_profile}: "
-                    "production never restarts automatically"
+                    f"({', '.join(restart_names)}) persisted under live; "
+                    "activated on operator restart (tuner never restarts)"
                 ),
             )
         return PreflightVerdict(

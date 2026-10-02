@@ -88,14 +88,18 @@ def _knob_requires_restart(item: dict[str, Any], scope: KnobScope) -> bool:
 
 
 def _applies_in_mode(scope: KnobScope, mode: ApplyMode) -> bool:
-    """Return True when ``scope`` should be applied under ``mode``."""
+    """Return True when ``scope`` should be applied under ``mode``.
+
+    LIVE applies the full plan: reloadable knobs activate immediately while
+    restart-required (postmaster/static) knobs are persisted and only activate
+    on the operator's next restart. MANUAL executes nothing (it emits SQL
+    only). INTERNAL knobs are never applied under any mode.
+    """
     if scope == KnobScope.INTERNAL:
         return False
     if mode == ApplyMode.LIVE:
-        return scope not in (KnobScope.POSTMASTER, KnobScope.INTERNAL)
+        return scope != KnobScope.INTERNAL
     if mode == ApplyMode.MANUAL:
-        # Apply the full plan: reloadable knobs go live, restart-required knobs
-        # are persisted and only activated by the operator's manual restart.
         return True
     return False
 

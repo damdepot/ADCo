@@ -155,7 +155,7 @@ def test_apply_knobs_mode_none_skips_all_no_connection(mock_db_config_pg):
         assert result["error"] is None
 
 
-def test_apply_knobs_mode_live_excludes_static_and_rejects_internal(
+def test_apply_knobs_mode_live_applies_static_and_rejects_internal(
     mock_db_config_pg, mock_db_conn
 ):
     conn, cursor = mock_db_conn
@@ -167,14 +167,17 @@ def test_apply_knobs_mode_live_excludes_static_and_rejects_internal(
     with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
         results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.LIVE)
 
+    # LIVE applies the full plan: reloadable knobs go live now, restart-required
+    # (postmaster) knobs are persisted for the next restart; internal rejected.
     assert len(results) == 3
     assert results[0]["status"] == "applied"
-    assert results[1]["status"] == "skipped"
+    assert results[1]["status"] == "applied"
+    assert results[1]["sql"] == "ALTER SYSTEM SET shared_buffers = '1GB';"
     assert results[2]["status"] == "failed"
     assert results[2]["error"] == "internal knob rejected: max_worker_processes"
     assert results[2]["sql"] == ""
-    # One ALTER for work_mem + one pg_reload_conf()
-    assert cursor.execute.call_count == 2
+    # Two ALTERs + one pg_reload_conf()
+    assert cursor.execute.call_count == 3
 
 
 def test_apply_knobs_mode_manual_applies_full_plan_and_reloads(

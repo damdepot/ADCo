@@ -117,10 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "live", "manual"],
         default="live",
         help=(
-            "How validated knobs are applied: 'live' mutates reloadable knobs "
-            "now; 'manual' never mutates and instead emits manual SQL plus a "
-            "restart procedure (default: live; legacy spellings dynamic, "
-            "safe-auto, persist-static, maintenance-assisted still accepted)"
+            "How validated knobs are applied: 'live' applies reloadable knobs "
+            "now and persists restart-required knobs for the next restart "
+            "(never auto-restarts); 'manual' emits SQL only and never mutates "
+            "(default: live; legacy spellings dynamic, safe-auto, "
+            "persist-static, maintenance-assisted still accepted)"
         ),
     )
     p.add_argument(

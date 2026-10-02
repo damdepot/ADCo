@@ -771,18 +771,30 @@ def test_apply_live_node_postmaster_recorded_pending_restart():
             "apply_mode": "live",
         }
     )
+    applied = [
+        {
+            "knob": "max_connections",
+            "value": "200",
+            "status": "applied",
+            "sql": "ALTER SYSTEM SET max_connections = '200';",
+            "error": None,
+        }
+    ]
     with patch(
-        "src.knob_tuner.workflow.apply_knobs", return_value=[]
+        "src.knob_tuner.workflow.apply_knobs", return_value=applied
     ):
         event = apply_live_node(ctx)
     pending = event.output["pending_restart_knobs"]
     assert len(pending) == 1
     assert pending[0]["name"] == "max_connections"
-    # Nothing was applied (postmaster knob skipped under live mode): the
-    # empty apply must not report success or stay PASS.
-    assert event.output["status"] == "APPLIED_NOTHING"
-    assert event.output["applied_knobs"] == []
-    assert event.actions.state_delta["result_status"] == "INCONCLUSIVE"
+    # LIVE applies the full plan: the postmaster knob is persisted now and
+    # recorded as pending an operator restart, so this is a full apply.
+    persisted = event.output["persisted_static_knobs"]
+    assert len(persisted) == 1
+    assert persisted[0]["knob"] == "max_connections"
+    assert event.output["status"] == "APPLIED"
+    assert event.output["applied_knobs"] == applied
+    assert "result_status" not in event.actions.state_delta
 
 
 def test_finalize_node_builds_manifest(tmp_path: Path):
@@ -968,6 +980,42 @@ def test_apply_live_node_full_apply_keeps_pass():
         event = apply_live_node(ctx)
     assert event.output["status"] == "APPLIED"
     assert "result_status" not in event.actions.state_delta
+
+
+def test_apply_live_node_real_apply_persists_postmaster(mock_db_conn):
+    # End-to-end through the real apply_knobs: under LIVE a restart-required
+    # (postmaster) knob is persisted now and recorded for the next restart,
+    # while the reloadable knob is applied live. The tuner never restarts.
+    conn, cursor = mock_db_conn
+    plan = {
+        "knobs": [
+            {
+                "name": "work_mem",
+                "value": "64MB",
+                "scope": "user",
+                "restart_required": False,
+                "reasoning": "",
+            },
+            {
+                "name": "shared_buffers",
+                "value": "1GB",
+                "scope": "postmaster",
+                "restart_required": True,
+                "reasoning": "",
+            },
+        ]
+    }
+    ctx = _pass_ctx(knob_plan=plan)
+    with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
+        event = apply_live_node(ctx)
+
+    assert event.output["status"] == "APPLIED"
+    applied_names = [r["knob"] for r in event.output["applied_knobs"]]
+    assert applied_names == ["work_mem", "shared_buffers"]
+    persisted = event.output["persisted_static_knobs"]
+    assert [r["knob"] for r in persisted] == ["shared_buffers"]
+    pending = event.output["pending_restart_knobs"]
+    assert [p["name"] for p in pending] == ["shared_buffers"]
 
 
 def test_apply_live_node_identity_mismatch_refuses():
@@ -1168,10 +1216,30 @@ def _futility_state(**overrides):
     return state
 
 
-def test_decision_withholds_unconfirmed_best_by_default():
+def test_decision_applies_confirmed_pass_below_threshold():
     from src.knob_tuner.stages import nodes as stage_nodes
 
     ctx = _FakeContext(_futility_state(all_rows=[_weak_row()]))
+
+    dec = stage_nodes.decision(ctx)
+    assert dec.decision == "apply_winner", dec.summary
+    assert dec.winner_plan.get("knobs")
+
+
+def test_decision_withholds_unconfirmed_best():
+    from src.knob_tuner.stages import nodes as stage_nodes
+
+    ctx = _FakeContext(_futility_state(all_rows=[_weak_row(confirmed=False)]))
+
+    dec = stage_nodes.decision(ctx)
+    assert dec.decision in ("inconclusive", "fail"), dec.summary
+    assert dec.winner_plan == {}
+
+
+def test_decision_withholds_confirmed_nonpass_best():
+    from src.knob_tuner.stages import nodes as stage_nodes
+
+    ctx = _FakeContext(_futility_state(all_rows=[_weak_row(status="FAIL")]))
 
     dec = stage_nodes.decision(ctx)
     assert dec.decision in ("inconclusive", "fail"), dec.summary

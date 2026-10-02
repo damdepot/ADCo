@@ -46,7 +46,7 @@ def main() -> None:
         return
 
     print(f"\n{'#' * 60}")
-    print(f"# CHECKER EVALUATION")
+    print("# CHECKER EVALUATION")
     print(f"# Model: {args.model}  Data: {data_dir}  Delay: {args.delay}s")
     if args.category:
         print(f"# Category filter: {args.category}")
