@@ -58,6 +58,78 @@ def _row_plan_name(row: dict[str, Any]) -> Any:
     return getattr(result, "plan", None)
 
 
+def _row_arm_name(row: dict[str, Any]) -> str:
+    for key in ("arm", "name", "exp_name"):
+        try:
+            val = row.get(key)
+        except AttributeError:
+            continue
+        if val:
+            return str(val)
+    return "?"
+
+
+def _dominance_note(
+    winner_row: dict[str, Any] | None,
+    rows: list[dict[str, Any]],
+) -> tuple[str | None, str | None, str | None]:
+    """Compare winner LCB vs every other confirmed arm's UCB (info only).
+
+    Returns ``(lead, runner_up, note)`` where ``lead`` is ``"decisive"``
+    when the winner's LCB clears all other confirmed arms' UCBs, else
+    ``"overlapping"`` with the runner-up (max challenger UCB) name.
+    Rows lacking a parseable ``ucb_pct`` are skipped, never crash.
+    Purely informational — callers must not alter routing on it.
+    """
+    if winner_row is None:
+        return None, None, None
+    try:
+        winner_lcb = float(winner_row.get("lcb_pct", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None, None, None
+    best_ucb: float | None = None
+    runner_up: str | None = None
+    try:
+        for row in rows:
+            if row is winner_row:
+                continue
+            try:
+                if not bool(row.get("confirmed", False)):
+                    continue
+            except Exception:
+                continue
+            raw_ucb = row.get("ucb_pct", None)
+            if raw_ucb is None:
+                continue
+            try:
+                ucb = float(raw_ucb)
+            except (TypeError, ValueError):
+                continue
+            if best_ucb is None or ucb > best_ucb:
+                best_ucb = ucb
+                runner_up = _row_arm_name(row)
+    except Exception:
+        return None, None, None
+    if best_ucb is None:
+        return (
+            "decisive",
+            None,
+            f"lead: decisive (no challenger UCB overlaps winner LCB {winner_lcb:.2f}%)",
+        )
+    if winner_lcb > best_ucb:
+        return (
+            "decisive",
+            runner_up,
+            f"lead: decisive (winner LCB {winner_lcb:.2f}% clears challenger UCB {best_ucb:.2f}%)",
+        )
+    return (
+        "overlapping",
+        runner_up,
+        f"lead: overlapping (runner-up {runner_up} UCB {best_ucb:.2f}% "
+        f"overlaps winner LCB {winner_lcb:.2f}%)",
+    )
+
+
 def _plan_dump(plan: Any) -> dict[str, Any]:
     if plan is None:
         return {}
@@ -253,6 +325,15 @@ def decision(
             "success_knobs": _jsonable(state.get("success_knobs") or ""),
             "confirmation": _jsonable(state.get("confirmation") or {}),
         }
+        # Dominance note (informational only — never alters routing/status):
+        # winner LCB vs every other confirmed arm's UCB.
+        try:
+            lead, runner_up, lead_note = _dominance_note(winner_row, rows)
+        except Exception:
+            lead, runner_up, lead_note = None, None, None
+        if lead is not None:
+            archive_payload["lead"] = lead
+            archive_payload["runner_up"] = runner_up
         reasons = [str(r) for row in rows for r in (row.get("reasons") or [])]
         # Audit trail: compile rejections never produce screen rows, so row
         # reasons alone would silently drop them. Append the rejected history
@@ -276,6 +357,8 @@ def decision(
                 "unconfirmed best withheld: no confirmed winner above "
                 "threshold; nothing applied"
             ]
+        if lead_note is not None and lead_note not in reasons:
+            reasons.append(lead_note)
         if controller_route or controller_reason:
             note = f"controller: {controller_route or '?'}".rstrip()
             if controller_reason:

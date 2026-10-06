@@ -310,7 +310,7 @@ def test_screen_records_row_and_bumps_attempt_once():
     )
     assert ctx.state["validation_attempt_count"] == 1
     assert len(ctx.state["experiment_history"]) == 1
-    assert ctrl["route"] == "done"  # confident win backstop
+    assert ctrl["route"] == "done"  # quota met (1/1): confident win backstop
     assert ctrl.get("reason") == "confident_win_backstop"
 
 
@@ -402,17 +402,17 @@ def test_screen_fail_value_on_error_never_none():
 # --- decision ---
 
 
-def _row(mean=5.0, lcb=3.0, status="PASS", confirmed=True):
+def _row(mean=5.0, lcb=3.0, status="PASS", confirmed=True, ucb=7.0, arm="e1"):
     plan = KnobPlan.model_validate(
         {"knobs": [{"name": "work_mem", "value": "64MB", "scope": "user"}]}
     )
     return {
-        "arm": "e1",
+        "arm": arm,
         "phase": "screen",
         "status": status,
         "mean_delta_pct": mean,
         "lcb_pct": lcb,
-        "ucb_pct": 7.0,
+        "ucb_pct": ucb,
         "df": 4.0,
         "confirmed": confirmed,
         "improvement_confident": lcb > 2.0,
@@ -465,6 +465,32 @@ def test_decision_unconfirmed_pass_withholds():
     out = nodes.decision(ctx, all_rows=[row], baseline_tps=[100.0])
     assert out.decision != "apply_winner"
     assert out.winner_plan == {}
+
+
+def test_decision_lead_decisive():
+    ctx = FakeCtx({"min_improvement_pct": 2.0})
+    winner = _row(mean=5.0, lcb=4.0, ucb=6.0, arm="e1")
+    runner = _row(mean=3.0, lcb=2.0, ucb=3.0, arm="e2")
+    out = nodes.decision(ctx, all_rows=[winner, runner], baseline_tps=[100.0])
+    assert out.decision == "apply_winner"
+    assert out.summary["stats"]["mean_delta_pct"] == 5.0
+    archive = out.summary["archive"]
+    assert archive["lead"] == "decisive"
+    assert any("decisive" in r for r in out.summary["reasons"])
+
+
+def test_decision_lead_overlapping():
+    ctx = FakeCtx({"min_improvement_pct": 2.0})
+    winner = _row(mean=5.0, lcb=3.0, ucb=7.0, arm="e1")
+    runner = _row(mean=3.0, lcb=2.0, ucb=6.0, arm="e2")
+    out = nodes.decision(ctx, all_rows=[winner, runner], baseline_tps=[100.0])
+    assert out.decision == "apply_winner"
+    # Winner stays the same max(mean, lcb) arm.
+    assert out.summary["stats"]["mean_delta_pct"] == 5.0
+    archive = out.summary["archive"]
+    assert archive["lead"] == "overlapping"
+    assert archive["runner_up"] == "e2"
+    assert any("overlapping" in r and "e2" in r for r in out.summary["reasons"])
 
 
 # --- preflight routing ---

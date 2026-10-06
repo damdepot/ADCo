@@ -341,6 +341,41 @@ def _latest_verdict_stats(state: Any, node_input: Any = None) -> tuple[float, fl
     return 0.0, 0.0, False
 
 
+def _latest_incumbent_ref(
+    state: Any, node_input: Any, mean: float, lcb: float
+) -> dict[str, Any]:
+    """Return the leading-arm reference for the triggering verdict.
+
+    Generic: no knob names. ``plan_hash`` resolves from the verdict-shaped
+    ``node_input`` first, then ``last_screen_row``, then the tail of
+    ``experiment_history``; ``""`` when no hash is carried. Never throws.
+    """
+    plan_hash = ""
+    with contextlib.suppress(Exception):
+        if isinstance(node_input, dict) and node_input.get("plan_hash"):
+            plan_hash = str(node_input.get("plan_hash") or "")
+        if not plan_hash:
+            get = getattr(state, "get", None)
+            row = get("last_screen_row") if callable(get) else None
+            if isinstance(row, dict) and row.get("plan_hash"):
+                plan_hash = str(row.get("plan_hash") or "")
+        if not plan_hash:
+            get = getattr(state, "get", None)
+            hist = get("experiment_history") if callable(get) else None
+            if (
+                isinstance(hist, list)
+                and hist
+                and isinstance(hist[-1], dict)
+                and hist[-1].get("plan_hash")
+            ):
+                plan_hash = str(hist[-1].get("plan_hash") or "")
+    with contextlib.suppress(Exception):
+        mean = float(mean)
+    with contextlib.suppress(Exception):
+        lcb = float(lcb)
+    return {"plan_hash": plan_hash, "mean": mean, "lcb": lcb}
+
+
 # ---------------------------------------------------------------------------
 # 1. materialize_inventory
 # ---------------------------------------------------------------------------
@@ -1275,11 +1310,62 @@ def confirmation_controller(
                 if winners_found >= target:
                     route = "done"
                     reason = "confident_win_backstop"
-                elif reason != "quota_not_met":
-                    # Keep the stop-downgrade reason when present; otherwise
-                    # name the collecting state explicitly.
-                    route = "retry"
-                    reason = "collecting_success_candidates"
+                else:
+                    # While collecting (quota unmet), bank the leading arm as
+                    # the incumbent (strictly better by (mean, lcb)
+                    # lexicographic, the decision's ordering). Generic: no
+                    # knob names. Quota-met -> done above is untouched, and the
+                    # caps below still run so collecting can always exit.
+                    candidate = _latest_incumbent_ref(state, node_input, mean, lcb)
+                    incumbent: dict[str, Any] = candidate
+                    with contextlib.suppress(Exception):
+                        current = state.get("incumbent")
+                        if isinstance(current, dict):
+                            try:
+                                cur_key = (
+                                    float(current.get("mean", 0.0) or 0.0),
+                                    float(current.get("lcb", 0.0) or 0.0),
+                                )
+                            except (TypeError, ValueError):
+                                cur_key = None
+                            if cur_key is not None and (mean, lcb) <= cur_key:
+                                incumbent = {
+                                    "plan_hash": str(current.get("plan_hash", "") or ""),
+                                    "mean": cur_key[0],
+                                    "lcb": cur_key[1],
+                                }
+                            else:
+                                with contextlib.suppress(Exception):
+                                    state["incumbent"] = dict(candidate)
+                        else:
+                            with contextlib.suppress(Exception):
+                                state["incumbent"] = dict(candidate)
+                    name, _, _ = _describe_arm(node_input, state)
+                    with contextlib.suppress(Exception):
+                        # _describe_arm falls back to "experiment" for
+                        # diagnosis inputs; prefer the verdict row's arm label
+                        # when generic.
+                        if name == "experiment":
+                            row = state.get("last_screen_row")
+                            if isinstance(row, dict):
+                                for key in ("arm", "exp_name", "name"):
+                                    label = str(row.get(key, "") or "").strip()
+                                    if label:
+                                        name = label
+                                        break
+                    leader = str(incumbent.get("plan_hash") or name or "leader")
+                    if reason != "quota_not_met":
+                        # Keep the stop-downgrade reason when present;
+                        # otherwise name the collecting state + leader.
+                        route = "retry"
+                        reason = (
+                            "collecting_success_candidates: leader "
+                            f"{leader} mean={mean:+.2f}% lcb={lcb:+.2f}%"
+                        )
+                    else:
+                        route = "retry"
+                    gate_info = dict(gate_info or {})
+                    gate_info["incumbent"] = dict(incumbent)
             try:
                 rc = int(state.get("retry_same_count", 0) or 0)
             except (TypeError, ValueError):

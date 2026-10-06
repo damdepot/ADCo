@@ -163,6 +163,28 @@ def _last_verdict_pwin(row: dict[str, Any]) -> str:
     return "n/a"
 
 
+def _incumbent_lines(rows: list[dict[str, Any]]) -> list[str]:
+    """One-line incumbent-leader anchor for post-win steering (never throws).
+
+    Picks the confirmed row with the best mean delta; empty when there is
+    no confirmed winner yet (absent leader = generator screens normally).
+    """
+    try:
+        confirmed = [r for r in rows if isinstance(r, dict) and r.get("confirmed")]
+        if not confirmed:
+            return []
+        best = max(confirmed, key=lambda r: _num(r.get("mean_delta_pct")))
+        return [
+            f"Incumbent leader: {best.get('name', '?')} "
+            f"[{best.get('phase', '?')}] "
+            f"knobs={best.get('n_knobs', '?')} "
+            f"mean={_fmt_pct(best.get('mean_delta_pct'))} "
+            f"(vary around it; never re-propose its exact set)"
+        ]
+    except Exception:  # noqa: BLE001 - bundle must never throw
+        return []
+
+
 def _last_verdict_lines(state: Mapping[str, Any]) -> list[str]:
     row = state.get("last_screen_row")
     if not isinstance(row, dict):
@@ -238,7 +260,7 @@ def build_evidence_bundle(state: Mapping[str, Any] | None) -> str:
         detail_head = ["### Last experiments (detail, last 2)"]
         detail = _detail_lines(rows) or ["- none yet."]
         verdict_head = ["### Last verdict"]
-        verdict = _last_verdict_lines(state)
+        verdict = _last_verdict_lines(state) + _incumbent_lines(rows)
         rejected_head = ["### Rejected notes"]
         # History table is the first thing truncated; rejected notes second.
         table = (

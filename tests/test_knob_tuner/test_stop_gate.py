@@ -294,6 +294,61 @@ def test_evidence_bundle_shows_p_win_column():
 # --- prompt calibration + stop_reason ---
 
 
+def _next_diag():
+    return DiagnosisOutput(correction="drop_knob", targets=[], rationale="keep screening",
+                           confidence=0.6)
+
+
+def test_confident_win_continues_and_records_incumbent():
+    # Quota unmet (empty history, target=1): a confident win keeps
+    # collecting and banks the leading arm; done happens at quota, the cap,
+    # or on a diagnosis stop.
+    row = dict(_win_row(), plan_hash="hash-aaa")
+    ctx = _gate_state(row)
+    out = nodes.confirmation_controller(ctx, _next_diag())
+    assert out["route"] == "retry"
+    assert out["reason"].startswith("collecting_success_candidates")
+    assert "hash-aaa" in out["reason"] or "e-win" in out["reason"]
+    incumbent = ctx.state.get("incumbent")
+    assert incumbent == {"plan_hash": "hash-aaa", "mean": 12.0, "lcb": 11.0}
+    assert out["incumbent"] == incumbent
+
+
+def test_confident_win_at_cap_stops():
+    row = dict(_win_row(), plan_hash="hash-aaa")
+    ctx = _gate_state(row, validation_attempt_count=6)
+    out = nodes.confirmation_controller(ctx, _next_diag())
+    assert out["route"] == "done"
+    assert out["reason"] == "attempt_cap"
+
+
+def test_first_win_then_better_arm_keeps_later_incumbent():
+    first = dict(_win_row(), arm="e-first", plan_hash="hash-aaa",
+                 mean_delta_pct=12.0, lcb_pct=11.0)
+    ctx = _gate_state(first)
+    out1 = nodes.confirmation_controller(ctx, _next_diag())
+    assert out1["route"] == "retry"
+    assert out1["reason"].startswith("collecting_success_candidates")
+    assert ctx.state.get("incumbent") == {"plan_hash": "hash-aaa", "mean": 12.0, "lcb": 11.0}
+    # A strictly better (mean, lcb) verdict replaces the incumbent.
+    better = dict(_win_row(), arm="e-better", plan_hash="hash-bbb",
+                  mean_delta_pct=15.0, lcb_pct=12.0)
+    ctx.state["last_screen_row"] = dict(better)
+    out2 = nodes.confirmation_controller(ctx, _next_diag())
+    assert out2["route"] == "retry"
+    assert out2["reason"].startswith("collecting_success_candidates")
+    assert ctx.state.get("incumbent") == {"plan_hash": "hash-bbb", "mean": 15.0, "lcb": 12.0}
+    assert "hash-bbb" in out2["reason"] or "e-better" in out2["reason"]
+    # A worse verdict must not displace the leader.
+    worse = dict(_win_row(), arm="e-worse", plan_hash="hash-ccc",
+                 mean_delta_pct=10.0, lcb_pct=9.0)
+    ctx.state["last_screen_row"] = dict(worse)
+    out3 = nodes.confirmation_controller(ctx, _next_diag())
+    assert out3["route"] == "retry"
+    assert out3["reason"].startswith("collecting_success_candidates")
+    assert ctx.state.get("incumbent") == {"plan_hash": "hash-bbb", "mean": 15.0, "lcb": 12.0}
+
+
 def test_diagnosis_prompt_has_calibration_section():
     text = diag_prompt_mod.DIAGNOSIS_AGENT_PROMPT
     assert "0.9+" in text
@@ -411,7 +466,7 @@ def test_quota_unmet_backstop_collects_and_caps_later():
                         rationale="next", confidence=0.6),
     )
     assert out["route"] == "retry"
-    assert out["reason"] == "collecting_success_candidates"
+    assert out["reason"].startswith("collecting_success_candidates")
 
 
 def test_get_success_candidates_defaults_and_floor():

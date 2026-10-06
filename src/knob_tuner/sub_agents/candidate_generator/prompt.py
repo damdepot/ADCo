@@ -49,6 +49,10 @@ When a diagnosis is present, apply its enum exactly:
 - interaction: joint variation of previously confirmed movers to catch couplings (e.g. shared_buffers x checkpoint, work_mem x parallelism).
 - refinement: tight grid around the best so far; small knob sets (1-4 knobs, small steps).
 
+## Post-win steering (conditional — only when a confirmed leader exists)
+- When {evidence_bundle?} names an incumbent leader, prefer refinement/interaction experiments that vary around it: adjust a value or add/remove one coupled knob (favor {belief_table?} movers). NEVER re-propose its exact knob set — repeats are compile-rejected.
+- With no confirmed leader in {evidence_bundle?}, keep current behavior: screen for fresh movers per the method above.
+
 ## Durability policy (strict is ALWAYS enforced — there is no relaxed mode)
 - `synchronous_commit` stays `on`, `full_page_writes` `on`, `fsync` `on`. WAL/checkpoint sizing, autovacuum, planner, I/O knobs allowed.
 - NEVER propose `synchronous_commit = off`, `full_page_writes = off`, or `fsync = off` under any circumstance: the trust boundary rejects them.

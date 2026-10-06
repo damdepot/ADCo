@@ -369,7 +369,7 @@ def test_confirmation_controller_node_retry_then_done():
     assert len(ctx.state["experiment_history"]) == 1
     assert len(ctx.state["diagnosis_history"]) == 1
 
-    # Confident win short-circuits to done even when diagnosis says NEXT.
+    # Confident win with the quota met (1/1) stops via the backstop.
     ctx.state["last_screen_row"] = {
         "status": "PASS",
         "mean_delta_pct": 5.0,
