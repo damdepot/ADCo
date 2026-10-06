@@ -35,6 +35,9 @@ def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any, restart_requ
     if db_type_norm in ("postgres", "postgresql"):
         # For Postgres, ALTER SYSTEM SET <knob> = '<value>';
         # Quotes are valid for string, byte units (e.g. '256MB'), and numbers.
+        # Normalize "<number> <pg_settings-unit>" display shapes (e.g. "393216 8kB")
+        # copied from the inspector output into a SET-accepted literal first.
+        val_str = _normalize_display_value(val_str)
         if isinstance(knob_value, (int, float)):
             return f"ALTER SYSTEM SET {knob_name} = {knob_value};"
         elif val_str.lower() in ("on", "off", "true", "false") or val_str.isdigit():
@@ -344,6 +347,50 @@ def snapshot_settings(cfg: DBConfig, names: list[str]) -> dict[str, str]:
 _PG_MEMORY_UNITS = {"b", "kb", "mb", "gb", "tb", "8kb", "16kb", "32kb", "64kb"}
 _PG_TIME_UNITS = {"us", "ms", "s", "min", "h", "d"}
 
+# Suffixes accepted by Postgres SET for memory GUCs (HINT: B/kB/MB/GB/TB).
+_SET_MEMORY_UNITS: tuple[tuple[str, int], ...] = (
+    ("GB", 1024**3),
+    ("MB", 1024**2),
+    ("kB", 1024),
+)
+
+_DISPLAY_VALUE_RE = re.compile(r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s+([A-Za-z0-9]+)\s*$")
+
+
+def _normalize_display_value(val_str: str) -> str:
+    """Convert a ``"<number> <pg_settings-unit>"`` display shape to a SET-accepted literal.
+
+    The inspector renders e.g. ``current_value="262144 8kB"`` style strings and
+    the model copies that shape back (``"393216 8kB"``); Postgres rejects the
+    embedded space (valid units are B/kB/MB/GB/TB, no space). For known memory
+    units the bare number counts in those units, so scale to total bytes and
+    emit the largest evenly-dividing ``GB``/``MB``/``kB`` suffix (else ``B``);
+    for known time units emit integral milliseconds. Anything unrecognized is
+    returned untouched — never corrupt a value we don't understand.
+    """
+    match = _DISPLAY_VALUE_RE.match(val_str)
+    if not match:
+        return val_str
+    num_part, unit_part = match.groups()
+    unit_lower = unit_part.lower()
+    if unit_lower in _PG_MEMORY_UNITS:
+        total_bytes = _parse_memory_to_bytes(num_part, unit_lower)
+        if total_bytes is None or total_bytes != int(total_bytes):
+            return val_str
+        total = int(total_bytes)
+        for suffix, size in _SET_MEMORY_UNITS:
+            if total >= size and total % size == 0:
+                return f"{total // size}{suffix}"
+        return f"{total}B"
+    if unit_lower in _PG_TIME_UNITS:
+        total_ms = _parse_time_to_ms(num_part, unit_lower)
+        if total_ms is None:
+            return val_str
+        if float(total_ms).is_integer():
+            return f"{int(total_ms)}ms"
+        return f"{total_ms:g}ms"
+    return val_str
+
 def _parse_memory_to_bytes(val: str, default_unit: str = "") -> float | None:
     """Parse a memory string to bytes."""
     units = {
@@ -357,8 +404,8 @@ def _parse_memory_to_bytes(val: str, default_unit: str = "") -> float | None:
         "32kb": 32768,
         "64kb": 65536,
     }
-    val = val.lower().replace(" ", "").strip("'\"")
-    match = re.match(r"^([\d\.]+)([a-z]*)$", val)
+    val = val.lower().strip().strip("'\"").strip()
+    match = re.match(r"^([\d\.]+)\s*([a-z0-9]*)$", val)
     if not match:
         return None
     
@@ -385,8 +432,8 @@ def _parse_time_to_ms(val: str, default_unit: str = "") -> float | None:
         "h": 60 * 60 * 1000,
         "d": 24 * 60 * 60 * 1000,
     }
-    val = val.lower().replace(" ", "").strip("'\"")
-    match = re.match(r"^([\d\.]+)([a-z]*)$", val)
+    val = val.lower().strip().strip("'\"").strip()
+    match = re.match(r"^([\d\.]+)\s*([a-z]*)$", val)
     if not match:
         return None
         

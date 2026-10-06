@@ -458,6 +458,44 @@ def test_is_noop_value_unknown_unit_falls_back_conservatively():
     assert is_noop_value(entry, "4xyz") is False
 
 
+def test_apply_knobs_normalizes_spaced_pg_display_units_postgres(mock_db_config_pg):
+    # Inspector display shape "<number> <pg_settings-unit>" copied by the model.
+    # 393216 * 8kB = 3221225472 bytes = 3GB — Postgres rejects the spaced form.
+    knobs = [{"name": "effective_cache_size", "value": "393216 8kB"}]
+    results = apply_knobs(knobs, mock_db_config_pg, dry_run=True)
+    assert results[0]["status"] == "dry_run"
+    assert results[0]["sql"] == "ALTER SYSTEM SET effective_cache_size = '3GB';"
+    literal = results[0]["sql"].split("=", 1)[1].strip().strip("';")
+    assert " " not in literal
+
+
+def test_apply_knobs_normalizes_spaced_time_units_postgres(mock_db_config_pg):
+    results = apply_knobs([{"name": "lock_timeout", "value": "60 s"}], mock_db_config_pg, dry_run=True)
+    assert results[0]["sql"] == "ALTER SYSTEM SET lock_timeout = '60000ms';"
+    results = apply_knobs([{"name": "lock_timeout", "value": "2 ms"}], mock_db_config_pg, dry_run=True)
+    assert results[0]["sql"] == "ALTER SYSTEM SET lock_timeout = '2ms';"
+
+
+def test_apply_knobs_leaves_valid_and_unknown_shapes_untouched(mock_db_config_pg):
+    results = apply_knobs(
+        [
+            {"name": "shared_buffers", "value": "512MB"},
+            {"name": "work_mem", "value": "4 furlongs"},
+        ],
+        mock_db_config_pg,
+        dry_run=True,
+    )
+    assert results[0]["sql"] == "ALTER SYSTEM SET shared_buffers = '512MB';"
+    assert results[1]["sql"] == "ALTER SYSTEM SET work_mem = '4 furlongs';"
+
+
+def test_normalized_display_value_stays_equivalent_to_actual():
+    entry = {"current_value": "393216", "unit": "8kB", "vartype": "integer"}
+    assert is_noop_value(entry, "393216 8kB") is True
+    assert is_noop_value(entry, "3GB") is True
+    assert is_noop_value(entry, "8GB") is False
+
+
 def test_is_noop_value_bool_and_enum_equivalence():
     assert is_noop_value({"current_value": "on", "vartype": "bool"}, "true") is True
     assert (

@@ -114,4 +114,9 @@ def read_knob_details(names: str, tool_context: ToolContext) -> str:
     if missing:
         lines.append(f"Missing: {', '.join(missing)}")
 
+    lines.append(
+        "NOTE: propose bare numbers or standard suffixes like 512MB/64kB, "
+        "never '<num> <unit>' with a space."
+    )
+
     return "\n".join(lines)
