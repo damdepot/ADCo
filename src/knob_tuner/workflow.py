@@ -557,6 +557,13 @@ def compile_candidate_node(
     progress = make_progress_callback(
         ctx.state.get("log_file"), bool(ctx.state.get("verbose", False))
     )
+    if isinstance(node_input, dict):
+        _repaired, _raw = node_input.get("repaired", False), node_input.get("phase_raw", "")
+    else:
+        _repaired = getattr(node_input, "repaired", False)
+        _raw = getattr(node_input, "phase_raw", "")
+    if _repaired:
+        progress(f"compile phase repaired {_raw!r} -> 'screen' (invalid phase)")
     result = stage_nodes.compile_candidate(ctx, node_input)
     if isinstance(result, CompileRejection):
         ctx.route = "rejected"

@@ -33,13 +33,54 @@ def test_candidate_rejects_empty_levels():
 def test_phase_validator_case_insensitive_ok():
     p = CandidateProposal(name="exp-1", phase="Screen", levels=_levels())
     assert p.phase == "screen"
+    assert p.repaired is False
+    assert p.phase_raw == ""
     p2 = CandidateProposal(name="exp-2", phase="  REFINEMENT ", levels=_levels())
     assert p2.phase == "refinement"
+    assert p2.repaired is False
+    assert p2.phase_raw == ""
 
 
-def test_phase_validator_bad_phase_fails():
-    with pytest.raises(ValidationError):
-        CandidateProposal(name="exp-1", phase="explore", levels=_levels())
+def test_phase_validator_bad_phase_repairs():
+    p = CandidateProposal(name="exp-1", phase="explore", levels=_levels())
+    assert p.phase == "screen"
+    assert p.repaired is True
+    assert p.phase_raw == "explore"
+
+
+def test_phase_leak_shared_buffers_repairs_and_compiles():
+    # Live crash value: LLM put a knob name in the phase field, ADK
+    # output_schema validation raised and killed the whole Workflow.
+    p = CandidateProposal(
+        name="exp-leak", phase="shared_buffers", levels=_levels()
+    )
+    assert p.phase == "screen"
+    assert p.repaired is True
+    assert p.phase_raw == "shared_buffers"
+    from tests.test_knob_tuner.conftest import FakeCtx
+
+    from src.knob_tuner.stages import nodes as stage_nodes
+
+    ctx = FakeCtx(
+        {
+            "knobs_info": [
+                {
+                    "name": "shared_buffers",
+                    "current_value": "128MB",
+                    "unit": "8kB",
+                    "vartype": "integer",
+                    "context": "postmaster",
+                    "enumvals": [],
+                },
+            ],
+            "resource_budget": {"cpu_cores": 4, "memory_gb": 8.0},
+            "durability_profile": "strict",
+            "max_set_knobs": 20,
+        }
+    )
+    out = stage_nodes.compile_candidate(ctx, p)
+    assert not isinstance(out, ValidationError)
+    assert getattr(out, "phase", "screen") == "screen"
 
 
 def test_correction_type_values():

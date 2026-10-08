@@ -36,7 +36,8 @@ def test_proposal_model_shape():
     assert prop.levels[0].knob == "work_mem"
     assert set(ProposedLevel.model_fields) == {"knob", "value", "reasoning"}
     assert set(CandidateProposal.model_fields) == {
-        "objective", "name", "phase", "levels", "rationale"}
+        "objective", "name", "phase", "levels", "rationale",
+        "phase_raw", "repaired"}
     # Defaults mirror spec.
     assert CandidateProposal(
         name="n", phase="screen", levels=[lvl]).objective == ""

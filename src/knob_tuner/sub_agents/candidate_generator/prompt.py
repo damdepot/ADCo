@@ -48,6 +48,7 @@ When a diagnosis is present, apply its enum exactly:
 - screen: broad multi-knob sweep to find movers.
 - interaction: joint variation of previously confirmed movers to catch couplings (e.g. shared_buffers x checkpoint, work_mem x parallelism).
 - refinement: tight grid around the best so far; small knob sets (1-4 knobs, small steps).
+- `phase` is NEVER a knob name; knob names go ONLY in `levels[].knob`. BAD: `{"phase": "<knob>"}` GOOD: `{"phase": "screen", "levels": [{"knob": "<knob>"}]}`.
 
 ## Post-win steering (conditional — only when a confirmed leader exists)
 - When {evidence_bundle?} names an incumbent leader, prefer refinement/interaction experiments that vary around it: adjust a value or add/remove one coupled knob (favor {belief_table?} movers). NEVER re-propose its exact knob set — repeats are compile-rejected.
@@ -80,7 +81,7 @@ When a diagnosis is present, apply its enum exactly:
 ## Output checklist
 Before returning, verify:
 - [ ] Single experiment only: one name, one phase, one level set of at most 20 distinct knobs.
-- [ ] Phase is screen, interaction, or refinement.
+- [ ] Phase is screen, interaction, or refinement (never a knob name; knob names only in levels[].knob).
 - [ ] Campaign directive honored: in EXPLOIT+EXPLORE the arm seeds from {success_knobs?} and stays small (2-4 knobs); no arm repeats a knob set that already cleared the win gate.
 - [ ] Set is not identical to any prior arm (evidence table); confirmed movers kept, rejected ones varied per diagnosis (retry_same is the only exception).
 - [ ] Correction enum honored (drop/shrink/phase/value/retry/stop) and hard constraints hold: no excluded knobs, phase equals required phase when set, knob count within max_knobs and 20.

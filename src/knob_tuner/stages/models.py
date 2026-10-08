@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.knob_tuner.contracts import VALID_EXPERIMENT_PHASES
 
@@ -48,22 +48,51 @@ class CandidateProposal(BaseModel):
     """One proposed experiment: name/phase/levels required."""
 
     name: str = Field(description="Unique experiment name")
-    phase: str = Field(description="Experiment phase: screen, interaction, or refinement")
+    phase: str = Field(
+        description=(
+            "MUST be exactly one of ('screen', 'interaction', 'refinement'). "
+            "Never a knob name — knob names go only in levels[].knob."
+        )
+    )
     levels: list[ProposedLevel] = Field(
         min_length=1, description="Knob-level assignments (at least one required)"
     )
     rationale: str = Field(default="", description="DBA rationale for this experiment")
     objective: str = Field(default="", description="Tuning objective for this experiment")
+    phase_raw: str = Field(
+        default="", description="Raw phase value as received before repair"
+    )
+    repaired: bool = Field(
+        default=False, description="True when phase was repaired to a valid value"
+    )
 
-    @field_validator("phase", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def _normalize_phase(cls, value: Any) -> str:
-        normalized = str(value or "").strip().lower()
-        if normalized not in _VALID_EXPERIMENT_PHASES:
-            raise ValueError(
-                f"phase must be one of {_VALID_EXPERIMENT_PHASES}, got {value!r}"
-            )
-        return normalized
+    def _repair_phase(cls, data: Any) -> Any:
+        # Repair (never raise): the LLM sometimes puts a knob name in the
+        # phase field; ADK output_schema validation would otherwise escape
+        # as ValidationError and kill the whole Workflow. Valid phases pass
+        # through normalized; anything else repairs to "screen" with the raw
+        # value preserved in phase_raw.
+        if isinstance(data, dict):
+            raw = data.get("phase", "")
+            normalized = str(raw or "").strip().lower()
+            if normalized in _VALID_EXPERIMENT_PHASES:
+                patched = dict(data)
+                patched["phase"] = normalized
+                patched.setdefault("repaired", False)
+                patched.setdefault("phase_raw", "")
+                return patched
+            patched = dict(data)
+            try:
+                raw_str = str(raw) if raw is not None else ""
+            except Exception:
+                raw_str = ""
+            patched["phase"] = "screen"
+            patched["phase_raw"] = raw_str
+            patched["repaired"] = True
+            return patched
+        return data
 
 
 class CorrectionType(str, Enum):
