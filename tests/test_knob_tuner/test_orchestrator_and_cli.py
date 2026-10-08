@@ -1462,8 +1462,8 @@ def test_cli_parser_defaults_with_required_resources():
     assert args.results_dir == "results/dco"
     assert args.db_config == "db.config"
     assert not hasattr(args, "production_db")
-    assert args.success_candidates == 10
-    assert args.max_attempts == 20
+    assert args.success_candidates == 3
+    assert args.max_attempts == 30
     assert args.min_improvement_pct == 5.0
     assert args.log_file == "logs/knob_tuner.log"
     assert args.dry_run is False
@@ -1500,8 +1500,8 @@ def test_cli_parser_defaults_with_required_resources():
     assert args.measure_warmup_seconds == 2
     assert args.early_stop_min_reps == 4
     assert args.screening_benchmark == "sysbench"
-    assert args.max_attempts == 20
-    assert args.success_candidates == 10
+    assert args.max_attempts == 30
+    assert args.success_candidates == 3
 
 
 def test_cli_parser_max_attempts_override_and_no_legacy_flags():
@@ -1560,8 +1560,8 @@ def test_build_initial_state_sets_single_attempt_ceiling():
         knob_path="/tmp/knobs",
         dry_run=True,
     )
-    assert default["max_attempts"] == 20
-    assert default["success_candidates"] == 10
+    assert default["max_attempts"] == 30
+    assert default["success_candidates"] == 3
     assert "max_validation_attempts" not in default
     assert "max_experiments" not in default
     custom = build_initial_state(

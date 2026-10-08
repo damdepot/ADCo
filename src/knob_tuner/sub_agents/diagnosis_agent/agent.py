@@ -24,7 +24,7 @@ def create_diagnosis_agent(model: str | BaseLlm = "gemini-3.5-flash-lite", buffe
         name="diagnosis_agent",
         model=model,
         instruction=prompt.DIAGNOSIS_AGENT_PROMPT,
-        description="Diagnoses failed benchmark proposals into a strategy-only correction; never sets knob values or verdicts.",
+        description="Suggests knob improvements grounded in evaluation facts; never sets values, halts, or verdicts.",
         before_model_callback=make_buffer_callback(buffer_time),
         tools=[
             tools.read_knob_details,

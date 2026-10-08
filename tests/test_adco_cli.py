@@ -59,8 +59,8 @@ def test_build_parser():
     assert args.apply_mode == "live"
     assert args.buffer_time == 0.0
     assert args.screening_benchmark == "sysbench"
-    assert args.max_attempts == 10
-    assert args.success_candidates == 10
+    assert args.max_attempts == 30
+    assert args.success_candidates == 3
     assert args.measure_reps == 10
     assert args.measure_seconds == 10
     assert args.measure_warmup_seconds == 2

@@ -321,6 +321,11 @@ def _refresh_memory(state: Any) -> None:
                     "winners",
                     "candidates",
                     "all_rows",
+                    # Shrink steering: the evidence bundle renders the active
+                    # shrink_set knob-count ceiling from these keys.
+                    "diagnosis_history",
+                    "diagnosis_output",
+                    "max_knobs",
                 )
             }
         else:

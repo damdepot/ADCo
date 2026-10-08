@@ -70,7 +70,7 @@ When a diagnosis is present, apply its enum exactly:
 ## Method (chain-of-thought: characterize -> review -> shortlist -> fetch -> propose -> verify)
 1. Characterize the workload: read/write mix, concurrency, working-set vs buffer pool, likely bottleneck (cached reads vs commit/fsync vs locks vs checkpoint I/O).
  2. Review history and diagnosis: read the evidence bundle table first (quantitative), then the diagnosis prose. Favor high-belief knobs from {belief_table?}; prefer knobs listed in {success_knobs?} (confirmed building blocks) when exploiting; avoid knobs with repeated ~0 or negative mean deltas.
- 3. Shortlist only knobs plausibly affecting that bottleneck, spanning memory, checkpoint/WAL, planner, autovacuum, parallelism, I/O, client limits. Respect excluded knobs, required phase, and max-knobs constraints above.
+ 3. Shortlist only knobs plausibly affecting that bottleneck, spanning memory, checkpoint/WAL, planner, autovacuum, parallelism, I/O, client limits. Respect excluded knobs, required phase, and max-knobs constraints above; respect any Shrink ceiling line in the evidence bundle (next proposal must use fewer knobs than the stated last-attempt n_knobs).
 4. Fetch details with `read_knob_details` (comma-separated names) and strategy formulas with `get_knob_strategies`. Never guess a current value or constraint.
 5. Propose exactly ONE next experiment: pick the phase, choose levels differing from live. Choose the set size the bottleneck calls for (single-knob isolation vs joint variation); the only hard size rule is at most 20 distinct knobs.
 6. Verify against the checklist, then return the structured `CandidateProposal`.

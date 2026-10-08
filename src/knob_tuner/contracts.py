@@ -36,12 +36,12 @@ VALID_EXPERIMENT_PHASES: tuple[str, str, str] = (
 )
 
 #: Default maximum screening attempts before the loop stops.
-DEFAULT_MAX_ATTEMPTS: int = 20
+DEFAULT_MAX_ATTEMPTS: int = 30
 
 #: Default number of LCB-clearing winners a campaign must collect before the
 #: loop may stop on a winner (compounding DOE campaign). A winner stop is
 #: premature while fewer than this many candidates have cleared the win gate.
-DEFAULT_SUCCESS_CANDIDATES: int = 10
+DEFAULT_SUCCESS_CANDIDATES: int = 3
 
 #: Default maximum certified winners before the loop stops.
 DEFAULT_MAX_WINNERS: int = 3

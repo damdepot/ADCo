@@ -467,6 +467,57 @@ def _last_rejection_lines(state: Mapping[str, Any]) -> list[str]:
         return []
 
 
+def _shrink_ceiling_lines(state: Mapping[str, Any]) -> list[str]:
+    """Active shrink-set knob-count ceiling for the candidate (never throws).
+
+    Present only when a ``shrink_set`` diagnosis is active. ``N`` derives
+    generically from the last attempt's ``n_knobs`` (history tail); when
+    history is unknown it falls back to ``max_knobs + 1``. No knob names.
+    """
+    try:
+        if not isinstance(state, Mapping):
+            return []
+        correction = ""
+        hist = state.get("diagnosis_history")
+        if isinstance(hist, list) and hist:
+            last = hist[-1]
+            dumped = _as_dict(last) if not isinstance(last, dict) else last
+            raw = dumped.get("correction", getattr(last, "correction", ""))
+            correction = getattr(raw, "value", raw)
+        if not str(correction or "").strip():
+            cur = state.get("diagnosis_output")
+            dumped = _as_dict(cur) if not isinstance(cur, dict) else (cur or {})
+            if dumped:
+                raw = dumped.get("correction", getattr(cur, "correction", ""))
+                correction = getattr(raw, "value", raw)
+            elif cur is not None:
+                raw = getattr(cur, "correction", "")
+                correction = getattr(raw, "value", raw)
+        if str(correction or "").strip().lower() != "shrink_set":
+            return []
+        n: int | None = None
+        try:
+            rows = _history_rows(state)
+            if rows:
+                n = int(rows[-1].get("n_knobs") or 0) or None
+        except (TypeError, ValueError):
+            n = None
+        if n is None:
+            try:
+                ceiling = state.get("max_knobs")
+                n = int(ceiling) + 1 if str(ceiling or "").strip() != "" else None
+            except (TypeError, ValueError):
+                n = None
+        if n is None or n <= 1:
+            return []
+        return [
+            f"Shrink ceiling: next proposal must use fewer than {n} knobs "
+            f"(last attempt n_knobs={n})"
+        ]
+    except Exception:  # noqa: BLE001 - bundle must never throw
+        return []
+
+
 def build_evidence_bundle(state: Mapping[str, Any] | None) -> str:
     """Render a capped markdown evidence bundle from a state mapping."""
     try:
@@ -486,8 +537,9 @@ def build_evidence_bundle(state: Mapping[str, Any] | None) -> str:
             f"Attempt {attempt_s}/{total_s}",
             _winners_line(state),
             _resource_line(state),
-            f"### Experiment history ({len(rows)} runs)",
         ]
+        head.extend(_shrink_ceiling_lines(state))
+        head.append(f"### Experiment history ({len(rows)} runs)")
         detail_head = ["### Last experiments (detail, last 2)"]
         detail = _detail_lines(rows) or ["- none yet."]
         verdict_head = ["### Last verdict"]

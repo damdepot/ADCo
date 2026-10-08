@@ -155,3 +155,75 @@ def test_belief_table_has_cleared_column():
 def test_belief_model_cleared_defaults_false():
     assert KnobBelief().cleared is False
     assert KnobBelief(cleared=True).cleared is True
+
+
+# --- shrink ceiling line (shrink_set steering) ---
+
+
+def _shrink_state(**overrides) -> dict:
+    state = _state(
+        experiment_history=[
+            {**_row(1), "n_knobs": 3},
+            {**_row(2), "n_knobs": 3},
+        ],
+        diagnosis_history=[
+            {"correction": "shrink_set", "targets": [], "rationale": "too broad"}
+        ],
+    )
+    state.update(overrides)
+    return state
+
+
+def test_bundle_shrink_ceiling_present_when_shrink_active():
+    text = build_evidence_bundle(_shrink_state())
+    assert "Shrink ceiling: next proposal must use fewer than 3 knobs" in text
+    assert "last attempt n_knobs=3" in text
+
+
+def test_bundle_shrink_ceiling_tracks_last_attempt_n_knobs():
+    state = _shrink_state(
+        experiment_history=[
+            {**_row(1), "n_knobs": 5},
+            {**_row(2), "n_knobs": 5},
+        ]
+    )
+    text = build_evidence_bundle(state)
+    assert "fewer than 5 knobs" in text
+    assert "n_knobs=5" in text
+
+
+def test_bundle_shrink_ceiling_via_diagnosis_output_fallback():
+    state = _state(
+        diagnosis_output={"correction": "shrink_set", "targets": []},
+    )
+    text = build_evidence_bundle(state)
+    # _state() history tail has n_knobs=3.
+    assert "Shrink ceiling" in text
+    assert "n_knobs=3" in text
+
+
+def test_bundle_shrink_ceiling_absent_without_shrink():
+    assert "Shrink ceiling" not in build_evidence_bundle(_state())
+    no_shrink = _shrink_state(
+        diagnosis_history=[{"correction": "drop_knob", "targets": ["work_mem"]}]
+    )
+    assert "Shrink ceiling" not in build_evidence_bundle(no_shrink)
+    empty_hist: dict = _shrink_state(diagnosis_history=[])
+    assert "Shrink ceiling" not in build_evidence_bundle(empty_hist)
+
+
+def test_bundle_shrink_ceiling_absent_at_floor_or_unknown():
+    at_floor = _shrink_state(
+        experiment_history=[{**_row(1), "n_knobs": 1}],
+    )
+    assert "Shrink ceiling" not in build_evidence_bundle(at_floor)
+    unknown = _shrink_state(experiment_history=[])
+    unknown.pop("max_knobs", None)
+    assert "Shrink ceiling" not in build_evidence_bundle(unknown)
+
+
+def test_bundle_shrink_ceiling_never_throws_on_garbage():
+    text = build_evidence_bundle(
+        {"experiment_history": "junk", "diagnosis_history": [{"correction": None}]}
+    )
+    assert isinstance(text, str) and "Shrink ceiling" not in text

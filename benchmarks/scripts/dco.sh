@@ -29,8 +29,8 @@ measure_seconds="${MEASURE_SECONDS:-10}"
 measure_warmup_seconds="${MEASURE_WARMUP_SECONDS:-2}"
 early_stop_min_reps="${EARLY_STOP_MIN_REPS:-4}"
 
-# Tuner loop caps. Defaults match the tuner (10/20).
-max_attempts="${MAX_ATTEMPTS:-10}"
+# Tuner loop caps. Defaults match the tuner (30/20).
+max_attempts="${MAX_ATTEMPTS:-30}"
 max_set_knobs="${MAX_SET_KNOBS:-20}"
 
 uv run python -m src.adco "$source_dir" \

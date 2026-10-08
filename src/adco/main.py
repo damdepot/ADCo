@@ -201,8 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-attempts",
         type=int,
-        default=10,
-        help="Maximum tuner screening attempts before the loop stops (default: 10)",
+        default=DEFAULT_MAX_ATTEMPTS,
+        help=(
+            "Maximum tuner screening attempts before the loop stops "
+            f"(default: {DEFAULT_MAX_ATTEMPTS})"
+        ),
     )
     p.add_argument(
         "--success-candidates",

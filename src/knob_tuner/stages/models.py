@@ -107,16 +107,25 @@ class CorrectionType(str, Enum):
 
 
 class DiagnosisOutput(BaseModel):
-    """Diagnosis verdict for a rejected/failed proposal."""
+    """Knob improvement suggestion grounded in evaluation facts.
 
-    correction: CorrectionType = Field(description="Requested correction kind")
+    Advisory only: suggests the next knob improvement for the campaign to
+    try. Never halts the campaign, declares winners, or issues verdicts —
+    the deterministic controller owns all of that.
+    """
+
+    correction: CorrectionType = Field(description="Suggested knob-improvement kind")
     targets: list[str] = Field(
-        default_factory=list, description="Knob names the correction applies to"
+        default_factory=list,
+        description="Knob names the suggestion applies to (names only, never values)",
     )
-    rationale: str = Field(default="", description="Rationale for the correction")
+    rationale: str = Field(
+        default="",
+        description="Rationale citing the specific evaluation facts behind the suggestion",
+    )
     confidence: float = Field(
         description=(
-            "Agent's confidence (0..1) that the recommended action "
+            "Suggester's confidence (0..1) that the suggested improvement "
             "(the correction enum) is correct"
         )
     )
