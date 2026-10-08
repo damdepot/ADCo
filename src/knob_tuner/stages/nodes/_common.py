@@ -13,6 +13,7 @@ from typing import Any
 
 from src.knob_tuner.contracts import (
     VALID_EXPERIMENT_PHASES,
+    get_certify_lcb_pct,
     get_database_name,
     get_db_config_path,
     get_max_attempts,
@@ -456,6 +457,11 @@ def _resolve_attempt_cap(state: Any) -> tuple[int, int]:
 def _min_improvement_pct(state: Any) -> float:
     """Phase 4.2: plain ``.get`` default WITHOUT ``or`` (0.0 honored)."""
     return get_min_improvement_pct(state)
+
+
+def _certify_lcb_pct(state: Any) -> float:
+    """Phase 4.2: plain ``.get`` default WITHOUT ``or`` (0.0 honored)."""
+    return get_certify_lcb_pct(state)
 
 
 def _ensure_list(state: Any, key: str) -> list:

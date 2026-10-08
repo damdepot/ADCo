@@ -34,6 +34,7 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from src.knob_tuner.agent import create_root_agent
 from src.knob_tuner.contracts import (
+    DEFAULT_CERTIFY_LCB_PCT,
     DEFAULT_EARLY_STOP_MIN_REPS,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_SET_KNOBS,
@@ -369,6 +370,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--certify-lcb-pct",
+        type=float,
+        default=DEFAULT_CERTIFY_LCB_PCT,
+        help=(
+            "Promotion-bar LCB on throughput (percent) a candidate must exceed "
+            "to certify; any confident win certifies "
+            f"(default: {DEFAULT_CERTIFY_LCB_PCT})"
+        ),
+    )
+    parser.add_argument(
         "--results-dir",
         default="results/dco",
         help="Base directory for run-scoped artifacts (default: results/dco)",
@@ -440,6 +451,7 @@ def build_initial_state(
     success_candidates: int = DEFAULT_SUCCESS_CANDIDATES,
     min_improvement_pct: float = DEFAULT_MIN_IMPROVEMENT_PCT,
     max_winners: int | None = None,
+    certify_lcb_pct: float = DEFAULT_CERTIFY_LCB_PCT,
 ) -> dict[str, Any]:
     """Construct the initial session state for the knob tuner workflow."""
     profile = profile or SysbenchProfile()
@@ -475,6 +487,7 @@ def build_initial_state(
         "success_candidates": quota,
         "max_winners": quota,
         "min_improvement_pct": float(min_improvement_pct),
+        "certify_lcb_pct": float(certify_lcb_pct),
         "screen_total_rows": int(screen_total_rows),
         "screen_max_rows": int(screen_max_rows),
         "durability_profile": "strict",
@@ -711,6 +724,30 @@ def _tuning_gate_raw(state: dict[str, Any]) -> float | None:
         return None
 
 
+def _tuning_certify_raw(state: dict[str, Any]) -> float | None:
+    """Return the configured promotion-bar pct, or None when unrecorded.
+
+    Pure projection: state ``certify_lcb_pct`` first, then the decision
+    archive's copy; missing/non-numeric degrades to None, never throws.
+    Generic: no knob names.
+    """
+    try:
+        if not isinstance(state, dict):
+            return None
+        raw = state.get("certify_lcb_pct")
+        if raw is None:
+            archive = state.get("candidate_archive") or {}
+            if isinstance(archive, dict):
+                raw = archive.get("certify_lcb_pct")
+        if raw is None:
+            return None
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+    except Exception:
+        return None
+
+
 def _tuning_applied(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Project applied knobs as ``[{knob, value}]`` (pure; never throws).
 
@@ -805,6 +842,14 @@ def _build_tuning_summary(state: dict[str, Any]) -> dict[str, Any]:
                 gate = float(DEFAULT_MIN_IMPROVEMENT_PCT)
             except Exception:
                 gate = 5.0
+        certify = _tuning_certify_raw(state)
+        if certify is None:
+            try:
+                from src.knob_tuner.contracts import DEFAULT_CERTIFY_LCB_PCT
+
+                certify = float(DEFAULT_CERTIFY_LCB_PCT)
+            except Exception:
+                certify = 1.0
         try:
             conf_by_round = _diagnosis_confidences_by_round(state)
         except Exception:
@@ -858,6 +903,7 @@ def _build_tuning_summary(state: dict[str, Any]) -> dict[str, Any]:
             "certified_count": certified_count,
             "applied": _tuning_applied(state),
             "gate_pct": gate,
+            "certify_lcb_pct": certify,
             "llm_confidences": llm_confidences,
             "winner_llm_confidence": winner_llm_confidence,
         }
@@ -869,6 +915,7 @@ def _build_tuning_summary(state: dict[str, Any]) -> dict[str, Any]:
             "certified_count": 0,
             "applied": [],
             "gate_pct": 5.0,
+            "certify_lcb_pct": 1.0,
             "llm_confidences": [],
             "winner_llm_confidence": None,
         }
@@ -1036,9 +1083,12 @@ def _print_tuning_results(state: dict[str, Any]) -> None:
             f"{_fmt_count_or_na(attempts)} total attempts (incl. cheap rejections)"
         )
         gate_s = f"{gate:.1f}%" if gate is not None else "n/a"
+        certify = _tuning_certify_raw(state)
+        certify_s = f"{certify:.1f}%" if certify is not None else "n/a"
         print(
             f"Successful candidates: {_fmt_count_or_na(passed)} confirmed PASS; "
-            f"Certified: {_fmt_count_or_na(certified)} (LCB > {gate_s})"
+            f"Certified: {_fmt_count_or_na(certified)} (LCB > {certify_s}; "
+            f"ranking gate LCB > {gate_s})"
         )
 
         hist_by_name: dict[str, dict[str, Any]] = {}
@@ -1280,6 +1330,7 @@ async def run_pipeline(
     success_candidates: int = DEFAULT_SUCCESS_CANDIDATES,
     min_improvement_pct: float = DEFAULT_MIN_IMPROVEMENT_PCT,
     max_winners: int | None = None,
+    certify_lcb_pct: float = DEFAULT_CERTIFY_LCB_PCT,
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using the ADK Runner and session service."""
     # 1. Resource contract FIRST: fail before any side effect.
@@ -1359,6 +1410,7 @@ async def run_pipeline(
         success_candidates=success_candidates,
         min_improvement_pct=min_improvement_pct,
         max_winners=max_winners,
+        certify_lcb_pct=certify_lcb_pct,
     )
 
     initial_state["verbose"] = verbose
@@ -1568,6 +1620,7 @@ def main() -> None:
                 success_candidates=args.success_candidates,
                 min_improvement_pct=args.min_improvement_pct,
                 max_winners=args.max_winners,
+                certify_lcb_pct=args.certify_lcb_pct,
             )
         )
     except Exception as exc:

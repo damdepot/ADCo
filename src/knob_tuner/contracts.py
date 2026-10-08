@@ -52,6 +52,11 @@ DEFAULT_MAX_SET_KNOBS: int = 20
 #: Default win-gate: LCB on throughput must exceed this pct to confirm.
 DEFAULT_MIN_IMPROVEMENT_PCT: float = 5.0
 
+#: Promotion bar: LCB on throughput must exceed this pct to certify. Any
+#: confident win certifies, while min_improvement_pct stays the
+#: ranking/display gate.
+DEFAULT_CERTIFY_LCB_PCT: float = 1.0
+
 #: Default measurement reps per arm in single-fidelity mode.
 DEFAULT_MEASURE_REPS: int = 10
 
@@ -219,6 +224,23 @@ def get_min_improvement_pct(state: Any) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return DEFAULT_MIN_IMPROVEMENT_PCT
+
+
+def get_certify_lcb_pct(state: Any) -> float:
+    """Return the promotion-bar pct (explicit 0.0 honored; missing → default).
+
+    Uses a plain ``.get`` default WITHOUT ``or`` so a configured ``0.0``
+    is honored while a missing/``None`` entry falls back to
+    :data:`DEFAULT_CERTIFY_LCB_PCT`.
+    """
+    try:
+        getter = getattr(state, "get", None)
+        raw = getter("certify_lcb_pct", DEFAULT_CERTIFY_LCB_PCT) if callable(getter) else DEFAULT_CERTIFY_LCB_PCT
+        if raw is None:
+            return DEFAULT_CERTIFY_LCB_PCT
+        return float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CERTIFY_LCB_PCT
 
 
 def get_max_set_knobs(state: Any) -> int:

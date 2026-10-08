@@ -418,8 +418,9 @@ def _last_verdict_lines(state: Mapping[str, Any]) -> list[str]:
 def _winners_line(state: Mapping[str, Any]) -> str:
     """Render the compounding-campaign winner progress line.
 
-    ``Winners 3/10 (lcb >= 5.0%)`` — found/target plus the bar, so the
-    diagnosis agent can see a winner stop is premature while short of target.
+    ``Winners 3/10 (lcb >= 1.0%)`` — found/target plus the certify bar, so
+    the diagnosis agent can see a winner stop is premature while short of
+    target. Falls back to the legacy ranking-gate key for old states.
     Never throws.
     """
     try:
@@ -430,10 +431,12 @@ def _winners_line(state: Mapping[str, Any]) -> str:
         target = int(state.get("success_candidates_target", 0) or 0)
     except (TypeError, ValueError):
         target = 0
-    min_pct = state.get("min_improvement_pct_state")
-    if min_pct is None:
-        min_pct = 0.0
-    return f"Winners {found}/{target} (lcb >= {_num(min_pct):.1f}%)"
+    bar = state.get("certify_lcb_pct_state")
+    if bar is None:
+        bar = state.get("min_improvement_pct_state")
+    if bar is None:
+        bar = 0.0
+    return f"Winners {found}/{target} (lcb >= {_num(bar):.1f}%)"
 
 
 def _last_rejection_lines(state: Mapping[str, Any]) -> list[str]:

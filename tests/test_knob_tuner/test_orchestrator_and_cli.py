@@ -1224,9 +1224,10 @@ def _futility_state(**overrides):
 def test_decision_withholds_confirmed_pass_below_threshold():
     from src.knob_tuner.stages import nodes as stage_nodes
 
-    # Compounding quota unification: "winner" means lcb > min_improvement_pct,
-    # so a confirmed PASS whose LCB misses the bar withholds.
-    ctx = _FakeContext(_futility_state(all_rows=[_weak_row()]))
+    # Compounding quota unification: "winner" means lcb > certify bar,
+    # so a confirmed PASS whose LCB misses a strict certify bar withholds.
+    # (Default certify bar is 0.1; pinned to 5.0 to exercise withholding.)
+    ctx = _FakeContext(_futility_state(all_rows=[_weak_row()], certify_lcb_pct=5.0))
 
     dec = stage_nodes.decision(ctx)
     assert dec.decision != "apply_winner", dec.summary
@@ -2317,6 +2318,7 @@ def _six_arm_state():
         "result_status": "PASS",
         "validation_attempt_count": 8,
         "min_improvement_pct": 5.0,
+        "certify_lcb_pct": 1.0,
         "experiment_history": history,
         "rejected_history": ["cheap rejection one", "cheap rejection two"],
         "candidate_archive": {
@@ -2341,7 +2343,7 @@ def test_tuning_results_section_prints_rank_table(capsys):
     assert "=== Tuning Results ===" in out
     assert "6 measured screens / 8 total attempts" in out
     assert "4 confirmed PASS" in out
-    assert "Certified: 3 (LCB > 5.0%)" in out
+    assert "Certified: 3 (LCB > 1.0%; ranking gate LCB > 5.0%)" in out
     for arm in ("test_arm_a", "test_arm_d", "test_arm_e", "test_arm_f"):
         assert arm in out
     assert "FAIL" in out

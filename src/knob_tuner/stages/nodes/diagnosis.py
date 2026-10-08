@@ -16,7 +16,10 @@ from src.knob_tuner.stages.models import (
     KnobBelief,
     render_belief_table,
 )
-from src.knob_tuner.contracts import get_success_candidates
+from src.knob_tuner.contracts import (
+    DEFAULT_CERTIFY_LCB_PCT,
+    get_success_candidates,
+)
 from src.knob_tuner.stages.nodes._common import (
     count_success_candidates,
     success_knob_counts,
@@ -331,6 +334,12 @@ def _refresh_memory(state: Any) -> None:
                 snapshot.get("min_improvement_pct")
                 if snapshot.get("min_improvement_pct") is not None
                 else 0.0
+            )
+        if snapshot.get("certify_lcb_pct_state") is None:
+            snapshot["certify_lcb_pct_state"] = (
+                snapshot.get("certify_lcb_pct")
+                if snapshot.get("certify_lcb_pct") is not None
+                else DEFAULT_CERTIFY_LCB_PCT
             )
         state["evidence_bundle"] = build_evidence_bundle(snapshot)
     except Exception:

@@ -41,6 +41,7 @@ from src.knob_tuner.tools.knobs import build_plan
 from src.knob_tuner.tools.stats import p_win as _welch_p_win
 from src.knob_tuner.stages.nodes._common import (
     _VALID_EXPERIMENT_PHASES,
+    _certify_lcb_pct,
     _cleared_knob_sets,
     _context_map_from_knobs_info,
     _inventory_by_name,
@@ -511,10 +512,11 @@ def _latest_confirmed_pass(
 
 
 def _is_entry_certified(entry: Any, gate: float) -> bool:
-    """Return whether a winner entry clears the win gate (never throws).
+    """Return whether a winner entry clears the certify threshold (never throws).
 
     Entries carrying an explicit ``certified`` flag are trusted; legacy
-    entries without one derive it from ``lcb > gate``.
+    entries without one derive it from ``lcb > gate`` where ``gate`` is the
+    certify threshold (``certify_lcb_pct``).
     """
     try:
         if isinstance(entry, dict) and entry.get("certified") is not None:
@@ -530,13 +532,13 @@ def _is_entry_certified(entry: Any, gate: float) -> bool:
 
 
 def _count_certified_winners(state: Any) -> int:
-    """Count registry entries clearing the win gate (never throws).
+    """Count registry entries clearing the certify threshold (never throws).
 
     Only certified entries satisfy the winner quota; registered-but-
     uncertified arms are reported but never stop the loop.
     """
     try:
-        gate = float(_min_improvement_pct(state))
+        gate = float(_certify_lcb_pct(state))
         get = getattr(state, "get", None)
         raw = get("winners") if callable(get) else None
         if not isinstance(raw, list):
@@ -607,7 +609,7 @@ def _register_winner(
     """Append a winner entry for the triggering verdict (never throws).
 
     Entry shape: ``{plan_hash, mean, lcb, knobs, family, certified}`` where
-    ``certified`` is ``lcb >`` the resolved ``min_improvement_pct``. A
+    ``certified`` is ``lcb >`` the resolved ``certify_lcb_pct``. A
     ``plan_hash`` already present is never duplicated.
     """
     try:
@@ -625,7 +627,7 @@ def _register_winner(
         mean_f = float(ref.get("mean", mean) or 0.0)
         lcb_f = float(ref.get("lcb", lcb) or 0.0)
         try:
-            certified = lcb_f > float(_min_improvement_pct(state))
+            certified = lcb_f > float(_certify_lcb_pct(state))
         except (TypeError, ValueError):
             certified = False
         entry = {
@@ -1744,7 +1746,7 @@ def confirmation_controller(
             # Unified quota readiness: certified registry entries already fed
             # the count above, so one check covers both history and registry.
             quota_met = count_success_candidates(state) >= target
-            if found and mean > 0 and lcb > _min_improvement_pct(state):
+            if found and mean > 0 and lcb > _certify_lcb_pct(state):
                 if quota_met:
                     route = "done"
                     reason = "confident_win_backstop"

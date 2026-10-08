@@ -594,7 +594,7 @@ def _uncertified_entry(plan_hash, mean=8.9, lcb=3.5):
 
 def test_agreed_but_uncertified_winner_registers_without_quota():
     ctx = _gate_state(_uncertified_win_row(), min_improvement_pct=5.0,
-                      max_winners=1)
+                      certify_lcb_pct=5.0, max_winners=1)
     out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.9))
     assert out["gate"] == "stop_agree_winner"
     winners = ctx.state.get("winners")
@@ -622,7 +622,7 @@ def test_agreed_certified_winner_registers_certified():
 def test_quota_met_at_three_certified_ignoring_uncertified():
     row = dict(_win_row(), arm="e-third", plan_hash="hash-ccc")
     ctx = _gate_state(
-        row, min_improvement_pct=5.0, max_winners=3,
+        row, min_improvement_pct=5.0, certify_lcb_pct=5.0, max_winners=3,
         winners=[_certified_entry("hash-aaa"), _certified_entry("hash-bbb"),
                  _uncertified_entry("hash-xxx")],
     )
@@ -637,7 +637,8 @@ def test_quota_met_at_three_certified_ignoring_uncertified():
     assert winners[-1]["certified"] is True
     # ... while an uncertified verdict alone never trips quota.
     ctx2 = _gate_state(
-        _uncertified_win_row(), min_improvement_pct=5.0, max_winners=3,
+        _uncertified_win_row(), min_improvement_pct=5.0, certify_lcb_pct=5.0,
+        max_winners=3,
         winners=[_certified_entry("hash-aaa"), _certified_entry("hash-bbb")],
     )
     out2 = nodes.confirmation_controller(ctx2, _next_diag())

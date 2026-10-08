@@ -12,9 +12,11 @@ from typing import Any
 
 from src.knob_tuner.contracts import (
     ApplyMode,
+    DEFAULT_CERTIFY_LCB_PCT,
     DEFAULT_MIN_IMPROVEMENT_PCT,
     KnobPlan,
     ResourceBudget,
+    get_certify_lcb_pct,
     get_database_name,
     get_db_config_path,
     get_early_stop_min_reps,
@@ -170,6 +172,7 @@ def _winners_table(
     rows: list[dict[str, Any]],
     gate_pct: float,
     experiment_history: list[Any],
+    certify_pct: float | None = None,
 ) -> list[dict[str, Any]]:
     """Rank every PASS arm best-first (audit only, never routes).
 
@@ -181,10 +184,12 @@ def _winners_table(
     carries its gate proof; missing evidence degrades to
     ``None``/``""``/``0`` instead of throwing. Generic: no knob names.
     """
+    # gate_pct is the min_improvement_pct ranking/display gate, retained
+    # for signature stability; the certified flag uses certify_gate below.
     try:
-        gate = float(gate_pct)
+        certify_gate = float(certify_pct) if certify_pct is not None else DEFAULT_CERTIFY_LCB_PCT
     except (TypeError, ValueError):
-        gate = 0.0
+        certify_gate = DEFAULT_CERTIFY_LCB_PCT
     shortlisted: list[dict[str, Any]] = []
     try:
         for row in rows:
@@ -260,7 +265,7 @@ def _winners_table(
                     "p_win": p_win,
                     "n_knobs": n_knobs,
                     "certified": bool(row.get("confirmed", False))
-                    and _row_float(row, "lcb_pct") > gate,
+                    and _row_float(row, "lcb_pct") > certify_gate,
                 }
             )
         except Exception:
@@ -360,16 +365,17 @@ def decision(
 
         winner_row: dict[str, Any] | None = None
         outcome = "fail"
-        # Phase 1.7 / compounding quota: a confirmed PASS applies only when its
-        # LCB clears min_improvement_pct — the SAME definition the campaign's
-        # success-candidate quota uses, so "winner" has one meaning. Pick the
-        # best such row — highest mean, tie-broken by LCB — not the first seen.
+        # Promotion bar vs ranking gate: a confirmed PASS applies only when
+        # its LCB clears the certify threshold — NOT the min_improvement_pct
+        # ranking/display gate (winners table ordering keeps using that one).
+        # Pick the best such row — highest mean, tie-broken by LCB.
+        certify_threshold = _certify_lcb_pct(state)
         confirmed_pass_rows = [
             row
             for row in rows
             if str(row.get("status", "")).upper() == "PASS"
             and bool(row.get("confirmed", False))
-            and _row_float(row, "lcb_pct") > float(min_improvement_pct)
+            and _row_float(row, "lcb_pct") > float(certify_threshold)
         ]
         if confirmed_pass_rows:
             winner_row = max(
@@ -443,7 +449,9 @@ def decision(
         # withheld inconclusive/fail outcomes) — informational only, never
         # alters selection/routing.
         try:
-            winners_table = _winners_table(rows, min_improvement_pct, experiment_history)
+            winners_table = _winners_table(
+                rows, min_improvement_pct, experiment_history, certify_threshold
+            )
         except Exception:
             winners_table = []
         archive_payload = {
@@ -623,6 +631,7 @@ def confirm_winner(
             term = TerminalDecision.model_validate(_jsonable(node_input))
         summary = dict(term.summary or {})
         min_pct = float(min_improvement_pct_from_state(state))
+        certify_pct = float(_certify_lcb_pct(state))
         confirmation: dict[str, Any] = {
             "attempted": 0,
             "plan_hash": "",
@@ -674,7 +683,7 @@ def confirm_winner(
             v_status = getattr(verdict, "status", "FAIL")
             v_lcb = float(getattr(verdict, "lcb_pct", 0.0) or 0.0)
             v_conf = bool(getattr(verdict, "confirmed", False))
-            if str(v_status).upper() == "PASS" and v_conf and v_lcb > min_pct:
+            if str(v_status).upper() == "PASS" and v_conf and v_lcb > certify_pct:
                 last_verdict = "pass"
                 chosen = row
                 promoted = tried > 1
@@ -725,6 +734,14 @@ def min_improvement_pct_from_state(state: Any) -> float:
         return float(get_min_improvement_pct(state))
     except Exception:
         return DEFAULT_MIN_IMPROVEMENT_PCT
+
+
+def _certify_lcb_pct(state: Any) -> float:
+    """Read the certify LCB pct from state (never throws)."""
+    try:
+        return float(get_certify_lcb_pct(state))
+    except Exception:
+        return DEFAULT_CERTIFY_LCB_PCT
 
 
 # ---------------------------------------------------------------------------

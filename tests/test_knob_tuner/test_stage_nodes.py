@@ -442,9 +442,10 @@ def test_decision_inconclusive_vs_fail():
 
 
 def test_decision_confirmed_pass_below_threshold_withholds():
-    # Compounding quota unification: "winner" means lcb > min_improvement_pct,
-    # so a confirmed PASS whose LCB misses the bar no longer applies.
-    ctx = FakeCtx({"min_improvement_pct": 5.0})
+    # Compounding quota unification: "winner" means lcb > certify bar, so a
+    # confirmed PASS whose LCB misses a strict certify bar still withholds.
+    # (Default certify bar is 0.1; pinned to 5.0 here to exercise withholding.)
+    ctx = FakeCtx({"min_improvement_pct": 5.0, "certify_lcb_pct": 5.0})
     row = _row(mean=1.0, lcb=0.5)
     out = nodes.decision(ctx, all_rows=[row], baseline_tps=[100.0])
     assert out.decision != "apply_winner"
@@ -494,7 +495,7 @@ def test_decision_lead_overlapping():
 
 
 def test_decision_multi_certified_lists_all_winners():
-    ctx = FakeCtx({"min_improvement_pct": 5.0})
+    ctx = FakeCtx({"min_improvement_pct": 5.0, "certify_lcb_pct": 5.0})
     best = _row(mean=8.0, lcb=6.0, ucb=9.0, arm="e-best")
     best["p_win"] = 0.95
     second = _row(mean=6.0, lcb=5.5, ucb=7.0, arm="e-second")
@@ -540,8 +541,9 @@ def test_decision_confirmed_pass_below_gate_withholds_but_lists():
     # Unified design: selection stays certified-only (a confirmed PASS below
     # the gate still withholds, exactly as the compounding base), while the
     # arm is listed — flagged uncertified — instead of vanishing from the
-    # winners table.
-    ctx = FakeCtx({"min_improvement_pct": 5.0})
+    # winners table. (Strict certify bar pinned to exercise withholding;
+    # default 0.1 would certify this arm.)
+    ctx = FakeCtx({"min_improvement_pct": 5.0, "certify_lcb_pct": 5.0})
     row = _row(mean=8.9, lcb=3.5, ucb=12.0, arm="e-unc")
     out = nodes.decision(ctx, all_rows=[row], baseline_tps=[100.0])
     assert out.decision == "inconclusive"
