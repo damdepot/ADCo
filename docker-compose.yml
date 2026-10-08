@@ -8,7 +8,10 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
     ports:
-      - "5432:5432"
+      # Loopback-only: the benchmark harness and tuner all connect via
+      # 127.0.0.1, so never expose Postgres to the LAN/WAN (brute-force +
+      # COPY-PROGRAM RCE risk, especially with the default password).
+      - "127.0.0.1:5432:5432"
     platform: linux/amd64
     # Limits are env-driven so the benchmark harness's CPU_CORES/MEMORY_GB
     # match what the container actually gets (defaults preserve 2 cpus / 8g).
