@@ -21,5 +21,5 @@ class OptimizerOutput(BaseModel):
     )
     status: str = Field(
         default="",
-        description="PASS if the target function was optimized, FAIL otherwise",
+        description="PASS if the target function was optimized, NO_OP if intentionally left unchanged (loop-free PRESERVE target), FAIL otherwise",
     )

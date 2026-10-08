@@ -21,11 +21,13 @@ class TargetStatus(BaseModel):
     file: str = Field(description="The file containing the target")
     function: str = Field(description="The function name")
     status: Literal[
-        "TRANSFORMED", "MISSING_REWRITE", "INVALID_REWRITE", "UNVERIFIABLE", "RESTRICTED"
+        "TRANSFORMED", "MISSING_REWRITE", "INVALID_REWRITE", "UNVERIFIABLE", "RESTRICTED", "NO_OP"
     ] = Field(
         description=(
             "Outcome for this specific target: TRANSFORMED, MISSING_REWRITE, "
-            "INVALID_REWRITE, UNVERIFIABLE, or RESTRICTED"
+            "INVALID_REWRITE, UNVERIFIABLE, RESTRICTED, or NO_OP (loop-free "
+            "target intentionally preserved unchanged; counts as a pass "
+            "alongside RESTRICTED)"
         )
     )
     details: str = Field(default="", description="Explanation of the outcome")

@@ -6,14 +6,33 @@ from .sql_resolver import collect_module_dicts, resolve, _const_str
 from ..models.ast_models import FileAnalysis, FunctionAnalysis
 from ..models.rewrite_models import RewriteContract, RewriteTarget
 from .rewrite_contract import build_rewrite_contract
-from .contract_verifier import verify_contract, VerificationResult, TargetStatus, VerificationCheck, VerificationViolation
-from .dependency_graph import build_dependency_graph, slice_dependency_graph, format_dependency_slice_markdown
+from .contract_verifier import (
+    verify_contract,
+    VerificationResult,
+    TargetStatus,
+    VerificationCheck,
+    VerificationViolation,
+    is_preserve_contract,
+)
+from .dependency_graph import (
+    build_dependency_graph,
+    slice_dependency_graph,
+    format_dependency_slice_markdown,
+)
 from .._common import find_function_node
 
 EXCLUDED_SETUP_FUNCTION_PATTERNS = {
-    "_execute_ddl", "execute_ddl", "load_schema", "init_schema", 
-    "_load_schema", "create_tables", "init_db", "_init_db", "setup_schema"
+    "_execute_ddl",
+    "execute_ddl",
+    "load_schema",
+    "init_schema",
+    "_load_schema",
+    "create_tables",
+    "init_db",
+    "_init_db",
+    "setup_schema",
 }
+
 
 def is_ddl_or_setup_func(fn) -> bool:
     name_lower = fn.name.lower()
@@ -23,7 +42,36 @@ def is_ddl_or_setup_func(fn) -> bool:
         return True
     return False
 
+
 _LOOP_STRATEGY_HINTS = ("N_PLUS_ONE", "BATCH", "COMBINING", "LOOP", "ROUND_TRIP")
+
+# Loop-free targets with no combinable multi-statement chain (sequential point
+# lookups, e.g. lookup-A-then-lookup-B chains where each step consumes the
+# previous step's result) carry a PRESERVE contract and may pass unchanged.
+PRESERVE_PATTERN = "SEQUENTIAL_POINT_LOOKUPS"
+PRESERVE_STRATEGY = "PRESERVE"
+
+
+def _has_combinable_chain(fn) -> bool:
+    """True when a loop-free function holds an independently combinable chain.
+
+    Generic definition (no table/function names): two or more sequential
+    ``EXECUTE``/``EXECUTEMANY`` ops outside loops with no ``FETCH`` in the
+    function. An interleaved fetch means a later statement consumes an earlier
+    query's result (dependent point lookups) — fusing those changes semantics
+    and is HIGH-risk, so the chain is not combinable and the target is a
+    PRESERVE candidate instead.
+    """
+    sequential_execute_ops = [
+        op
+        for op in fn.database_operations
+        if op.operation_type in ("EXECUTE", "EXECUTEMANY") and not op.inside_loop
+    ]
+    if len(sequential_execute_ops) < 2:
+        return False
+    if any(op.operation_type == "FETCH" for op in fn.database_operations):
+        return False
+    return True
 
 
 def _pick_strategy(
@@ -41,16 +89,16 @@ def _pick_strategy(
 
 
 def build_contracts_from_intent(
-    target_dir: str, 
-    intent_output: dict, 
+    target_dir: str,
+    intent_output: dict,
     selected_strategy_names: list[str] | None = None,
 ) -> tuple[dict[str, FileAnalysis], list[RewriteContract]]:
     targets = intent_output.get("optimization_targets", [])
     analyses: dict[str, FileAnalysis] = {}
-    
-    # (rel_path, FunctionAnalysis, has_loop) in deterministic discovery order.
-    discovered: list[tuple[str, object, bool]] = []
-    
+
+    # (rel_path, FunctionAnalysis, has_loop, preserve) in discovery order.
+    discovered: list[tuple[str, object, bool, bool]] = []
+
     # Analyze each file
     for target in targets:
         rel_path = target.get("file")
@@ -59,16 +107,16 @@ def build_contracts_from_intent(
         abs_path = os.path.join(target_dir, rel_path)
         if not os.path.exists(abs_path):
             continue
-            
+
         try:
             analysis = analyze_file(abs_path)
             analyses[rel_path] = analysis
-            
+
             # Find candidate functions
             funcs_to_check = list(analysis.functions)
             for cls in analysis.classes:
                 funcs_to_check.extend(cls.methods)
-                
+
             already_added: set[tuple[str, str]] = set()
 
             for fn in funcs_to_check:
@@ -78,27 +126,36 @@ def build_contracts_from_intent(
                 db_ops = fn.database_operations
                 has_loop_db = any(op.inside_loop for op in db_ops)
 
-                sequential_execute_ops = [
-                    op for op in db_ops
-                    if op.operation_type in ("EXECUTE", "EXECUTEMANY") and not op.inside_loop
-                ]
                 has_sequential_chain = (
                     not has_loop_db
                     and fn.control_flow.for_loops == 0
                     and fn.control_flow.while_loops == 0
-                    and len(sequential_execute_ops) >= 2
+                    and _has_combinable_chain(fn)
+                )
+                # Loop-free point lookups with no combinable chain (a single
+                # point lookup, or dependent sequential lookups where each step
+                # consumes the previous step's result): PRESERVE, may pass
+                # unchanged (NO_OP) instead of a forced rewrite.
+                is_preserve = (
+                    not has_loop_db
+                    and not has_sequential_chain
+                    and any(
+                        op.operation_type in ("EXECUTE", "EXECUTEMANY")
+                        and not op.inside_loop
+                        for op in db_ops
+                    )
                 )
 
-                if has_loop_db or has_sequential_chain:
+                if has_loop_db or has_sequential_chain or is_preserve:
                     key = (rel_path, fn.name)
                     if key not in already_added:
                         already_added.add(key)
-                        discovered.append((rel_path, fn, has_loop_db))
+                        discovered.append((rel_path, fn, has_loop_db, is_preserve))
         except Exception:
             continue
-            
+
     contracts = []
-    for rel_path, fn, has_loop in discovered:
+    for rel_path, fn, has_loop, is_preserve in discovered:
         file_analysis = analyses.get(rel_path)
         if file_analysis is None:
             continue
@@ -109,8 +166,14 @@ def build_contracts_from_intent(
             qualified_function=fn.qualified_name,
             source_location=fn.source_location,
         )
-        contract_pattern = "N_PLUS_ONE_QUERY" if has_loop else "SEQUENTIAL_CHAIN"
-        contract_strategy = _pick_strategy(selected_strategy_names, has_loop, "COMBINING_QUERIES")
+        if is_preserve:
+            contract_pattern = PRESERVE_PATTERN
+            contract_strategy = PRESERVE_STRATEGY
+        else:
+            contract_pattern = "N_PLUS_ONE_QUERY" if has_loop else "SEQUENTIAL_CHAIN"
+            contract_strategy = _pick_strategy(
+                selected_strategy_names, has_loop, "COMBINING_QUERIES"
+            )
         contract = build_rewrite_contract(
             analysis=file_analysis,
             target=target,
@@ -120,14 +183,107 @@ def build_contracts_from_intent(
         contract.targets = [target]
         contract.allowed_regions = [fn.qualified_name or fn.name]
         contracts.append(contract)
-                
+
     return analyses, contracts
 
+
+def _contract_for_target(contracts, target):
+    """Return the first contract owning *target*, or None."""
+    fn_names = {
+        target.function or "",
+        target.qualified_function or "",
+    }
+    fn_names = {n for n in fn_names if n}
+    for c in contracts:
+        owned = list(c.targets or [])
+        if c.target is not None:
+            owned.append(c.target)
+        for t in owned:
+            if t.file != target.file:
+                continue
+            if (t.function or "") in fn_names or (
+                t.qualified_function or ""
+            ) in fn_names:
+                return c
+    return None
+
+
+def _no_modifications_result(contracts, all_contract_targets):
+    """Verification outcome when the sandbox modified no files.
+
+    PRESERVE (loop-free) targets are intentionally unchanged, so they count
+    as RESTRICTED/WARNING (NO_OP pass) instead of a strict-zero ERROR, which
+    stays reserved for true N+1 contracts.
+    """
+    violations = []
+    target_coverage = []
+    for t in all_contract_targets:
+        fn = t.qualified_function or t.function
+        if is_preserve_contract(_contract_for_target(contracts, t) or {}):
+            target_coverage.append(
+                TargetStatus(
+                    file=t.file,
+                    function=fn,
+                    status="RESTRICTED",
+                    details="Target preserved unchanged (NO_OP: loop-free, nothing to rewrite)",
+                )
+            )
+            violations.append(
+                VerificationViolation(
+                    code="MISSING_REWRITE",
+                    severity="WARNING",
+                    message=f"Target '{fn}' in '{t.file}' preserved unchanged (NO_OP: loop-free, nothing to rewrite)",
+                )
+            )
+        else:
+            target_coverage.append(
+                TargetStatus(
+                    file=t.file,
+                    function=fn,
+                    status="MISSING_REWRITE",
+                    details="File not modified",
+                )
+            )
+            violations.append(
+                VerificationViolation(
+                    code="MISSING_REWRITE",
+                    severity="ERROR",
+                    message=f"File not modified for target '{fn}' in '{t.file}'",
+                )
+            )
+
+    preserved = sum(1 for tc in target_coverage if tc.status == "RESTRICTED")
+    missing = sum(1 for tc in target_coverage if tc.status == "MISSING_REWRITE")
+    expected = len(all_contract_targets)
+    has_error = any(v.severity == "ERROR" for v in violations)
+    return VerificationResult(
+        status="FAIL" if has_error else "PASS",
+        violations=violations,
+        checks=[
+            VerificationCheck(
+                name="check_rewrite_coverage",
+                status="FAIL" if missing else "PASS",
+                details="No files modified."
+                if missing
+                else "All targets preserved (NO_OP).",
+            )
+        ],
+        summary="Verification failed: no files modified."
+        if missing
+        else "Verification passed: loop-free targets preserved (NO_OP).",
+        target_coverage=target_coverage,
+        expected_targets=expected,
+        transformed_targets=0,
+        missing_targets=missing,
+        rewrite_coverage=round(preserved / expected, 3) if expected > 0 else 1.0,
+    )
+
+
 def verify_all_contracts(
-    target_dir: str, 
-    sandbox_dir: str, 
-    contracts: list[RewriteContract], 
-    modified_files: list[str]
+    target_dir: str,
+    sandbox_dir: str,
+    contracts: list[RewriteContract],
+    modified_files: list[str],
 ) -> VerificationResult:
     if not contracts:
         return VerificationResult(
@@ -139,9 +295,9 @@ def verify_all_contracts(
             expected_targets=0,
             transformed_targets=0,
             missing_targets=0,
-            rewrite_coverage=1.0
+            rewrite_coverage=1.0,
         )
-        
+
     all_contract_targets = []
     for c in contracts:
         if c.targets:
@@ -149,65 +305,47 @@ def verify_all_contracts(
         elif c.target:
             all_contract_targets.append(c.target)
     expected_targets_count = len(all_contract_targets)
-    
+
     if not modified_files and expected_targets_count > 0:
-        violations = []
-        target_coverage = []
-        for t in all_contract_targets:
-            target_coverage.append(TargetStatus(
-                file=t.file,
-                function=t.qualified_function or t.function,
-                status="MISSING_REWRITE",
-                details="File not modified"
-            ))
-            violations.append(VerificationViolation(
-                code="MISSING_REWRITE",
-                severity="ERROR",
-                message=f"File not modified for target '{t.qualified_function or t.function}' in '{t.file}'"
-            ))
-        
-        return VerificationResult(
-            status="FAIL",
-            violations=violations,
-            checks=[VerificationCheck(name="check_rewrite_coverage", status="FAIL", details="No files modified.")],
-            summary="Verification failed: no files modified.",
-            target_coverage=target_coverage,
-            expected_targets=expected_targets_count,
-            transformed_targets=0,
-            missing_targets=expected_targets_count,
-            rewrite_coverage=0.0
-        )
+        return _no_modifications_result(contracts, all_contract_targets)
 
     all_violations = []
     all_checks = []
     all_target_coverage = []
-    
-    active_contracts = [c for c in contracts if c.target and c.target.file in modified_files]
-    
+
+    active_contracts = [
+        c for c in contracts if c.target and c.target.file in modified_files
+    ]
+
     for c in active_contracts:
         f = c.target.file
         orig_src = os.path.join(target_dir, f)
         opt_src = os.path.join(sandbox_dir, f)
         if os.path.exists(orig_src) and os.path.exists(opt_src):
             try:
-                with open(orig_src, 'r', encoding='utf-8') as file:
+                with open(orig_src, "r", encoding="utf-8") as file:
                     orig_code = file.read()
-                with open(opt_src, 'r', encoding='utf-8') as file:
+                with open(opt_src, "r", encoding="utf-8") as file:
                     opt_code = file.read()
-                
+
                 result = verify_contract(orig_code, opt_code, c)
                 all_violations.extend(result.violations)
                 for check in result.checks:
-                    if not any(existing.name == check.name and existing.status == check.status for existing in all_checks):
+                    if not any(
+                        existing.name == check.name and existing.status == check.status
+                        for existing in all_checks
+                    ):
                         all_checks.append(check)
                 all_target_coverage.extend(result.target_coverage)
             except Exception as e:
-                all_violations.append(VerificationViolation(
-                    code="VERIFICATION_ERROR",
-                    severity="ERROR",
-                    message=f"Error verifying {f}: {str(e)}"
-                ))
-    
+                all_violations.append(
+                    VerificationViolation(
+                        code="VERIFICATION_ERROR",
+                        severity="ERROR",
+                        message=f"Error verifying {f}: {str(e)}",
+                    )
+                )
+
     # Deduplicate target_coverage by file and function
     seen_targets = set()
     dedup_coverage = []
@@ -216,7 +354,7 @@ def verify_all_contracts(
         if key not in seen_targets:
             seen_targets.add(key)
             dedup_coverage.append(tc)
-            
+
     # Expected = ALL contract targets (not only those covered by active contracts).
     # Uncovered contract targets count as MISSING_REWRITE so partial/no-op runs cannot PASS vacuously.
     covered_by_key: dict[tuple[str, str], TargetStatus] = {
@@ -225,43 +363,94 @@ def verify_all_contracts(
     final_coverage: list[TargetStatus] = []
     for t in all_contract_targets:
         fn = t.qualified_function or t.function
-        match = covered_by_key.get((t.file, fn)) or covered_by_key.get((t.file, t.function or ""))
+        match = covered_by_key.get((t.file, fn)) or covered_by_key.get(
+            (t.file, t.function or "")
+        )
         if not match:
             for (f, fn_key), tc in covered_by_key.items():
                 if f != t.file:
                     continue
-                if t.function and (fn_key == t.function or fn_key.endswith("." + t.function)):
+                if t.function and (
+                    fn_key == t.function or fn_key.endswith("." + t.function)
+                ):
                     match = tc
                     break
         if match:
             final_coverage.append(match)
+        elif is_preserve_contract(_contract_for_target(contracts, t) or {}):
+            # PRESERVE (loop-free) targets with untouched files are an
+            # intentional NO_OP, not a missing rewrite.
+            final_coverage.append(
+                TargetStatus(
+                    file=t.file,
+                    function=fn,
+                    status="RESTRICTED",
+                    details="Target preserved unchanged (NO_OP: loop-free, nothing to rewrite)",
+                )
+            )
+            all_violations.append(
+                VerificationViolation(
+                    code="MISSING_REWRITE",
+                    severity="WARNING",
+                    message=f"Target '{fn}' in '{t.file}' preserved unchanged (NO_OP: loop-free, nothing to rewrite)",
+                )
+            )
         else:
-            final_coverage.append(TargetStatus(
-                file=t.file,
-                function=fn,
-                status="MISSING_REWRITE",
-                details="Target not verified (file not modified or target not covered)",
-            ))
+            final_coverage.append(
+                TargetStatus(
+                    file=t.file,
+                    function=fn,
+                    status="MISSING_REWRITE",
+                    details="Target not verified (file not modified or target not covered)",
+                )
+            )
 
     expected_targets = expected_targets_count
     transformed_targets = sum(1 for tc in final_coverage if tc.status == "TRANSFORMED")
+    preserved_targets = sum(
+        1 for tc in final_coverage if tc.status in ("RESTRICTED", "NO_OP")
+    )
     missing_targets = sum(1 for tc in final_coverage if tc.status == "MISSING_REWRITE")
-    rewrite_coverage = round(transformed_targets / expected_targets, 3) if expected_targets > 0 else 1.0
+    rewrite_coverage = (
+        round((transformed_targets + preserved_targets) / expected_targets, 3)
+        if expected_targets > 0
+        else 1.0
+    )
 
     critical_codes = {
-        "SYNTAX_ERROR", "ORIGINAL_SYNTAX_ERROR", "TARGET_MISSING",
-        "FUNCTION_SIGNATURE_CHANGED", "UNAUTHORIZED_CHANGE",
-        "DB_OPERATION_REMOVED", "INVALID_REWRITE", "BREAKING_DEPENDENCY",
-        "MISSING_REWRITE", "STRATEGY_NOT_APPLIED", "UNTRANSFORMED_FUNCTION", "UNTRANSFORMED_TARGET",
-        "MULTI_STATEMENT_EXECUTE", "DUPLICATE_WHERE", "UNKNOWN_QUERY_KEY",
-        "IMPLICIT_CROSS_JOIN"
+        "SYNTAX_ERROR",
+        "ORIGINAL_SYNTAX_ERROR",
+        "TARGET_MISSING",
+        "FUNCTION_SIGNATURE_CHANGED",
+        "UNAUTHORIZED_CHANGE",
+        "DB_OPERATION_REMOVED",
+        "INVALID_REWRITE",
+        "BREAKING_DEPENDENCY",
+        "MISSING_REWRITE",
+        "STRATEGY_NOT_APPLIED",
+        "UNTRANSFORMED_FUNCTION",
+        "UNTRANSFORMED_TARGET",
+        "MULTI_STATEMENT_EXECUTE",
+        "DUPLICATE_WHERE",
+        "UNKNOWN_QUERY_KEY",
+        "IMPLICIT_CROSS_JOIN",
     }
-    has_critical = any(v.severity == "ERROR" and v.code in critical_codes for v in all_violations)
+    has_critical = any(
+        v.severity == "ERROR" and v.code in critical_codes for v in all_violations
+    )
 
-    if has_critical or (expected_targets > 0 and (transformed_targets < expected_targets or missing_targets > 0)):
+    if has_critical or (
+        expected_targets > 0
+        and (
+            (transformed_targets + preserved_targets) < expected_targets
+            or missing_targets > 0
+        )
+    ):
         overall_status = "FAIL"
     else:
-        overall_status = "PASS" if not any(v.severity == "ERROR" for v in all_violations) else "FAIL"
+        overall_status = (
+            "PASS" if not any(v.severity == "ERROR" for v in all_violations) else "FAIL"
+        )
 
     return VerificationResult(
         status=overall_status,
@@ -272,8 +461,9 @@ def verify_all_contracts(
         expected_targets=expected_targets,
         transformed_targets=transformed_targets,
         missing_targets=missing_targets,
-        rewrite_coverage=rewrite_coverage
+        rewrite_coverage=rewrite_coverage,
     )
+
 
 def verify_contract_target(
     target_dir: str,
@@ -299,23 +489,29 @@ def verify_contract_target(
         details = f"Target file '{rel}' missing from target or sandbox directory."
         return VerificationResult(
             status="FAIL",
-            violations=[VerificationViolation(
-                code="MISSING_REWRITE",
-                severity="ERROR",
-                message=details,
-            )],
-            checks=[VerificationCheck(
-                name="check_target_file",
-                status="FAIL",
-                details=details,
-            )],
+            violations=[
+                VerificationViolation(
+                    code="MISSING_REWRITE",
+                    severity="ERROR",
+                    message=details,
+                )
+            ],
+            checks=[
+                VerificationCheck(
+                    name="check_target_file",
+                    status="FAIL",
+                    details=details,
+                )
+            ],
             summary="Verification failed: target file missing.",
-            target_coverage=[TargetStatus(
-                file=rel,
-                function=fn_name,
-                status="MISSING_REWRITE",
-                details=details,
-            )],
+            target_coverage=[
+                TargetStatus(
+                    file=rel,
+                    function=fn_name,
+                    status="MISSING_REWRITE",
+                    details=details,
+                )
+            ],
             expected_targets=1,
             transformed_targets=0,
             missing_targets=1,
@@ -338,7 +534,11 @@ def _build_dependency_slice_pairs(
 
     pairs: list[tuple[str, str]] = []
     for contract in contracts:
-        targets_to_check = contract.targets if contract.targets else ([contract.target] if contract.target else [])
+        targets_to_check = (
+            contract.targets
+            if contract.targets
+            else ([contract.target] if contract.target else [])
+        )
         for t in targets_to_check:
             file_analysis = analyses_map.get(t.file)
             if not file_analysis:
@@ -358,7 +558,11 @@ def _build_dependency_slice_pairs(
                             source_code = f.read()
                     except Exception:
                         pass
-            if not source_code and file_analysis.file_path and os.path.exists(file_analysis.file_path):
+            if (
+                not source_code
+                and file_analysis.file_path
+                and os.path.exists(file_analysis.file_path)
+            ):
                 try:
                     with open(file_analysis.file_path, "r", encoding="utf-8") as f:
                         source_code = f.read()
@@ -439,7 +643,7 @@ def _extract_function_source(source: str, source_location) -> str:
     end = source_location.end_line
     if start < 1 or end < start or end > len(lines):
         return ""
-    return "\n".join(lines[start - 1:end])
+    return "\n".join(lines[start - 1 : end])
 
 
 _SQL_OPERATIONS = ("SELECT", "INSERT", "UPDATE", "DELETE")
@@ -468,7 +672,9 @@ def _discover_query_context(
 
     local_vars: dict[str, dict] = {}
     for node in ast.walk(func_node):
-        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Subscript):
+        if not isinstance(node, ast.Assign) or not isinstance(
+            node.value, ast.Subscript
+        ):
             continue
         subscript = node.value
         if not isinstance(subscript.value, ast.Name):
@@ -492,7 +698,11 @@ def _discover_query_context(
         if node.func.attr not in _EXECUTE_METHODS or not node.args:
             continue
         arg0 = node.args[0]
-        subscript = arg0.left if isinstance(arg0, ast.BinOp) and isinstance(arg0.op, ast.Mod) else arg0
+        subscript = (
+            arg0.left
+            if isinstance(arg0, ast.BinOp) and isinstance(arg0.op, ast.Mod)
+            else arg0
+        )
         if not isinstance(subscript, ast.Subscript):
             continue
         key = _const_str(subscript.slice)
@@ -546,7 +756,11 @@ def build_target_context_map(
 
     out: dict[str, dict] = {}
     for contract in contracts:
-        targets_to_check = contract.targets if contract.targets else ([contract.target] if contract.target else [])
+        targets_to_check = (
+            contract.targets
+            if contract.targets
+            else ([contract.target] if contract.target else [])
+        )
         for t in targets_to_check:
             qfn = t.qualified_function or t.function
             if not qfn:
@@ -570,7 +784,12 @@ def build_target_context_map(
                             source_code = f.read()
                     except Exception:
                         pass
-            if not source_code and file_analysis and file_analysis.file_path and os.path.exists(file_analysis.file_path):
+            if (
+                not source_code
+                and file_analysis
+                and file_analysis.file_path
+                and os.path.exists(file_analysis.file_path)
+            ):
                 try:
                     with open(file_analysis.file_path, "r", encoding="utf-8") as f:
                         source_code = f.read()

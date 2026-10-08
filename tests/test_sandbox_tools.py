@@ -230,6 +230,12 @@ def test_get_optimization_context_includes_prior_attempts():
 
 _NO_REWRITE_FN = "def doNewOrder(self, warehouse_id):\n    cursor.execute('SELECT 1')\n"
 
+_NO_REWRITE_LOOP_FN = (
+    "def doNewOrder(self, warehouse_ids):\n"
+    "    for wid in warehouse_ids:\n"
+    "        cursor.execute('SELECT 1', (wid,))\n"
+)
+
 
 def _optimizer_context_state_with_sandbox(
     tmp_path, sandbox_function_source, attempt_count
@@ -244,11 +250,22 @@ def _optimizer_context_state_with_sandbox(
 
 
 def test_get_optimization_context_no_rewrite_directive_when_unchanged(tmp_path):
-    state = _optimizer_context_state_with_sandbox(tmp_path, _NO_REWRITE_FN, 2)
+    state = _optimizer_context_state_with_sandbox(tmp_path, _NO_REWRITE_LOOP_FN, 2)
+    state["target_context_map"]["Db.doNewOrder"]["function_source"] = _NO_REWRITE_LOOP_FN
 
     result = co_get_optimization_context(MockToolContext(state))
 
     assert "## CRITICAL: No rewrite applied" in result
+
+
+def test_get_optimization_context_noop_directive_when_unchanged_loop_free(tmp_path):
+    state = _optimizer_context_state_with_sandbox(tmp_path, _NO_REWRITE_FN, 2)
+
+    result = co_get_optimization_context(MockToolContext(state))
+
+    assert "## CRITICAL: No rewrite applied" not in result
+    assert "## NO_OP allowed" in result
+    assert "NO_OP" in result
 
 
 def test_get_optimization_context_no_directive_on_first_attempt(tmp_path):

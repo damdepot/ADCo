@@ -22,12 +22,18 @@ from src.code_rewriter.models.feedback_models import (
 )
 from src.code_rewriter.models.rewrite_models import RewriteContract
 from src.code_rewriter.tools.ast_replacer import function_ast_dump, replace_function_ast
-from src.code_rewriter.tools.contract_verifier import verify_contract
+from src.code_rewriter.tools.contract_verifier import (
+    verify_contract,
+    is_preserve_contract,
+)
 from src.code_rewriter.tools.pipeline_analysis import verify_all_contracts
 from src.code_rewriter.tools.transformation_risk import (
     analyze_candidate,
     analyze_transformation,
+    should_block_fusion,
 )
+from src.code_rewriter.tools.sql_analysis import fusion_regression_violations
+from src.code_rewriter.tools.explain_guard import explain_cost_guard
 
 _ADCO_TAG_RE = re.compile(r"^[#-]{1,2}\s*ADCO_OPTIMIZED:.*\n?", re.MULTILINE)
 
@@ -99,9 +105,7 @@ def _prior_reject_count(
             continue
         if entry.get("file") != path:
             continue
-        entry_bare = entry.get("bare_function") or _bare_function(
-            entry.get("function")
-        )
+        entry_bare = entry.get("bare_function") or _bare_function(entry.get("function"))
         if entry_bare != bare:
             continue
         if entry.get("candidate_key") != candidate_key:
@@ -122,7 +126,14 @@ def _reject(
     """Record a rejected attempt and build the feedback message."""
     count = _prior_reject_count(tool_context, path, function_name, candidate_key)
     _record_attempt(
-        tool_context, path, function_name, "REJECTED", codes, message, candidate_key, diff
+        tool_context,
+        path,
+        function_name,
+        "REJECTED",
+        codes,
+        message,
+        candidate_key,
+        diff,
     )
     parts = [message]
     if count >= 1:
@@ -164,8 +175,7 @@ def _coverage_feedback(tool_context: ToolContext) -> str:
         return ""
     try:
         contracts = [
-            RewriteContract(**c) if isinstance(c, dict) else c
-            for c in contracts_data
+            RewriteContract(**c) if isinstance(c, dict) else c for c in contracts_data
         ]
     except Exception:
         return ""
@@ -229,9 +239,7 @@ def _render_transformation_risk(tool_context: ToolContext) -> str:
 def _new_error_violations(before, after) -> list:
     """Return ERROR violations present in *after* but not in *before*."""
     before_signatures = {
-        (v.code, v.message)
-        for v in before.violations
-        if v.severity == "ERROR"
+        (v.code, v.message) for v in before.violations if v.severity == "ERROR"
     }
     new_errors = []
     seen: set[tuple[str, str]] = set()
@@ -267,7 +275,9 @@ def _write_time_gate(
         return ([], "")
 
     try:
-        original_source = Path(original_path).read_text(encoding="utf-8", errors="replace")
+        original_source = Path(original_path).read_text(
+            encoding="utf-8", errors="replace"
+        )
     except Exception:
         return ([], "")
 
@@ -305,16 +315,23 @@ def _write_time_gate(
 def _risk_block(
     tool_context: ToolContext, path: str, candidate_source: str
 ) -> tuple[list[str], str]:
-    """Block a candidate that is a HIGH-risk transformation.
+    """Block a candidate that is a fusion regression risk.
+
+    Enforces (all schema-agnostic, no hardcoded tables):
+
+    * ``should_block_fusion`` — DEPENDENT_QUERY_FUSION + (JOIN increase |
+      AGGREGATE expansion), which includes every HIGH classification;
+    * the static plan-shape guard — max top-level relations grew, or a
+      LATERAL/correlated subquery over a cross-function-written table was
+      introduced without strictly reducing round-trips
+      (``FUSION_REGRESSION_RISK``);
+    * the optional EXPLAIN cost guard — advisory-first, only blocks on a
+      proven cost regression, skips silently with no DB.
 
     Returns ``(codes, error)`` when the candidate must be rejected, else
-    ``([], "")``.  Any failure while analysing risk is treated as "no block" so
-    only a genuine HIGH classification can stop a write.
+    ``([], "")``.  Any analysis failure is treated as "no block" so only
+    proven regressions stop a write.
     """
-    read_write_map = tool_context.state.get("read_write_map")
-    if not read_write_map:
-        return ([], "")
-
     contract_data = tool_context.state.get("current_contract")
     if not isinstance(contract_data, dict) or not contract_data:
         return ([], "")
@@ -340,31 +357,130 @@ def _risk_block(
     except Exception:
         return ([], "")
 
+    bare = _bare_function(function)
+
+    def _targets_function(name: str) -> bool:
+        return bool(name) and (name == function or name.split(".")[-1] == bare)
+
+    # 1. Fusion + expansion block (superset of HIGH).
+    read_write_map = tool_context.state.get("read_write_map") or {}
     try:
         risk = analyze_candidate(
             original_source, candidate_source, function, read_write_map
         )
     except Exception:
-        return ([], "")
+        risk = None
 
-    if risk is None or risk.risk != "HIGH":
-        return ([], "")
+    if risk is not None and should_block_fusion(risk):
+        rejections = tool_context.state.setdefault("risk_rejections", [])
+        if function not in rejections:
+            rejections.append(function)
 
-    rejections = tool_context.state.setdefault("risk_rejections", [])
-    if function not in rejections:
-        rejections.append(function)
+        flags = ", ".join(risk.flags) if risk.flags else "none"
+        lines = [f"ERROR: rejected — HIGH transformation risk (blocked): {flags}."]
+        lines.append("Evidence:")
+        lines.extend(f"- {item}" for item in risk.evidence)
+        lines.append(
+            "Required: apply a dependency-preserving, lower-risk shape — e.g. keep the "
+            "dependent lookup as a scalar subquery (do NOT expand the aggregate's "
+            "top-level join), or keep the statements separate. Do not merge a "
+            "value-dependent lookup into a larger join."
+        )
+        return (["HIGH_TRANSFORMATION_RISK"], "\n".join(lines))
 
-    flags = ", ".join(risk.flags) if risk.flags else "none"
-    lines = [f"ERROR: rejected — HIGH transformation risk (blocked): {flags}."]
-    lines.append("Evidence:")
-    lines.extend(f"- {item}" for item in risk.evidence)
-    lines.append(
-        "Required: apply a dependency-preserving, lower-risk shape — e.g. keep the "
-        "dependent lookup as a scalar subquery (do NOT expand the aggregate's "
-        "top-level join), or keep the statements separate. Do not merge a "
-        "value-dependent lookup into a larger join."
-    )
-    return (["HIGH_TRANSFORMATION_RISK"], "\n".join(lines))
+    # 2. Static plan-shape guard (no live DB needed).
+    try:
+        written: set[str] = set()
+        if isinstance(read_write_map, dict):
+            for table, entry in read_write_map.items():
+                if not isinstance(entry, dict):
+                    continue
+                writers = entry.get("written_by") or []
+                others = [w for w in writers if w and w != function]
+                if others and isinstance(table, str) and table:
+                    written.add(table.lower())
+        sites = fusion_regression_violations(
+            original_source, candidate_source, written_tables=written or None
+        )
+        relevant = [s for s in sites if _targets_function(s.get("function", ""))]
+        if relevant:
+            rejections = tool_context.state.setdefault("risk_rejections", [])
+            if function not in rejections:
+                rejections.append(function)
+            lines = ["ERROR: rejected — fusion plan-shape regression (blocked):"]
+            for site in relevant:
+                lines.append(
+                    f"- {site.get('function')}: {site.get('reason')} "
+                    f"(relations {site.get('max_relations_before')} -> "
+                    f"{site.get('max_relations_after')}, executes "
+                    f"{site.get('executes_before')} -> {site.get('executes_after')})"
+                )
+            lines.append(
+                "Required: keep the statements separate (e.g. two sequential PK "
+                "lookups) or use a scalar subquery that strictly reduces "
+                "round-trips without growing the top-level join."
+            )
+            return (["FUSION_REGRESSION_RISK"], "\n".join(lines))
+    except Exception:
+        pass
+
+    # 3. Optional EXPLAIN cost guard — advisory-first, never fails closed.
+    try:
+        orig_sqls: list[str] = []
+        cand_sqls: list[str] = []
+        if risk is not None:
+            pass
+        try:
+            from src.code_rewriter.tools.db_interaction import build_function_model
+            from src.code_rewriter.tools.sql_resolver import collect_module_dicts
+            from src.code_rewriter._common import find_function_node
+            import ast as _ast
+
+            for src, bucket in (
+                (original_source, orig_sqls),
+                (candidate_source, cand_sqls),
+            ):
+                try:
+                    tree = _ast.parse(src)
+                except Exception:
+                    continue
+                node = find_function_node(tree, function)
+                if node is None:
+                    continue
+                try:
+                    model = build_function_model(
+                        node, collect_module_dicts(tree), file="", function=function
+                    )
+                except Exception:
+                    continue
+                for stmt in model.statements:
+                    if stmt.sql:
+                        bucket.append(stmt.sql)
+        except Exception:
+            pass
+        if orig_sqls and cand_sqls:
+            db_url = None
+            try:
+                db_url = tool_context.state.get("db_url") or tool_context.state.get(
+                    "database_url"
+                )
+            except Exception:
+                db_url = None
+            verdict = explain_cost_guard(orig_sqls, cand_sqls, db_url=db_url)
+            if isinstance(verdict, dict) and verdict.get("status") == "regression":
+                rejections = tool_context.state.setdefault("risk_rejections", [])
+                if function not in rejections:
+                    rejections.append(function)
+                return (
+                    ["FUSION_REGRESSION_RISK"],
+                    f"ERROR: rejected — EXPLAIN cost regression (blocked): "
+                    f"{verdict.get('reason', '')} Keep the statements separate or "
+                    f"reduce the join shape.",
+                )
+    except Exception:
+        pass
+
+    return ([], "")
 
 
 def replace_function(
@@ -393,7 +509,9 @@ def replace_function(
     except Exception as e:
         return f"ERROR: Could not read file '{path}': {e}"
 
-    success, reconstructed, err = replace_function_ast(content, function_name, new_function_code)
+    success, reconstructed, err = replace_function_ast(
+        content, function_name, new_function_code
+    )
     if not success:
         return f"ERROR: Failed to replace function '{function_name}': {err}"
 
@@ -439,16 +557,19 @@ def replace_function(
             diff,
         )
 
-    codes, rejection = _write_time_gate(tool_context, path, content, reconstructed)
-    if rejection:
-        return _reject(
-            tool_context, path, function_name, codes, rejection, candidate_key, diff
-        )
-
+    # Fusion/plan-cost guard first so HIGH-risk fusions report the
+    # transformation-risk verdict (and record risk_rejections) before the
+    # generic verification-error gate.
     codes, risk_block = _risk_block(tool_context, path, reconstructed)
     if risk_block:
         return _reject(
             tool_context, path, function_name, codes, risk_block, candidate_key, diff
+        )
+
+    codes, rejection = _write_time_gate(tool_context, path, content, reconstructed)
+    if rejection:
+        return _reject(
+            tool_context, path, function_name, codes, rejection, candidate_key, diff
         )
 
     sandbox_id = os.path.basename(sandbox) if sandbox else ""
@@ -520,7 +641,9 @@ def _render_previous_attempt(
         full = os.path.join(sandbox, file)
         if os.path.isfile(full):
             try:
-                sandbox_source = Path(full).read_text(encoding="utf-8", errors="replace")
+                sandbox_source = Path(full).read_text(
+                    encoding="utf-8", errors="replace"
+                )
             except Exception:
                 sandbox_source = ""
             extracted = extract_function_source_by_name(sandbox_source, qualified)
@@ -558,10 +681,48 @@ def _render_previous_attempt(
     return sections
 
 
+def _function_has_loop_db_ops(original_source: str, qualified: str) -> bool:
+    """True when the target function issues DB calls inside a loop.
+
+    Generic AST check (no table/function names): finds the function by bare
+    name and reports whether any ``execute``/``executemany`` call sits inside
+    a ``for``/``while`` node. Unparseable or missing functions conservatively
+    return ``True`` so the strict rewrite directive still applies.
+    """
+    import ast as _ast
+
+    if not original_source or not qualified:
+        return True
+    try:
+        tree = _ast.parse(textwrap.dedent(original_source))
+    except Exception:
+        return True
+    bare = qualified.rsplit(".", 1)[-1]
+    func_node = None
+    for node in _ast.walk(tree):
+        if (
+            isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+            and node.name == bare
+        ):
+            func_node = node
+            break
+    if func_node is None:
+        return True
+    for node in _ast.walk(func_node):
+        if isinstance(node, (_ast.For, _ast.AsyncFor, _ast.While)):
+            for child in _ast.walk(node):
+                if isinstance(child, _ast.Call) and isinstance(
+                    child.func, _ast.Attribute
+                ):
+                    if child.func.attr.lower() in ("execute", "executemany"):
+                        return True
+    return False
+
+
 def _no_rewrite_directive(
     state: dict, file: str, qualified: str, original_source: str
 ) -> str:
-    """Emit a hard directive when a prior attempt left the target unchanged."""
+    """Emit a directive when a prior attempt left the target unchanged."""
     if (state.get("attempt_count") or 0) <= 1:
         return ""
     sandbox = state.get("sandbox", "")
@@ -580,12 +741,23 @@ def _no_rewrite_directive(
     bare = qualified.rsplit(".", 1)[-1]
     previous_dump = function_ast_dump(sandbox_source, bare)
     original_dump = function_ast_dump(textwrap.dedent(original_source or ""), bare)
-    if (
-        previous_dump is None
-        or original_dump is None
-        or previous_dump != original_dump
-    ):
+    if previous_dump is None or original_dump is None or previous_dump != original_dump:
         return ""
+    contract = state.get("current_contract") or {}
+    if is_preserve_contract(contract) or not _function_has_loop_db_ops(
+        original_source, qualified
+    ):
+        return (
+            "## NO_OP allowed — no rewrite required\n"
+            f"The sandbox function `{qualified}` is unchanged from the original, "
+            "and the target is loop-free (no DB ops inside loops"
+            + ("; Contract Strategy PRESERVE" if is_preserve_contract(contract) else "")
+            + "). A NO_OP finish is acceptable: do NOT call `replace_function`. "
+            "Return your final message as valid OptimizerOutput JSON with status "
+            "`PASS` (or `NO_OP`), no modified files, and a `summary` reason such "
+            'as "NO_OP: loop-free sequential point lookups; no shared-key batch '
+            'opportunity".'
+        )
     return (
         "## CRITICAL: No rewrite applied\n"
         f"The sandbox function `{qualified}` is IDENTICAL to the original — your "
@@ -622,11 +794,17 @@ def _render_contract(contract: dict, file: str, qualified: str) -> str:
     lines.append(f"- Pattern: {contract.get('pattern', '')}")
     lines.append(f"- Strategy: {contract.get('strategy', '')}")
     allowed = contract.get("allowed_regions") or []
-    lines.append(f"- Allowed edit regions: {', '.join(allowed) if allowed else '(none)'}")
+    lines.append(
+        f"- Allowed edit regions: {', '.join(allowed) if allowed else '(none)'}"
+    )
     must_preserve = contract.get("must_preserve") or []
-    lines.append(f"- Must preserve: {', '.join(must_preserve) if must_preserve else '(none)'}")
+    lines.append(
+        f"- Must preserve: {', '.join(must_preserve) if must_preserve else '(none)'}"
+    )
     must_not_change = contract.get("must_not_change") or []
-    lines.append(f"- Must not change: {', '.join(must_not_change) if must_not_change else '(none)'}")
+    lines.append(
+        f"- Must not change: {', '.join(must_not_change) if must_not_change else '(none)'}"
+    )
     lines.append(f"- Target file: {file}")
     lines.append(f"- Target function: {qualified}")
     return "\n".join(lines)
@@ -636,7 +814,8 @@ def _render_checklist(pattern: str) -> str:
     """Render the deterministic acceptance checklist for the target."""
     checklist = ["## Acceptance Checklist (deterministic — all must hold)"]
     pattern_upper = (pattern or "").upper()
-    if "N+1" in pattern_upper or "N_PLUS_ONE" in pattern_upper:
+    is_n1 = "N+1" in pattern_upper or "N_PLUS_ONE" in pattern_upper
+    if is_n1:
         checklist.append(
             "- 0 database operations inside any loop (strict zero — no "
             "cursor.execute/executemany in loop body)"
@@ -644,6 +823,23 @@ def _render_checklist(pattern: str) -> str:
         checklist.append(
             "- at least one replacement DB operation outside the loop (batch IN/ANY/JOIN "
             "before the loop, or executemany after it)"
+        )
+    else:
+        # Non-N+1 / sequential point lookups: NO_OP is an acceptable outcome.
+        # Do NOT force batching/combining when there is nothing to batch.
+        checklist.append(
+            "- NO_OP is acceptable for this non-N+1 pattern: if the Function Analysis "
+            "shows zero DB ops inside loops AND no shared-key batch opportunity AND "
+            "no eliminated round trip, leave the function unchanged and return "
+            "status NO_OP (do NOT call replace_function)"
+        )
+        checklist.append(
+            "- fusion-risk conditions (any one blocks combining/batching): "
+            "(a) value-dependent lookup — a later query consumes a value returned "
+            "by an earlier query; "
+            "(b) different filter keys per statement with no shared key set; "
+            "(c) merging would add a JOIN/aggregate that changes cardinality or "
+            "transaction/error-handling semantics"
         )
     checklist.extend(
         [

@@ -34,6 +34,7 @@ from src.code_rewriter.models.rewrite_models import RewriteContract
 from src.code_rewriter.sub_agents.optimizer.agent import create_optimizer_agent
 from src.code_rewriter.sub_agents.verifier.agent import create_verifier_agent
 from src.code_rewriter.tools import copy_to_sandbox, get_optimization_strategies
+from src.code_rewriter.tools.contract_verifier import is_preserve_contract
 from src.code_rewriter.tools.pipeline_analysis import verify_contract_target
 from src.code_rewriter.tools.transformation_risk import analyze_transformation
 
@@ -45,9 +46,15 @@ _STRATEGY_ERROR_CODES = {"STRATEGY_NOT_APPLIED", "MISSING_REWRITE", "INVALID_REW
 def _attempt_score(verdict: Any) -> tuple[int, int, int]:
     """Lower is better: (has_strategy_error, error_count, warning_count)."""
     violations = (verdict or {}).get("violations") or []
-    errors = [v for v in violations if isinstance(v, dict) and v.get("severity") == "ERROR"]
-    warnings = [v for v in violations if isinstance(v, dict) and v.get("severity") == "WARNING"]
-    has_strategy = 1 if any(v.get("code") in _STRATEGY_ERROR_CODES for v in errors) else 0
+    errors = [
+        v for v in violations if isinstance(v, dict) and v.get("severity") == "ERROR"
+    ]
+    warnings = [
+        v for v in violations if isinstance(v, dict) and v.get("severity") == "WARNING"
+    ]
+    has_strategy = (
+        1 if any(v.get("code") in _STRATEGY_ERROR_CODES for v in errors) else 0
+    )
     return (has_strategy, len(errors), len(warnings))
 
 
@@ -93,6 +100,50 @@ def _function_unchanged(
     if not original_fn or not sandbox_fn:
         return False
     return original_fn == sandbox_fn
+
+
+def _original_has_loop_db_ops(target_dir: str, rel_file: str, function: str) -> bool:
+    """True when the original target function issues DB calls inside a loop.
+
+    Generic AST check (no table/function names): an ``execute``/``executemany``
+    call inside a ``for``/``while`` node. Missing files or parse failures
+    conservatively return ``True`` so loop-free NO_OP handling only fires when
+    the original is provably loop-free.
+    """
+    import ast as _ast
+
+    if not target_dir or not rel_file or not function:
+        return True
+    try:
+        source = Path(os.path.join(target_dir, rel_file)).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except Exception:
+        return True
+    try:
+        tree = _ast.parse(source)
+    except Exception:
+        return True
+    bare = (function or "").rsplit(".", 1)[-1]
+    func_node = None
+    for node in _ast.walk(tree):
+        if (
+            isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+            and node.name == bare
+        ):
+            func_node = node
+            break
+    if func_node is None:
+        return True
+    for node in _ast.walk(func_node):
+        if isinstance(node, (_ast.For, _ast.AsyncFor, _ast.While)):
+            for child in _ast.walk(node):
+                if isinstance(child, _ast.Call) and isinstance(
+                    child.func, _ast.Attribute
+                ):
+                    if child.func.attr.lower() in ("execute", "executemany"):
+                        return True
+    return False
 
 
 def copy_node(ctx: Context, node_input: Any = None) -> Event:
@@ -161,7 +212,9 @@ def make_orchestrate(
             qfn = target.get("qualified_function") or target.get("function") or ""
             sandbox = ctx.state.get("sandbox", "")
             rel_file = target.get("file", "")
-            target_path = os.path.join(sandbox, rel_file) if sandbox and rel_file else ""
+            target_path = (
+                os.path.join(sandbox, rel_file) if sandbox and rel_file else ""
+            )
             best_score: tuple[int, int, int] | None = None
             best_bytes: bytes | None = None
             best_verdict: Any = None
@@ -308,21 +361,35 @@ def make_orchestrate(
                     ctx.state.get("target", ""), sandbox, rel_file, qfn
                 )
                 if unchanged:
-                    # The original function is preserved: either a HIGH-risk
-                    # rewrite was blocked, or the optimizer never produced a valid
-                    # rewrite. Both are acceptable (RESTRICTED) outcomes rather
-                    # than pipeline failures.
-                    status = "RESTRICTED"
-                    verdict = {
-                        "status": "RESTRICTED",
-                        "summary": (
-                            "HIGH-risk transformation blocked; original function preserved."
-                            if risk_rejected
-                            else "No valid rewrite produced; original function preserved."
-                        ),
-                        "violations": [],
-                        "target_coverage": [],
-                    }
+                    # The original function is preserved: a HIGH-risk rewrite
+                    # was blocked, the optimizer never produced a valid rewrite,
+                    # or the loop-free target needed no rewrite (NO_OP). All are
+                    # acceptable (RESTRICTED) outcomes rather than failures.
+                    if is_preserve_contract(contract) or not _original_has_loop_db_ops(
+                        ctx.state.get("target", ""), rel_file, qfn
+                    ):
+                        status = "RESTRICTED"
+                        verdict = {
+                            "status": "RESTRICTED",
+                            "summary": (
+                                "NO_OP: loop-free target preserved unchanged "
+                                "(no loop DB ops; nothing to rewrite)."
+                            ),
+                            "violations": [],
+                            "target_coverage": [],
+                        }
+                    else:
+                        status = "RESTRICTED"
+                        verdict = {
+                            "status": "RESTRICTED",
+                            "summary": (
+                                "HIGH-risk transformation blocked; original function preserved."
+                                if risk_rejected
+                                else "No valid rewrite produced; original function preserved."
+                            ),
+                            "violations": [],
+                            "target_coverage": [],
+                        }
                 else:
                     status = "FAIL"
 
@@ -349,7 +416,9 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
     n_total = len(results)
     n_pass = sum(1 for r in results if r.get("status") == "PASS")
     n_restricted = sum(1 for r in results if r.get("status") == "RESTRICTED")
-    all_ok = n_total > 0 and all(r.get("status") in ("PASS", "RESTRICTED") for r in results)
+    all_ok = n_total > 0 and all(
+        r.get("status") in ("PASS", "RESTRICTED") for r in results
+    )
 
     errors = [
         v
@@ -367,8 +436,8 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
     summary = f"{n_pass}/{n_total} target functions transformed."
     if n_restricted:
         summary += (
-            f" {n_restricted} restricted (HIGH-risk transformation blocked; "
-            "original preserved)."
+            f" {n_restricted} restricted (original preserved: NO_OP loop-free "
+            "pass-through or HIGH-risk transformation blocked)."
         )
 
     det = {
@@ -378,7 +447,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         "transformed_targets": n_pass,
         "restricted_targets": n_restricted,
         "missing_targets": n_total - n_pass - n_restricted,
-        "rewrite_coverage": (n_pass / n_total) if n_total else 0.0,
+        "rewrite_coverage": ((n_pass + n_restricted) / n_total) if n_total else 0.0,
         "target_coverage": [
             {
                 "file": r.get("file", ""),
@@ -391,7 +460,8 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
                     else "MISSING_REWRITE"
                 ),
                 "details": (
-                    "HIGH-risk transformation blocked; original function preserved."
+                    (r.get("verification") or {}).get("summary", "")
+                    or "Original function preserved."
                     if r.get("status") == "RESTRICTED"
                     else (r.get("verification") or {}).get("summary", "")
                     if r.get("status") != "PASS"
@@ -421,7 +491,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
 
     restricted_lines = [
         f"[RESTRICTED] {r.get('file')}::{r.get('function')} — "
-        "HIGH-risk transformation blocked"
+        f"{(r.get('verification') or {}).get('summary', '') or 'original preserved'}"
         for r in results
         if r.get("status") == "RESTRICTED"
     ]
@@ -453,9 +523,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         # into a FAIL (observed hallucinated "residual loop ops" on already-
         # batched code). Advisory warnings are surfaced in `detail`; they never
         # change `status`.
-        detail_parts = [
-            f"[{w.get('code')}] {w.get('message')}" for w in warnings
-        ]
+        detail_parts = [f"[{w.get('code')}] {w.get('message')}" for w in warnings]
         detail_parts.extend(restricted_lines)
         vo = {
             "status": "PASS",

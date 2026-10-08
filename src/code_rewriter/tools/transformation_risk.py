@@ -40,6 +40,15 @@ Risk rule
 
 The rule is intentionally conservative: it prefers false positives over false
 negatives, since this is an advisory signal only.
+
+Blocking helper
+---------------
+:func:`should_block_fusion` promotes ``DEPENDENT_QUERY_FUSION`` + (
+``JOIN_COMPLEXITY_INCREASE`` | ``AGGREGATE_QUERY_EXPANSION``) to a blocking
+signal.  It returns ``True`` for ``HIGH`` reports (which always carry that flag
+combination) and for any report carrying fusion + expansion even without a
+cross-function table.  The module itself stays advisory by default — callers
+(e.g. the optimizer write-time gate) decide whether to enforce the block.
 """
 
 from __future__ import annotations
@@ -80,9 +89,7 @@ def model_from_source(source: str, function_name: str) -> Optional[FunctionDbMod
         return None
 
     try:
-        return build_function_model(
-            node, module_dicts, file="", function=function_name
-        )
+        return build_function_model(node, module_dicts, file="", function=function_name)
     except Exception:
         return None
 
@@ -141,7 +148,11 @@ def _statement_order_changed(orig: FunctionDbModel, opt: FunctionDbModel) -> boo
 
 
 def _classify_risk(
-    fusion: bool, join_increase: bool, aggregate_expansion: bool, cross: bool, order_change: bool
+    fusion: bool,
+    join_increase: bool,
+    aggregate_expansion: bool,
+    cross: bool,
+    order_change: bool,
 ) -> str:
     expansion = join_increase or aggregate_expansion
     if fusion and expansion and cross:
@@ -151,9 +162,37 @@ def _classify_risk(
     return "LOW"
 
 
-def _risk_evidence(
-    risk: str, fusion: bool, expansion: bool, cross: bool
-) -> str:
+def should_block_fusion(report: Any) -> bool:
+    """True when *report* is a fusion that must be blocked unless proven safe.
+
+    Blocking condition (all schema-agnostic, no hardcoded tables): the report
+    carries ``DEPENDENT_QUERY_FUSION`` **and** (``JOIN_COMPLEXITY_INCREASE``
+    **or** ``AGGREGATE_QUERY_EXPANSION``).  Every ``HIGH`` report satisfies
+    this by construction, so ``HIGH`` always blocks; a ``MEDIUM`` fusion that
+    grew the plan shape blocks as well.  Returns ``False`` for ``None``,
+    malformed reports, or anything without the fusion + expansion combination.
+
+    The module itself never rejects anything — this is a pure predicate for
+    write-time gates (optimizer ``_risk_block``) and verification to enforce.
+    """
+    try:
+        if report is None:
+            return False
+        risk = getattr(report, "risk", None)
+        flags = set(getattr(report, "flags", None) or [])
+        if risk == "HIGH":
+            return True
+        return bool(
+            DEPENDENT_QUERY_FUSION in flags
+            and (
+                JOIN_COMPLEXITY_INCREASE in flags or AGGREGATE_QUERY_EXPANSION in flags
+            )
+        )
+    except Exception:
+        return False
+
+
+def _risk_evidence(risk: str, fusion: bool, expansion: bool, cross: bool) -> str:
     reasons: List[str] = []
     if fusion:
         reasons.append("dependent fusion")
@@ -196,9 +235,7 @@ def compare_function_models(
             evidence.append(
                 f"S{producer + 1} -> S{consumer + 1} linear value dependency was fused"
             )
-        evidence.append(
-            f"statement count {statements_before} -> {statements_after}"
-        )
+        evidence.append(f"statement count {statements_before} -> {statements_after}")
 
     if join_increase:
         flags.append(JOIN_COMPLEXITY_INCREASE)

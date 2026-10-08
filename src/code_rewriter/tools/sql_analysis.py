@@ -26,8 +26,19 @@ _EXECUTE_METHODS = {"execute", "executemany"}
 _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 _IMPLICIT_JOIN_MIN_RELATIONS = 3
 _FROM_CLAUSE_END_KEYWORDS = (
-    "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "EXCEPT", "INTERSECT",
-    "WINDOW", "QUALIFY", "RETURNING", "FETCH", "FOR",
+    "WHERE",
+    "GROUP",
+    "ORDER",
+    "HAVING",
+    "LIMIT",
+    "UNION",
+    "EXCEPT",
+    "INTERSECT",
+    "WINDOW",
+    "QUALIFY",
+    "RETURNING",
+    "FETCH",
+    "FOR",
 )
 _PLACEHOLDER_NAMED_RE = re.compile(r"%\(([A-Za-z_]\w*)\)s")
 _PLACEHOLDER_POSITIONAL_RE = re.compile(r"%s|\$\d+|(?<!:):[A-Za-z_]\w*|\?")
@@ -49,7 +60,7 @@ _COMPOSITE_ANY_ARRAY_RE = re.compile(
     re.IGNORECASE,
 )
 _ANY_IN_FILTER_RE = re.compile(
-    r'([A-Za-z_\"`][\w.\"`]*)\s*(?:=\s*ANY\s*\(\s*%s\s*\)|IN\s*\(\s*%s\s*\))',
+    r"([A-Za-z_\"`][\w.\"`]*)\s*(?:=\s*ANY\s*\(\s*%s\s*\)|IN\s*\(\s*%s\s*\))",
     re.IGNORECASE,
 )
 
@@ -101,7 +112,9 @@ def _scan_keyword(sql: str, keyword: str, start: int, depth_target: int) -> int:
         if depth == depth_target and sql[i : i + len(kw)].upper() == kw:
             before = sql[i - 1] if i > 0 else " "
             after = sql[i + len(kw)] if i + len(kw) < n else " "
-            if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+            if not (before.isalnum() or before == "_") and not (
+                after.isalnum() or after == "_"
+            ):
                 return i
         i += 1
     return -1
@@ -174,7 +187,9 @@ def _split_top_level_and(clause: str) -> List[str]:
         elif depth == 0 and clause[i : i + 3].upper() == "AND":
             before = clause[i - 1] if i > 0 else " "
             after = clause[i + 3] if i + 3 < n else " "
-            if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+            if not (before.isalnum() or before == "_") and not (
+                after.isalnum() or after == "_"
+            ):
                 items.append("".join(current))
                 current = []
                 i += 3
@@ -277,7 +292,9 @@ def find_select_column_count(sql: str) -> Optional[int]:
     if not items:
         return None
     for item in items:
-        normalized = re.sub(r"^(DISTINCT|ALL)\s+", "", item, flags=re.IGNORECASE).strip()
+        normalized = re.sub(
+            r"^(DISTINCT|ALL)\s+", "", item, flags=re.IGNORECASE
+        ).strip()
         if normalized == "*" or _QUALIFIED_STAR_RE.match(normalized):
             return None
     return len(items)
@@ -306,7 +323,9 @@ def find_select_columns(sql: str) -> Optional[List[str]]:
         return None
     columns: List[str] = []
     for item in items:
-        normalized = re.sub(r"^(DISTINCT|ALL)\s+", "", item, flags=re.IGNORECASE).strip()
+        normalized = re.sub(
+            r"^(DISTINCT|ALL)\s+", "", item, flags=re.IGNORECASE
+        ).strip()
         if normalized == "*" or _QUALIFIED_STAR_RE.match(normalized):
             return None
         normalized = _SELECT_AS_ALIAS_RE.sub("", normalized).strip()
@@ -440,7 +459,11 @@ class _FunctionAnalyzer:
 
     def _process_for(self, stmt: ast.AST) -> None:
         sql = self._iter_sql(stmt.iter)
-        if sql is None and isinstance(stmt.iter, ast.Name) and stmt.iter.id in self.row_bindings:
+        if (
+            sql is None
+            and isinstance(stmt.iter, ast.Name)
+            and stmt.iter.id in self.row_bindings
+        ):
             sql = self.row_bindings[stmt.iter.id]
         saved = dict(self.row_bindings)
         if isinstance(sql, str):
@@ -466,7 +489,9 @@ class _FunctionAnalyzer:
             return
         if isinstance(node, _FUNCTION_NODES):
             return
-        if isinstance(node, (ast.DictComp, ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        if isinstance(
+            node, (ast.DictComp, ast.ListComp, ast.SetComp, ast.GeneratorExp)
+        ):
             self._process_comprehension(node)
             return
         if isinstance(node, ast.Assign):
@@ -634,7 +659,9 @@ def implicit_join_sql(source: str) -> List[dict]:
             if semicolon >= 0 and semicolon < end:
                 end = semicolon
             from_clause = sql[from_pos + 4 : end]
-            relations = len([item for item in _split_top_level(from_clause) if item.strip()])
+            relations = len(
+                [item for item in _split_top_level(from_clause) if item.strip()]
+            )
             if relations < _IMPLICIT_JOIN_MIN_RELATIONS:
                 continue
             key = (name, sql)
@@ -848,6 +875,226 @@ def lookup_key_not_selected_sql(source: str) -> List[dict]:
     return violations
 
 
+_LATERAL_RE = re.compile(
+    r"\bLATERAL\b|\bCROSS\s+APPLY\b|\bOUTER\s+APPLY\b", re.IGNORECASE
+)
+_SUBQUERY_RE = re.compile(r"\(\s*SELECT\b", re.IGNORECASE)
+_DML_WRITE_RE = re.compile(
+    r"\bINTO\s+([A-Za-z_][\w$]*)\b|\bUPDATE\s+([A-Za-z_][\w$]*)\b|\bDELETE\s+FROM\s+([A-Za-z_][\w$]*)\b",
+    re.IGNORECASE,
+)
+
+
+def has_lateral_sql(sql: str) -> bool:
+    """True when *sql* uses LATERAL / APPLY (schema-agnostic)."""
+    return bool(isinstance(sql, str) and sql and _LATERAL_RE.search(sql))
+
+
+def has_subquery_sql(sql: str) -> bool:
+    """True when *sql* contains a parenthesized SELECT subquery."""
+    return bool(isinstance(sql, str) and sql and _SUBQUERY_RE.search(sql))
+
+
+def written_tables_in_source(source: str) -> set:
+    """Best-effort set of tables written by DML in *source* (lowercased)."""
+    found: set = set()
+    if not isinstance(source, str) or not source:
+        return found
+    for match in _DML_WRITE_RE.finditer(source):
+        for group in match.groups():
+            if group:
+                found.add(group.lower())
+    return found
+
+
+def _fallback_max_relations(sql: str) -> int:
+    """Regex fallback for top-level relation counting (no sqlglot needed)."""
+    try:
+        from_pos = _scan_keyword(sql, "FROM", 0, 0)
+        if from_pos < 0:
+            return 0
+        end = len(sql)
+        for keyword in _FROM_CLAUSE_END_KEYWORDS:
+            pos = _scan_keyword(sql, keyword, from_pos + 4, 0)
+            if pos >= 0 and pos < end:
+                end = pos
+        semicolon = _scan_top_level_semicolon(sql, from_pos + 4)
+        if semicolon >= 0 and semicolon < end:
+            end = semicolon
+        from_clause = sql[from_pos + 4 : end]
+        items = [item for item in _split_top_level(from_clause) if item.strip()]
+        joins = len(re.findall(r"\bJOIN\b", from_clause, flags=re.IGNORECASE))
+        return max(len(items), (1 if items else 0) + joins)
+    except Exception:
+        return 0
+
+
+def estimate_top_level_relations(sql: str) -> int:
+    """Best-effort top-level relation count for one SQL string."""
+    if not isinstance(sql, str) or not sql.strip():
+        return 0
+    try:
+        from .db_interaction import analyze_sql as _analyze_sql
+
+        model = _analyze_sql(sql)
+        if model is not None:
+            return int(model.top_level_relations or 0)
+    except Exception:
+        pass
+    return _fallback_max_relations(sql)
+
+
+def function_plan_stats(source: str) -> Dict[str, dict]:
+    """Per-function plan shape: executes, max relations, lateral/subquery flags."""
+    stats: Dict[str, dict] = {}
+    if not isinstance(source, str) or not source:
+        return stats
+    try:
+        for name, analyzer in _iter_analyzed(source):
+            sqls = [
+                sql
+                for sql, _line in getattr(analyzer, "execute_sqls", [])
+                if isinstance(sql, str) and SENTINEL not in sql
+            ]
+            max_relations = 0
+            lateral = False
+            subquery = False
+            for sql in sqls:
+                relations = estimate_top_level_relations(sql)
+                if relations > max_relations:
+                    max_relations = relations
+                if not lateral and has_lateral_sql(sql):
+                    lateral = True
+                if not subquery and has_subquery_sql(sql):
+                    subquery = True
+            entry = stats.setdefault(
+                name,
+                {
+                    "executes": 0,
+                    "max_relations": 0,
+                    "has_lateral": False,
+                    "has_subquery": False,
+                    "sqls": [],
+                },
+            )
+            entry["executes"] = len(sqls)
+            entry["max_relations"] = max_relations
+            entry["has_lateral"] = lateral
+            entry["has_subquery"] = subquery
+            entry["sqls"] = list(sqls)
+    except Exception:
+        return stats
+    return stats
+
+
+def _tables_read_in_sqls(sqls: List[str]) -> set:
+    """Lowercased tables read by *sqls* (best effort, schema-agnostic)."""
+    tables: set = set()
+    for sql in sqls:
+        if not isinstance(sql, str):
+            continue
+        try:
+            from .db_interaction import analyze_sql as _analyze_sql
+
+            model = _analyze_sql(sql)
+            if model is not None:
+                for table in list(model.tables_read or []):
+                    if table:
+                        tables.add(str(table).lower())
+                continue
+        except Exception:
+            pass
+    return tables
+
+
+def fusion_regression_violations(
+    original_source: str,
+    optimized_source: str,
+    written_tables: Optional[set] = None,
+) -> List[dict]:
+    """Static plan-shape guard for dependent-query fusions (no live DB needed).
+
+    Flags a function when the candidate plan shape regresses vs the original:
+
+    * ``relations_grew`` — max top-level relations strictly increased, or
+    * ``lateral_without_saving`` — a LATERAL/APPLY or correlated ``(SELECT``
+      subquery was newly introduced while the execute() round-trip count did
+      not strictly decrease.  When *written_tables* (lowercased table names)
+      is a non-empty set, the lateral/subquery arm additionally requires the
+      candidate to read one of those cross-function-written tables; when
+      ``None`` (unknown) the arm fires conservatively without table filtering.
+
+    A preserved split (same count, same shape, no new LATERAL/subquery —
+    e.g. two sequential PK lookups kept as two statements) passes cleanly.
+    All matching is schema-agnostic: no hardcoded table, column or function
+    names.
+    """
+    violations: List[dict] = []
+    try:
+        orig_stats = function_plan_stats(original_source)
+        opt_stats = function_plan_stats(optimized_source)
+    except Exception:
+        return violations
+    if not orig_stats or not opt_stats:
+        return violations
+
+    filter_tables: Optional[set] = None
+    if written_tables is not None:
+        try:
+            filter_tables = {str(t).lower() for t in written_tables if t}
+        except Exception:
+            filter_tables = None
+
+    for func, opt in opt_stats.items():
+        orig = orig_stats.get(func)
+        if orig is None:
+            bare = func.split(".")[-1]
+            for key, value in orig_stats.items():
+                if key.split(".")[-1] == bare:
+                    orig = value
+                    break
+        if orig is None:
+            continue
+        executes_before = int(orig.get("executes", 0) or 0)
+        executes_after = int(opt.get("executes", 0) or 0)
+        relations_before = int(orig.get("max_relations", 0) or 0)
+        relations_after = int(opt.get("max_relations", 0) or 0)
+
+        if relations_after > relations_before:
+            violations.append(
+                {
+                    "function": func,
+                    "reason": "relations_grew",
+                    "max_relations_before": relations_before,
+                    "max_relations_after": relations_after,
+                    "executes_before": executes_before,
+                    "executes_after": executes_after,
+                }
+            )
+            continue
+
+        lateral_new = bool(opt.get("has_lateral") and not orig.get("has_lateral"))
+        subquery_new = bool(opt.get("has_subquery") and not orig.get("has_subquery"))
+        if (lateral_new or subquery_new) and executes_after >= executes_before:
+            if filter_tables:
+                read_tables = _tables_read_in_sqls(opt.get("sqls") or [])
+                if not (read_tables & filter_tables):
+                    continue
+            violations.append(
+                {
+                    "function": func,
+                    "reason": "lateral_without_saving"
+                    if lateral_new
+                    else "subquery_without_saving",
+                    "max_relations_before": relations_before,
+                    "max_relations_after": relations_after,
+                    "executes_before": executes_before,
+                    "executes_after": executes_after,
+                }
+            )
+    return violations
+
+
 def duplicate_column_predicate_sql(source: str) -> List[dict]:
     """Resolved SQL constraining one column by both equality and a set predicate."""
     violations: List[dict] = []
@@ -868,14 +1115,20 @@ def duplicate_column_predicate_sql(source: str) -> List[dict]:
                     continue
                 col = _normalize_column(match.group(1))
                 op = match.group(2).upper().replace(" ", "")
-                if op.startswith("IN") or op.startswith("=ANY") or op.startswith("=ALL"):
+                if (
+                    op.startswith("IN")
+                    or op.startswith("=ANY")
+                    or op.startswith("=ALL")
+                ):
                     kind = "set"
                 elif op == "=":
                     kind = "eq"
                 else:
                     continue
                 kinds.setdefault(col, set()).add(kind)
-            duplicates = sorted(col for col, k in kinds.items() if "eq" in k and "set" in k)
+            duplicates = sorted(
+                col for col, k in kinds.items() if "eq" in k and "set" in k
+            )
             if not duplicates:
                 continue
             key = (name, sql, line)
