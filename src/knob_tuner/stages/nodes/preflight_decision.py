@@ -130,6 +130,144 @@ def _dominance_note(
     )
 
 
+def _row_plan_knob_count(row: dict[str, Any]) -> int | None:
+    """Count knobs in a screen row's plan (generic, never throws)."""
+    try:
+        sources = [row.get("plan")]
+        result = row.get("result")
+        if isinstance(result, dict):
+            sources.append(result.get("plan"))
+        for source in sources:
+            if source is None:
+                continue
+            knobs = (
+                source.get("knobs")
+                if isinstance(source, dict)
+                else getattr(source, "knobs", None)
+            )
+            if isinstance(knobs, list):
+                return len(knobs)
+    except Exception:
+        pass
+    return None
+
+
+def _row_plan_hash_of(row: dict[str, Any]) -> str:
+    """Resolve a screen row's plan hash (stored, else derived, else "")."""
+    try:
+        stored = row.get("plan_hash")
+        if stored:
+            return str(stored)
+        dump = _plan_dump(_row_plan_name(row))
+        if dump:
+            return str(KnobPlan.model_validate(dump).plan_hash())
+    except Exception:
+        pass
+    return ""
+
+
+def _winners_table(
+    rows: list[dict[str, Any]],
+    gate_pct: float,
+    experiment_history: list[Any],
+) -> list[dict[str, Any]]:
+    """Rank every PASS arm best-first (audit only, never routes).
+
+    Every ``PASS`` row is listed with its ``certified`` flag (confirmed
+    PASS with ``lcb_pct`` above the win gate); uncertified rows are
+    reported but never satisfy quota and never apply. Sorted by the same
+    ``(mean, lcb)`` key the single-apply selection uses, so ``winners[0]``
+    is the applied winner whenever the top arm clears the gate. Each row
+    carries its gate proof; missing evidence degrades to
+    ``None``/``""``/``0`` instead of throwing. Generic: no knob names.
+    """
+    try:
+        gate = float(gate_pct)
+    except (TypeError, ValueError):
+        gate = 0.0
+    shortlisted: list[dict[str, Any]] = []
+    try:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("status", "")).upper() != "PASS":
+                continue
+            shortlisted.append(row)
+    except Exception:
+        return []
+    try:
+        shortlisted.sort(
+            key=lambda row: (
+                _row_float(row, "mean_delta_pct"),
+                _row_float(row, "lcb_pct"),
+            ),
+            reverse=True,
+        )
+    except Exception:
+        pass
+    # Join surface for gate proof missing from screen rows: experiment
+    # history carries per-arm ``p_win``/``n_knobs`` keyed by plan hash/arm.
+    hist_by_hash: dict[str, dict[str, Any]] = {}
+    hist_by_arm: dict[str, dict[str, Any]] = {}
+    try:
+        for entry in experiment_history or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("plan_hash"):
+                hist_by_hash.setdefault(str(entry["plan_hash"]), entry)
+            for key in ("arm", "name", "exp_name"):
+                if entry.get(key):
+                    hist_by_arm.setdefault(str(entry[key]), entry)
+                    break
+    except Exception:
+        pass
+    winners: list[dict[str, Any]] = []
+    for rank, row in enumerate(shortlisted, start=1):
+        try:
+            plan_hash = _row_plan_hash_of(row)
+            hist = hist_by_hash.get(plan_hash) if plan_hash else None
+            if hist is None:
+                hist = hist_by_arm.get(_row_arm_name(row))
+            p_win: float | None = None
+            for source in (row, hist or {}):
+                try:
+                    raw = source.get("p_win")
+                except AttributeError:
+                    continue
+                if raw is None:
+                    continue
+                try:
+                    p_win = min(1.0, max(0.0, float(raw)))
+                    break
+                except (TypeError, ValueError):
+                    continue
+            n_knobs = _row_plan_knob_count(row)
+            if n_knobs is None and isinstance(hist, dict):
+                try:
+                    n_knobs = int(hist.get("n_knobs", 0) or 0)
+                except (TypeError, ValueError):
+                    n_knobs = 0
+            if n_knobs is None:
+                n_knobs = 0
+            winners.append(
+                {
+                    "rank": rank,
+                    "name": _row_arm_name(row),
+                    "plan_hash": plan_hash,
+                    "mean": _row_float(row, "mean_delta_pct"),
+                    "lcb": _row_float(row, "lcb_pct"),
+                    "ucb": _row_float(row, "ucb_pct"),
+                    "p_win": p_win,
+                    "n_knobs": n_knobs,
+                    "certified": bool(row.get("confirmed", False))
+                    and _row_float(row, "lcb_pct") > gate,
+                }
+            )
+        except Exception:
+            continue
+    return winners
+
+
 def _plan_dump(plan: Any) -> dict[str, Any]:
     if plan is None:
         return {}
@@ -300,6 +438,14 @@ def decision(
         measurement_problem = bool(
             cands and any(_cand_paired(c) is None for c in cands)
         )
+        # Multi-winner audit: every PASS arm ranked best-first with gate
+        # proof and its certified flag. Recorded on ALL paths (including
+        # withheld inconclusive/fail outcomes) — informational only, never
+        # alters selection/routing.
+        try:
+            winners_table = _winners_table(rows, min_improvement_pct, experiment_history)
+        except Exception:
+            winners_table = []
         archive_payload = {
             "dataset": _jsonable(dataset),
             "durability_profile": durability_profile,
@@ -314,6 +460,7 @@ def decision(
                 for r in rows
             ],
             "winner": winner_hash,
+            "winners": winners_table,
             "measurement_problem": measurement_problem,
             "winner_improvement_confident": bool(
                 winner_row and winner_row.get("improvement_confident")

@@ -30,6 +30,9 @@ def _paired(baseline=BASE, tuned=WIN):
 def _gate_state(last_row, **over):
     seed = {
         "max_attempts": 6,
+        # High winner quota by default so pre-quota incumbent tests never
+        # trip quota_met; quota tests override max_winners explicitly.
+        "max_winners": 10,
         "validation_attempt_count": 1,
         "min_improvement_pct": 2.0,
         # Winner-stop tests predate the compounding quota; set the target to 1
@@ -41,6 +44,11 @@ def _gate_state(last_row, **over):
     }
     seed.update(over)
     return AdkCtx(**seed)
+
+
+def _winner_entry(plan_hash, mean=12.0, lcb=11.0):
+    return {"plan_hash": plan_hash, "mean": mean, "lcb": lcb,
+            "knobs": [], "family": ""}
 
 
 def _stop_diag(stop_reason, confidence):
@@ -129,19 +137,25 @@ def _modest_win_row():
                               tuned=[101.0, 103.0, 100.0, 102.0, 101.0])}
 
 
-def test_gate_agree_winner_stops():
-    cleared = {"name": "e0", "phase": "screen", "n_knobs": 1,
-               "mean_delta_pct": 12.0, "lcb_pct": 11.0, "status": "PASS",
-               "confirmed": True}
-    ctx = _gate_state(_win_row(), experiment_history=[cleared])
+def test_gate_agree_winner_registers_and_continues():
+    # A diagnosis-stop winner agreement no longer halts: the arm registers
+    # (certified, lcb clears the gate) and screening continues until the
+    # unified quota stops the loop via the backstop (or the attempt cap).
+    ctx = _gate_state(dict(_win_row(), plan_hash="hash-aaa"))
     out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.9))
-    assert out["route"] == "done" and ctx.route == "done"
-    assert out["reason"] == "stopped_by_diagnosis"
+    assert out["route"] == "retry" and ctx.route == "retry"
+    assert out["reason"].endswith("continue screening")
     assert out["gate"] == "stop_agree_winner"
     assert out["diag_confidence"] == 0.9
     assert out["stat_p_win"] is not None and out["stat_p_win"] >= 0.7
     assert out["thresholds"] == {"stop_diag_min": 0.6, "stop_stat_win_min": 0.7,
                                 "futility_stat_max": 0.4}
+    winners = ctx.state.get("winners")
+    assert isinstance(winners, list) and len(winners) == 1
+    assert winners[0]["plan_hash"] == "hash-aaa"
+    assert winners[0]["certified"] is True
+    assert out["winners"] == winners
+    assert out["incumbent"] == {"plan_hash": "hash-aaa", "mean": 12.0, "lcb": 11.0}
 
 
 def test_gate_agree_futility_stops():
@@ -190,6 +204,61 @@ def test_gate_futility_claim_with_high_p_win_continues():
     assert out["reason"] == "diag_stat_disagree"
 
 
+def test_disagree_neutralizes_stale_stop_for_next_round():
+    # Deadlock repro: a futility stop the stats gate overrules must not halt
+    # the next proposal. The controller downgrades the stale stop to a
+    # satisfiable retry_same (recorded in the output, which the workflow
+    # persists to last_controller/controller_history), so compile measures
+    # the next proposal instead of rejecting it for the overruled order.
+    row = {"arm": "e-toss", "phase": "screen", "status": "PASS",
+           "mean_delta_pct": 1.0, "lcb_pct": -0.2, "ucb_pct": 2.2,
+           "confirmed": True, "reasons": [],
+           "paired": _paired(baseline=[100.0, 102.0, 99.0, 101.0, 100.0],
+                             tuned=[101.0, 103.0, 100.0, 102.0, 101.0])}
+    ctx = _gate_state(
+        row,
+        knobs_info=[
+            {"name": "work_mem", "current_value": "4MB", "unit": "kB",
+             "vartype": "integer", "context": "user", "enumvals": []},
+        ],
+        resource_budget={"cpu_cores": 4, "memory_gb": 8.0},
+        durability_profile="strict",
+        max_set_knobs=20,
+    )
+    out = nodes.confirmation_controller(ctx, _stop_diag("futility", 0.9))
+    assert out["route"] == "retry"
+    assert out["reason"] == "diag_stat_disagree"
+    assert out.get("stop_overruled") is True
+    assert out.get("downgraded_correction") == "retry_same"
+    hist = ctx.state.get("diagnosis_history")
+    assert hist and hist[-1]["correction"] == "retry_same"
+    nxt = nodes.compile_candidate(
+        ctx, {"name": "e-next", "phase": "screen",
+              "levels": [{"knob": "work_mem", "value": "64MB"}]}
+    )
+    assert isinstance(nxt, CompiledPlan)
+
+
+def test_agreed_stop_is_not_neutralized():
+    # An agreed futility stop ends the loop — the order stands and compile
+    # still halts for it.
+    ctx = _gate_state(
+        _loss_row(),
+        knobs_info=[
+            {"name": "work_mem", "current_value": "4MB", "unit": "kB",
+             "vartype": "integer", "context": "user", "enumvals": []},
+        ],
+        resource_budget={"cpu_cores": 4, "memory_gb": 8.0},
+        durability_profile="strict",
+        max_set_knobs=20,
+    )
+    out = nodes.confirmation_controller(ctx, _stop_diag("futility", 0.8))
+    assert out["route"] == "done"
+    assert out.get("stop_overruled") is not True
+    hist = ctx.state.get("diagnosis_history")
+    assert hist and hist[-1]["correction"] == "stop"
+
+
 def test_gate_thresholds_overridable_via_state():
     # A cleared history row so the winner quota (target=1) is met; the test
     # isolates the stop_diag_min override, not quota behavior.
@@ -199,10 +268,15 @@ def test_gate_thresholds_overridable_via_state():
     ctx = _gate_state(_modest_win_row(), stop_diag_min=0.99, experiment_history=[cleared])
     out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.9))
     assert out["route"] == "retry"  # 0.9 < overridden 0.99
-    ctx = _gate_state(_modest_win_row(), stop_diag_min=0.5, experiment_history=[cleared])
+    ctx = _gate_state(dict(_modest_win_row(), plan_hash="hash-modest"),
+                       stop_diag_min=0.5)
     out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.6))
-    assert out["route"] == "done"  # 0.6 >= overridden 0.5
-    ctx = _gate_state(_modest_win_row(), stop_stat_win_min=0.99999, experiment_history=[cleared])
+    # 0.6 >= overridden 0.5 agrees, but agreement registers-and-continues.
+    assert out["route"] == "retry"
+    assert out["reason"].endswith("continue screening")
+    winners = ctx.state.get("winners")
+    assert len(winners) == 1 and winners[0]["certified"] is False
+    ctx = _gate_state(_modest_win_row(), stop_stat_win_min=0.99999)
     out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.95))
     assert out["route"] == "retry"
     assert out["thresholds"]["stop_stat_win_min"] == 0.99999
@@ -231,8 +305,13 @@ def test_gate_uses_best_confirmed_row():
     ctx = _gate_state(_loss_row(), all_rows=[weak, strong],
                       experiment_history=[cleared])
     out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.9))
-    assert out["route"] == "done"
+    # Agreement is still read off the best confirmed row, but agreement now
+    # registers-and-continues instead of stopping. The latest row here is a
+    # loss (not a confirmed PASS), so nothing registers.
+    assert out["route"] == "retry"
+    assert out["gate"] == "stop_agree_winner"
     assert out["stat_p_win"] is not None and out["stat_p_win"] > 0.9
+    assert ctx.state.get("winners", []) == []
 
 
 def test_gate_observability_fields_present_on_stop():
@@ -371,7 +450,13 @@ def test_diagnosis_prompt_keeps_strategy_only_prohibitions():
     assert "NEVER persist" in text
 
 
-# --- compounding quota (success candidates) ---
+# --- unified winner quota (registry feeds the quota) ---
+#
+# Single check: the canonical target (success_candidates/max_winners alias
+# the same quota) against LCB-clearing history arms plus certified registry
+# entries. Quota tests below set max_winners explicitly (the _gate_state
+# default pairs it with success_candidates=1; the effective target is the
+# max of the keys present).
 
 
 def _cleared(name="c", lcb=11.0):
@@ -382,30 +467,40 @@ def _cleared(name="c", lcb=11.0):
 
 def test_quota_unmet_downgrades_winner_stop_to_collecting():
     # Two cleared rows remain short of a target of 3: the winner stop must not
-    # end the campaign; the route becomes a quota-collecting retry.
+    # end the campaign; the arm registers and the route becomes a
+    # quota-collecting retry.
     ctx = _gate_state(
         _win_row(),
         success_candidates=3,
+        max_winners=3,
         experiment_history=[_cleared("c1"), _cleared("c2")],
     )
     out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.9))
     assert out["route"] == "retry"
-    assert out["reason"] == "quota_not_met"
-    assert out["gate"] == "quota_not_met"
+    assert out["reason"].startswith("quota_not_met")
+    assert out["reason"].endswith("continue screening")
+    # The agreement stands (gate), but the stop cannot end the campaign
+    # while the quota is unmet (reason).
+    assert out["gate"] == "stop_agree_winner"
     assert out["success_candidates"] == {
         "found": 2, "target": 3, "min_improvement_pct": 2.0
     }
 
 
-def test_quota_met_allows_winner_stop():
+def test_quota_met_agreed_winner_continues_screening():
+    # Intentional change (multi-winner search): an agreed winner stop never
+    # halts, even with the quota met — the arm registers and screening
+    # continues; the quota ends the campaign via the backstop.
     ctx = _gate_state(
         _win_row(),
         success_candidates=2,
+        max_winners=2,
         experiment_history=[_cleared("c1"), _cleared("c2")],
     )
     out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.9))
-    assert out["route"] == "done"
-    assert out["reason"] == "stopped_by_diagnosis"
+    assert out["route"] == "retry"
+    assert out["reason"].endswith("continue screening")
+    assert out["gate"] == "stop_agree_winner"
     assert out["success_candidates"]["found"] == 2
 
 
@@ -419,6 +514,145 @@ def test_quota_unmet_but_futility_still_stops():
     assert out["route"] == "done"
     assert out["reason"] == "stopped_by_diagnosis"
     assert out["gate"] == "stop_agree_futility"
+# --- multi-winner quota (registry feeds the unified quota) ---
+
+
+def test_winner_registers_on_gate_clearing_verdict():
+    row = dict(_win_row(), plan_hash="hash-aaa")
+    ctx = _gate_state(row, max_winners=3)
+    out = nodes.confirmation_controller(ctx, _next_diag())
+    assert out["route"] == "retry"
+    winners = ctx.state.get("winners")
+    assert isinstance(winners, list) and len(winners) == 1
+    entry = winners[0]
+    assert set(entry.keys()) == {"plan_hash", "mean", "lcb", "knobs", "family",
+                                 "certified"}
+    assert entry["plan_hash"] == "hash-aaa"
+    assert entry["mean"] == 12.0 and entry["lcb"] == 11.0
+    assert entry["knobs"] == [] and entry["family"] == ""
+    assert entry["certified"] is True
+    assert out["winners"] == winners
+
+
+def test_quota_met_stops():
+    row = dict(_win_row(), arm="e-third", plan_hash="hash-ccc")
+    ctx = _gate_state(
+        row, max_winners=3,
+        winners=[_winner_entry("hash-aaa"), _winner_entry("hash-bbb")],
+    )
+    out = nodes.confirmation_controller(ctx, _next_diag())
+    assert out["route"] == "done"
+    assert out["reason"] == "confident_win_backstop"
+    winners = ctx.state.get("winners")
+    assert [w["plan_hash"] for w in winners] == ["hash-aaa", "hash-bbb", "hash-ccc"]
+
+
+def test_duplicate_plan_hash_not_double_counted():
+    row = dict(_win_row(), plan_hash="hash-aaa")
+    ctx = _gate_state(
+        row, max_winners=3, winners=[_winner_entry("hash-aaa")],
+    )
+    out = nodes.confirmation_controller(ctx, _next_diag())
+    winners = ctx.state.get("winners")
+    assert len(winners) == 1
+    assert winners[0]["plan_hash"] == "hash-aaa"
+    assert out["route"] == "retry"
+    assert out["reason"].startswith("collecting_success_candidates")
+
+
+def test_quota_one_first_certified_wins():
+    row = dict(_win_row(), plan_hash="hash-aaa")
+    ctx = _gate_state(row, max_winners=1)
+    out = nodes.confirmation_controller(ctx, _next_diag())
+    assert out["route"] == "done"
+    assert out["reason"] == "confident_win_backstop"
+    winners = ctx.state.get("winners")
+    assert len(winners) == 1 and winners[0]["plan_hash"] == "hash-aaa"
+
+
+# --- uncertified registration + certified-only quota (fix verification) ---
+
+
+def _uncertified_win_row():
+    # Live-repro shape: clear mean win (+8.9%) but LCB (+3.5%) below the 5%
+    # gate, with decisive paired samples backing a winner agreement.
+    return {"arm": "e-unc", "phase": "screen", "status": "PASS",
+            "mean_delta_pct": 8.9, "lcb_pct": 3.5, "ucb_pct": 12.0,
+            "confirmed": True, "reasons": [], "paired": _paired(),
+            "plan_hash": "hash-unc"}
+
+
+def _certified_entry(plan_hash, mean=12.0, lcb=11.0):
+    return {"plan_hash": plan_hash, "mean": mean, "lcb": lcb,
+            "knobs": [], "family": "", "certified": True}
+
+
+def _uncertified_entry(plan_hash, mean=8.9, lcb=3.5):
+    return {"plan_hash": plan_hash, "mean": mean, "lcb": lcb,
+            "knobs": [], "family": "", "certified": False}
+
+
+def test_agreed_but_uncertified_winner_registers_without_quota():
+    ctx = _gate_state(_uncertified_win_row(), min_improvement_pct=5.0,
+                      max_winners=1)
+    out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.9))
+    assert out["gate"] == "stop_agree_winner"
+    winners = ctx.state.get("winners")
+    assert isinstance(winners, list) and len(winners) == 1
+    assert winners[0]["plan_hash"] == "hash-unc"
+    assert winners[0]["certified"] is False
+    # One registered winner, but zero certified: even quota=1 is unmet, so
+    # screening continues instead of stopping.
+    assert out["route"] == "retry"
+    assert out["reason"].endswith("continue screening")
+    assert out["winners"] == winners
+
+
+def test_agreed_certified_winner_registers_certified():
+    row = dict(_win_row(), plan_hash="hash-aaa")
+    ctx = _gate_state(row, min_improvement_pct=5.0, max_winners=3)
+    out = nodes.confirmation_controller(ctx, _stop_diag("winner", 0.9))
+    assert out["route"] == "retry"
+    winners = ctx.state.get("winners")
+    assert len(winners) == 1
+    assert winners[0]["plan_hash"] == "hash-aaa"
+    assert winners[0]["certified"] is True
+
+
+def test_quota_met_at_three_certified_ignoring_uncertified():
+    row = dict(_win_row(), arm="e-third", plan_hash="hash-ccc")
+    ctx = _gate_state(
+        row, min_improvement_pct=5.0, max_winners=3,
+        winners=[_certified_entry("hash-aaa"), _certified_entry("hash-bbb"),
+                 _uncertified_entry("hash-xxx")],
+    )
+    out = nodes.confirmation_controller(ctx, _next_diag())
+    # Three certified banked = quota met (the uncertified entry coexists but
+    # never counts toward the quota).
+    assert out["route"] == "done"
+    assert out["reason"] == "confident_win_backstop"
+    winners = ctx.state.get("winners")
+    assert [w["plan_hash"] for w in winners] == ["hash-aaa", "hash-bbb",
+                                                "hash-xxx", "hash-ccc"]
+    assert winners[-1]["certified"] is True
+    # ... while an uncertified verdict alone never trips quota.
+    ctx2 = _gate_state(
+        _uncertified_win_row(), min_improvement_pct=5.0, max_winners=3,
+        winners=[_certified_entry("hash-aaa"), _certified_entry("hash-bbb")],
+    )
+    out2 = nodes.confirmation_controller(ctx2, _next_diag())
+    assert out2["route"] == "retry"
+    assert [w["plan_hash"] for w in ctx2.state.get("winners")] == [
+        "hash-aaa", "hash-bbb", "hash-unc"]
+
+
+def test_futility_stop_still_stops_without_registering():
+    ctx = _gate_state(_loss_row(), min_improvement_pct=5.0, max_winners=3)
+    out = nodes.confirmation_controller(ctx, _stop_diag("futility", 0.8))
+    assert out["route"] == "done"
+    assert out["reason"] == "stopped_by_diagnosis"
+    assert out["gate"] == "stop_agree_futility"
+    assert ctx.state.get("winners", []) == []
 
 
 def test_quota_unmet_still_honors_attempt_cap():
@@ -437,10 +671,11 @@ def test_quota_unmet_still_honors_attempt_cap():
 
 def test_quota_met_backstop_applies_without_stop_diagnosis():
     # No stop diagnosis: a latest confident win ends the campaign once the
-    # quota target is met.
+    # quota target is met (both quota keys alias the same target).
     ctx = _gate_state(
         _win_row(),
         success_candidates=1,
+        max_winners=1,
         experiment_history=[_cleared("c1")],
     )
     out = nodes.confirmation_controller(
@@ -481,3 +716,18 @@ def test_get_success_candidates_defaults_and_floor():
     assert get_success_candidates({"success_candidates": 3}) == 3
     assert get_success_candidates({"success_candidates": "7"}) == 7
     assert get_success_candidates({"success_candidates": -5}) == 1
+
+
+def test_quota_keys_alias_the_same_target():
+    # Unified quota: max_winners maps onto success_candidates (single check).
+    from src.knob_tuner.contracts import (
+        DEFAULT_SUCCESS_CANDIDATES,
+        get_max_winners,
+        get_success_candidates,
+    )
+
+    assert get_max_winners({}) == DEFAULT_SUCCESS_CANDIDATES
+    assert get_max_winners({"max_winners": 3}) == 3
+    assert get_success_candidates({"max_winners": 3}) == 3
+    assert get_max_winners({"max_winners": 3, "success_candidates": 1}) == 3
+    assert get_success_candidates({"max_winners": 10, "success_candidates": 1}) == 10

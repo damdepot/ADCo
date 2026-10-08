@@ -2199,3 +2199,267 @@ def test_run_pipeline_exception_triggers_cleanup(tmp_path: Path):
                 )
             )
         mock_cleanup.assert_called_once()
+
+
+# ===========================================================================
+# 11. End-of-run tuning summary (Tuning Results CLI + tuning_summary JSON)
+# ===========================================================================
+
+
+def _six_arm_state():
+    """Fabricated 6-arm run: 4 confirmed PASS + 2 FAIL, 2 cheap rejections."""
+    winners = [
+        {
+            "rank": 1,
+            "name": "test_arm_a",
+            "plan_hash": "hash-a",
+            "mean": 8.25,
+            "lcb": 6.10,
+            "ucb": 10.40,
+            "p_win": 0.99,
+            "n_knobs": 2,
+            "certified": True,
+        },
+        {
+            "rank": 2,
+            "name": "test_arm_b",
+            "plan_hash": "hash-b",
+            "mean": 6.50,
+            "lcb": 5.40,
+            "ucb": 7.60,
+            "p_win": 0.97,
+            "n_knobs": 1,
+            "certified": True,
+        },
+        {
+            "rank": 3,
+            "name": "test_arm_c",
+            "plan_hash": "hash-c",
+            "mean": 5.75,
+            "lcb": 5.05,
+            "ucb": 6.45,
+            "p_win": 0.95,
+            "n_knobs": 3,
+            "certified": True,
+        },
+        {
+            "rank": 4,
+            "name": "test_arm_d",
+            "plan_hash": "hash-d",
+            "mean": 3.20,
+            "lcb": 1.10,
+            "ucb": 5.30,
+            "p_win": 0.80,
+            "n_knobs": 1,
+            "certified": False,
+        },
+    ]
+    history = [
+        {
+            "arm": "test_arm_a",
+            "phase": "screen",
+            "n_knobs": 2,
+            "mean_delta_pct": 8.25,
+            "lcb_pct": 6.10,
+            "status": "PASS",
+            "confirmed": True,
+        },
+        {
+            "arm": "test_arm_b",
+            "phase": "screen",
+            "n_knobs": 1,
+            "mean_delta_pct": 6.50,
+            "lcb_pct": 5.40,
+            "status": "PASS",
+            "confirmed": True,
+        },
+        {
+            "arm": "test_arm_c",
+            "phase": "screen",
+            "n_knobs": 3,
+            "mean_delta_pct": 5.75,
+            "lcb_pct": 5.05,
+            "status": "PASS",
+            "confirmed": True,
+        },
+        {
+            "arm": "test_arm_d",
+            "phase": "screen",
+            "n_knobs": 1,
+            "mean_delta_pct": 3.20,
+            "lcb_pct": 1.10,
+            "status": "PASS",
+            "confirmed": True,
+        },
+        {
+            "arm": "test_arm_e",
+            "phase": "screen",
+            "n_knobs": 2,
+            "mean_delta_pct": -1.50,
+            "lcb_pct": -3.00,
+            "status": "FAIL",
+            "confirmed": False,
+        },
+        {
+            "arm": "test_arm_f",
+            "phase": "screen",
+            "n_knobs": 1,
+            "mean_delta_pct": -0.40,
+            "lcb_pct": -1.20,
+            "status": "FAIL",
+            "confirmed": False,
+        },
+    ]
+    return {
+        "target": "/code/app",
+        "run_id": "run-1",
+        "run_dir": "/tmp/run-1",
+        "result_status": "PASS",
+        "validation_attempt_count": 8,
+        "min_improvement_pct": 5.0,
+        "experiment_history": history,
+        "rejected_history": ["cheap rejection one", "cheap rejection two"],
+        "candidate_archive": {
+            "winners": winners,
+            "min_improvement_pct": 5.0,
+        },
+        "live_result": {
+            "status": "APPLIED",
+            "applied_knobs": [
+                {"knob": "test_knob_alpha", "value": "256MB"},
+                {"knob": "test_knob_beta", "value": "4"},
+            ],
+        },
+    }
+
+
+def test_tuning_results_section_prints_rank_table(capsys):
+    from src.knob_tuner.main import _print_tuning_results
+
+    _print_tuning_results(_six_arm_state())
+    out = capsys.readouterr().out
+    assert "=== Tuning Results ===" in out
+    assert "6 measured screens / 8 total attempts" in out
+    assert "4 confirmed PASS" in out
+    assert "Certified: 3 (LCB > 5.0%)" in out
+    for arm in ("test_arm_a", "test_arm_d", "test_arm_e", "test_arm_f"):
+        assert arm in out
+    assert "FAIL" in out
+    assert "yes" in out and "no" in out
+    assert "Final knobs applied:" in out
+    assert "test_knob_alpha = 256MB" in out
+    assert "test_knob_beta = 4" in out
+    assert "mean% = average measured speedup vs baseline;" in out
+    assert "LCB% = pessimistic bound (95% sure the true gain is at least this)." in out
+
+
+def test_tuning_results_empty_state_degrades_without_throwing(capsys):
+    from src.knob_tuner.main import _build_tuning_summary, _print_tuning_results
+
+    _print_tuning_results({})
+    out = capsys.readouterr().out
+    assert "=== Tuning Results ===" in out
+    assert "n/a" in out
+    assert "none" in out
+
+    summary = _build_tuning_summary({})
+    assert summary["attempts_total"] == 0
+    assert summary["screens_measured"] == 0
+    assert summary["passed"] == 0
+    assert summary["certified_count"] == 0
+    assert summary["applied"] == []
+
+
+def test_write_output_result_includes_tuning_summary(tmp_path: Path):
+    out_file = tmp_path / "result.json"
+    _write_output_result(str(out_file), _six_arm_state())
+    data = json.loads(out_file.read_text(encoding="utf-8"))
+    summary = data["tuning_summary"]
+    assert summary["attempts_total"] == 8
+    assert summary["screens_measured"] == 6
+    assert summary["passed"] == 4
+    assert summary["certified_count"] == 3
+    assert summary["gate_pct"] == 5.0
+    assert summary["applied"] == [
+        {"knob": "test_knob_alpha", "value": "256MB"},
+        {"knob": "test_knob_beta", "value": "4"},
+    ]
+    # Pre-existing keys are untouched.
+    assert data["status"] == "PASS"
+    assert len(data["winners"]) == 4
+
+
+def test_main_cli_tuning_results_section_present_and_exit_unchanged(tmp_path, capsys):
+    target_dir = tmp_path / "app"
+    target_dir.mkdir()
+    state = _six_arm_state()
+    state["target"] = str(target_dir)
+    state["run_dir"] = str(tmp_path)
+    code, _ = _run_main(
+        [str(target_dir), "--db-name", "custom_db", "--cpu-cores", "4", "--memory", "8"],
+        state,
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "=== Knob Tuner Summary ===" in out
+    assert "=== Tuning Results ===" in out
+    assert "6 measured screens / 8 total attempts" in out
+
+
+def _six_arm_state_with_diagnosis():
+    state = _six_arm_state()
+    state["diagnosis_history"] = [
+        {"correction": "retry_same", "confidence": 0.9, "stop_reason": "futility"},
+        {"correction": "retry_same", "confidence": 0.75, "stop_reason": "futility"},
+        {"correction": "adjust_value", "confidence": 0.5, "stop_reason": "futility"},
+        {"correction": "shrink_set", "confidence": 0.25, "stop_reason": "futility"},
+        {"correction": "drop_knob", "confidence": 0.1, "stop_reason": "futility"},
+        {"correction": "stop", "confidence": 0.99, "stop_reason": "futility"},
+    ]
+    return state
+
+
+def test_tuning_results_llm_conf_column_and_winner_confidence(capsys):
+    from src.knob_tuner.main import _build_tuning_summary, _print_tuning_results
+
+    _print_tuning_results(_six_arm_state_with_diagnosis())
+    out = capsys.readouterr().out
+    assert "LLM conf" in out
+    for conf_s in ("0.90", "0.75", "0.50", "0.25", "0.10", "0.99"):
+        assert conf_s in out
+    assert (
+        "LLM conf = diagnosing agent's confidence in its round assessment "
+        "(0-1), not a success probability" in out
+    )
+
+    summary = _build_tuning_summary(_six_arm_state_with_diagnosis())
+    assert summary["llm_confidences"] == [0.9, 0.75, 0.5, 0.25]
+    assert summary["winner_llm_confidence"] == 0.9
+
+
+def test_tuning_results_llm_conf_absent_renders_na_null(capsys):
+    from src.knob_tuner.main import _build_tuning_summary, _print_tuning_results
+
+    _print_tuning_results(_six_arm_state())
+    out = capsys.readouterr().out
+    assert "LLM conf" in out
+    assert "n/a" in out
+
+    summary = _build_tuning_summary(_six_arm_state())
+    assert summary["llm_confidences"] == [None, None, None, None]
+    assert summary["winner_llm_confidence"] is None
+
+
+def test_tuning_results_llm_conf_length_mismatch_tolerated(capsys):
+    from src.knob_tuner.main import _build_tuning_summary, _print_tuning_results
+
+    state = _six_arm_state()
+    state["diagnosis_history"] = [{"confidence": 0.82}]
+    _print_tuning_results(state)
+    out = capsys.readouterr().out
+    assert "0.82" in out
+    assert "n/a" in out
+
+    summary = _build_tuning_summary(state)
+    assert summary["llm_confidences"] == [0.82, None, None, None]
+    assert summary["winner_llm_confidence"] == 0.82

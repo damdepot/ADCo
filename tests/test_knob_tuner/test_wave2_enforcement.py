@@ -128,6 +128,36 @@ def test_shrink_set_violation():
     assert isinstance(good, CompiledPlan)
 
 
+def test_shrink_set_at_floor_measures_instead_of_spiral():
+    # Death-spiral repro: shrink ordered when the last attempt already has
+    # n_knobs=1 — a single-knob proposal is at the floor (cannot go lower),
+    # so it must compile and measure instead of compile-rejecting.
+    ctx = _ctx()
+    _diagnose(ctx, "shrink_set", [])
+    ctx.state.update(
+        {"experiment_history": [{"name": "e-prev", "phase": "screen", "n_knobs": 1}]}
+    )
+    floor = nodes.compile_candidate(ctx, _proposal(name="floor"))
+    assert isinstance(floor, CompiledPlan)
+    # Growing past the floor still violates shrink.
+    grown = nodes.compile_candidate(
+        ctx,
+        _proposal(
+            name="grown",
+            levels=[
+                {"knob": "work_mem", "value": "64MB"},
+                {"knob": "shared_buffers", "value": "256MB"},
+            ],
+        ),
+    )
+    assert isinstance(grown, CompileRejection)
+    assert "shrink_set" in grown.reason
+    # Absent history keeps today's behavior: no shrink rejection, no throw.
+    ctx2 = _ctx()
+    _diagnose(ctx2, "shrink_set", [])
+    assert isinstance(nodes.compile_candidate(ctx2, _proposal(name="nohist")), CompiledPlan)
+
+
 def test_change_phase_violation():
     ctx = _ctx()
     _diagnose(ctx, "change_phase", ["refinement"])
@@ -291,12 +321,13 @@ def test_beliefs_and_bundle_refresh_on_screen():
     table = ctx.state.get("belief_table") or ""
     assert "work_mem" in table
 
-    # Controller routes the diagnosed outcome without recounting.
+    # Controller banks the agreed winner and keeps screening (no recount).
     out = nodes.confirmation_controller(
         ctx, DiagnosisOutput(correction="stop", targets=[], rationale="winner",
                              confidence=0.95, stop_reason="winner")
     )
-    assert out["route"] == "done"
+    assert out["route"] == "retry"
+    assert "continue screening" in out.get("reason", "")
     assert ctx.state.get("validation_attempt_count") == 1
     assert len(ctx.state.get("experiment_history") or []) == 1
 
@@ -689,6 +720,60 @@ def test_knob_set_guard_ignores_superset_and_subset():
     assert isinstance(bigger, CompiledPlan)
 
 
+# --- Multi-winner step 3: family-diversity steering ------------------------
+
+_FAMILY_CATEGORIES = {"work_mem": "memory", "shared_buffers": "checkpoint"}
+
+
+def _ctx_with_families(winners=None):
+    ctx = _ctx()
+    info = []
+    for entry in ctx.state.get("knobs_info") or []:
+        entry = dict(entry)
+        if entry.get("name") in _FAMILY_CATEGORIES:
+            entry["category"] = _FAMILY_CATEGORIES[entry["name"]]
+        info.append(entry)
+    patch = {"knobs_info": info}
+    if winners is not None:
+        patch["winners"] = winners
+    ctx.state.update(patch)
+    return ctx
+
+
+def test_winner_family_same_family_only_rejected_and_rerouted():
+    ctx = _ctx_with_families(
+        winners=[{"knobs": [{"name": "work_mem", "value": "64MB"}]}]
+    )
+    bad = nodes.compile_candidate(
+        ctx, _proposal(levels=[{"knob": "work_mem", "value": "64MB"}])
+    )
+    assert isinstance(bad, CompileRejection)
+    assert "family-diversity" in bad.reason
+    out = nodes.confirmation_controller(ctx, bad)
+    assert out["route"] == "retry"
+
+
+def test_winner_family_outside_knob_passes():
+    ctx = _ctx_with_families(
+        winners=[{"knobs": [{"name": "work_mem", "value": "64MB"}]}]
+    )
+    single = nodes.compile_candidate(
+        ctx, _proposal(name="diverse", levels=[{"knob": "shared_buffers", "value": "256MB"}])
+    )
+    assert isinstance(single, CompiledPlan)
+    mixed = nodes.compile_candidate(
+        ctx,
+        _proposal(
+            name="mixed",
+            levels=[
+                {"knob": "work_mem", "value": "64MB"},
+                {"knob": "shared_buffers", "value": "256MB"},
+            ],
+        ),
+    )
+    assert isinstance(mixed, CompiledPlan)
+
+
 def test_winner_stop_non_binding_while_quota_unmet():
     # A winner stop must not veto the next proposal while the quota is unmet
     # (otherwise the compounded campaign can never collect candidates).
@@ -704,7 +789,10 @@ def test_winner_stop_non_binding_while_quota_unmet():
     assert isinstance(good, CompiledPlan)
 
 
-def test_winner_stop_binding_once_quota_met():
+def test_winner_stop_non_binding_once_quota_met():
+    # Unified quota: a winner stop never vetoes the next proposal, even with
+    # the quota met (the quota ends the loop via the backstop, not via
+    # compile). A genuinely different knob set compiles cleanly.
     ctx = _ctx()
     ctx.state.update({"min_improvement_pct": 5.0, "success_candidates": 1})
     ctx.state.update(
@@ -725,10 +813,13 @@ def test_winner_stop_binding_once_quota_met():
         DiagnosisOutput(correction="stop", targets=[], rationale="winner!",
                         confidence=0.95, stop_reason="winner"),
     )
-    # Quota (1) met -> the stop binds and vetoes the next proposal.
-    bad = nodes.compile_candidate(ctx, _proposal(name="after-stop"))
-    assert isinstance(bad, CompileRejection)
-    assert "stop" in bad.reason
+    # Quota (1) met -> the loop ends via the backstop, but the stop itself
+    # stays non-binding for compile.
+    good = nodes.compile_candidate(
+        ctx, _proposal(name="after-stop",
+                       levels=[{"knob": "shared_buffers", "value": "256MB"}])
+    )
+    assert isinstance(good, CompiledPlan)
 
 
 def test_futility_stop_stays_binding_while_quota_unmet():
@@ -742,3 +833,276 @@ def test_futility_stop_stays_binding_while_quota_unmet():
     bad = nodes.compile_candidate(ctx, _proposal(name="after-futility"))
     assert isinstance(bad, CompileRejection)
     assert "stop" in bad.reason
+
+
+def test_no_winner_state_unaffected():
+    ctx = _ctx_with_families()
+    assert ctx.state.get("winners") is None
+    ok = nodes.compile_candidate(ctx, _proposal())
+    assert isinstance(ok, CompiledPlan)
+    empty = _ctx_with_families(winners=[])
+    ok_empty = nodes.compile_candidate(empty, _proposal(name="e2"))
+    assert isinstance(ok_empty, CompiledPlan)
+
+
+def test_unknown_family_passes_through():
+    ctx = _ctx_with_families(
+        winners=[{"knobs": [{"name": "work_mem", "value": "64MB"}]}]
+    )
+    info = [dict(e) for e in (ctx.state.get("knobs_info") or [])]
+    for entry in info:
+        if entry.get("name") == "shared_buffers":
+            entry.pop("category", None)
+    ctx.state.update({"knobs_info": info})
+    ok = nodes.compile_candidate(
+        ctx, _proposal(name="unknown", levels=[{"knob": "shared_buffers", "value": "256MB"}])
+    )
+    assert isinstance(ok, CompiledPlan)
+
+
+def test_diagnosis_correction_keeps_priority_over_diversity():
+    ctx = _ctx_with_families(
+        winners=[{"knobs": [{"name": "work_mem", "value": "64MB"}]}]
+    )
+    _diagnose(ctx, "drop_knob", ["work_mem"])
+    bad = nodes.compile_candidate(
+        ctx, _proposal(levels=[{"knob": "work_mem", "value": "64MB"}])
+    )
+    assert isinstance(bad, CompileRejection)
+    assert "drop_knob" in bad.reason
+
+
+def test_winner_registry_entry_shape_steers_diversity():
+    # Winner-registry shape: {plan_hash, mean, lcb, knobs, family}.
+    ctx = _ctx_with_families(
+        winners=[
+            {
+                "plan_hash": "abc123",
+                "mean": 5.0,
+                "lcb": 3.0,
+                "knobs": ["work_mem"],
+                "family": "memory",
+            }
+        ]
+    )
+    bad = nodes.compile_candidate(
+        ctx, _proposal(levels=[{"knob": "work_mem", "value": "64MB"}])
+    )
+    assert isinstance(bad, CompileRejection)
+    assert "family-diversity" in bad.reason
+    good = nodes.compile_candidate(
+        ctx, _proposal(name="other", levels=[{"knob": "shared_buffers", "value": "256MB"}])
+    )
+    assert isinstance(good, CompiledPlan)
+
+
+def _certified_winners(n):
+    return [
+        {"plan_hash": f"hash-{i}", "mean": 12.0, "lcb": 11.0,
+         "knobs": [], "family": "", "certified": True}
+        for i in range(n)
+    ]
+
+
+def test_winner_stop_quota_unmet_compiles_fresh_proposal():
+    # Live-stall repro: a winner registered but quota unmet — a winner stop
+    # must NOT halt compile; the fresh proposal flows to remaining checks.
+    ctx = _ctx()
+    _diagnose(ctx, "stop", [], "winner found", stop_reason="winner")
+    result = nodes.compile_candidate(ctx, _proposal(name="fresh"))
+    assert isinstance(result, CompiledPlan)
+
+
+def test_winner_stop_quota_met_compiles():
+    # Unified quota: even with three certified winners banked, a winner stop
+    # never vetoes compile (below the attempt cap); the quota ends the loop
+    # via the backstop instead.
+    ctx = _ctx()
+    ctx.state.update({"winners": _certified_winners(3)})
+    _diagnose(ctx, "stop", [], "winner found", stop_reason="winner")
+    ok = nodes.compile_candidate(ctx, _proposal())
+    assert isinstance(ok, CompiledPlan)
+
+
+def test_futility_stop_halts_regardless_of_quota():
+    ctx = _ctx()
+    ctx.state.update({"winners": _certified_winners(1)})
+    _diagnose(ctx, "stop", [], "exhausted", stop_reason="futility")
+    rejected = nodes.compile_candidate(ctx, _proposal())
+    assert isinstance(rejected, CompileRejection)
+    assert "stop" in rejected.reason
+
+
+def test_winner_stop_at_cap_halts():
+    ctx = _ctx()
+    ctx.state.update({"validation_attempt_count": 6})
+    _diagnose(ctx, "stop", [], "winner found", stop_reason="winner")
+    rejected = nodes.compile_candidate(ctx, _proposal())
+    assert isinstance(rejected, CompileRejection)
+    assert "stop" in rejected.reason
+
+
+def test_diversity_sunsets_when_all_families_covered():
+    # Coverage-exhaustion stall repro: winners cover every inventory family,
+    # so same-family-only proposals must pass (refine the leader) instead
+    # of compile-rejecting for family-diversity with zero measurements.
+    ctx = _ctx_with_families(
+        winners=[{"knobs": ["work_mem"]}, {"knobs": ["shared_buffers"]}]
+    )
+    same_family = nodes.compile_candidate(
+        ctx, _proposal(name="refine", levels=[{"knob": "work_mem", "value": "64MB"}])
+    )
+    assert isinstance(same_family, CompiledPlan)
+
+
+def test_diversity_enforced_while_family_uncovered():
+    # One inventory family still uncovered: same-family-only rejects,
+    # outside-family (and mixed) proposals pass.
+    ctx = _ctx_with_families(winners=[{"knobs": ["work_mem"]}])
+    bad = nodes.compile_candidate(
+        ctx, _proposal(levels=[{"knob": "work_mem", "value": "64MB"}])
+    )
+    assert isinstance(bad, CompileRejection)
+    assert "family-diversity" in bad.reason
+    assert "uncovered" in bad.reason
+    good = nodes.compile_candidate(
+        ctx, _proposal(name="diverse", levels=[{"knob": "shared_buffers", "value": "256MB"}])
+    )
+    assert isinstance(good, CompiledPlan)
+
+
+def test_diversity_skipped_without_family_metadata():
+    # No category metadata anywhere: winners exist but the check sunsets
+    # (unknown = no rejection) so the loop keeps measuring.
+    ctx = _ctx_with_families(winners=[{"knobs": ["work_mem"]}])
+    info = [dict(e) for e in (ctx.state.get("knobs_info") or [])]
+    for entry in info:
+        entry.pop("category", None)
+    ctx.state.update({"knobs_info": info})
+    ok = nodes.compile_candidate(
+        ctx, _proposal(name="nometa", levels=[{"knob": "work_mem", "value": "64MB"}])
+    )
+    assert isinstance(ok, CompiledPlan)
+
+
+def test_diversity_no_winners_unaffected_with_families():
+    # Explicit: family metadata present but no winners registered — any
+    # proposal compiles (diversity needs winners to steer against).
+    ctx = _ctx_with_families()
+    assert ctx.state.get("winners") is None
+    ok = nodes.compile_candidate(
+        ctx, _proposal(levels=[{"knob": "work_mem", "value": "64MB"}])
+    )
+    assert isinstance(ok, CompiledPlan)
+
+
+def test_evidence_bundle_names_winner_families():
+    from src.knob_tuner.stages.evidence import build_evidence_bundle
+
+    bundle = build_evidence_bundle(
+        {
+            "experiment_history": [
+                {
+                    "name": "e-win",
+                    "phase": "screen",
+                    "n_knobs": 1,
+                    "mean_delta_pct": 5.0,
+                    "lcb_pct": 3.0,
+                    "status": "PASS",
+                    "confirmed": True,
+                }
+            ],
+            "knobs_info": [
+                {"name": "work_mem", "category": "Memory"},
+                {"name": "shared_buffers", "category": "Checkpoint"},
+            ],
+            "winners": [{"knobs": ["work_mem"]}],
+        }
+    )
+    assert "Incumbent leader: e-win" in bundle
+    assert "Winner families covered: memory" in bundle
+
+
+def test_last_rejection_reaches_next_round_context():
+    # Handoff rule 2: the next candidate round must see WHY the last proposal
+    # died. The workflow persists CompileRejection dumps as last_rejection;
+    # the next refresh must surface that reason in the evidence bundle the
+    # candidate prompt reads (diagnosis corrections keep priority).
+    ctx = _ctx()
+    _diagnose(ctx, "drop_knob", ["work_mem"])
+    bad = nodes.compile_candidate(
+        ctx, _proposal(levels=[{"knob": "work_mem", "value": "64MB"}])
+    )
+    assert isinstance(bad, CompileRejection)
+    ctx.state.update({"last_rejection": bad.model_dump()})
+    # Next round: a fresh diagnosis arrival refreshes memory for the
+    # candidate prompt.
+    nodes.confirmation_controller(
+        ctx,
+        DiagnosisOutput(correction="retry_same", targets=[], rationale="flake",
+                        confidence=0.6),
+    )
+    bundle = ctx.state.get("evidence_bundle") or ""
+    assert "Last compile rejection" in bundle
+    assert "drop_knob" in bundle
+
+
+def test_unsatisfiable_adjust_value_downgraded_three_rounds():
+    # Handoff rule 3: adjust_value naming knobs absent from inventory can
+    # never be satisfied — downgraded at issue time, never enforced as-is.
+    # Three-round sequence: reject -> next proposal complies -> measures.
+    ctx = _ctx()
+    out = nodes.confirmation_controller(
+        ctx,
+        DiagnosisOutput(correction="adjust_value", targets=["ghost_knob"],
+                        rationale="tweak", confidence=0.7),
+    )
+    assert out["route"] == "retry"
+    hist = ctx.state.get("diagnosis_history")
+    assert hist and hist[-1]["correction"] == "retry_same"
+    # Round 2: the next proposal complies (no dead-loop on ghost_knob).
+    complied = nodes.compile_candidate(ctx, _proposal(name="round2"))
+    assert isinstance(complied, CompiledPlan)
+    # Round 3: it measures — a screen records the attempt row.
+    from src.knob_tuner.contracts import KnobPlan
+
+    plan = KnobPlan.model_validate(
+        {"knobs": [{"name": "work_mem", "value": "64MB", "scope": "user"}]}
+    )
+    compiled = CompiledPlan(plan=plan.model_dump(), exp_name="round3",
+                            phase="screen", valid_knobs=["work_mem"])
+
+    def _validate(**kwargs):
+        return {
+            "status": "PASS",
+            "paired": {
+                "baseline": {"per_run_tps": [100.0, 101.0, 102.0]},
+                "tuned": {"per_run_tps": [110.0, 112.0, 111.0]},
+            },
+            "reasons": [],
+            "stopped_early": False,
+        }
+
+    ctx.state.update({"min_improvement_pct": 2.0})
+    verdict = nodes.screen_candidate(ctx, compiled, validate_fn=_validate)
+    assert isinstance(verdict, ScreenVerdict)
+    assert len(ctx.state.get("experiment_history") or []) == 1
+
+
+def test_shrink_set_at_floor_downgraded_not_emitted():
+    # shrink_set with known no-shrink room (last n_knobs=1) is
+    # unsatisfiable — the issue-time guard downgrades it to retry_same so
+    # no floor order is ever emitted as-is. Unknown history keeps
+    # today's pass-through (no shrink rejection).
+    ctx = _ctx()
+    ctx.state.update(
+        {"experiment_history": [{"name": "e-prev", "phase": "screen", "n_knobs": 1}]}
+    )
+    nodes.confirmation_controller(
+        ctx, DiagnosisOutput(correction="shrink_set", targets=[], rationale="tighten",
+                             confidence=0.7),
+    )
+    hist = ctx.state.get("diagnosis_history")
+    assert hist and hist[-1]["correction"] == "retry_same"
+    assert isinstance(nodes.compile_candidate(ctx, _proposal(name="floor-ok")),
+                      CompiledPlan)

@@ -493,6 +493,66 @@ def test_decision_lead_overlapping():
     assert any("overlapping" in r and "e2" in r for r in out.summary["reasons"])
 
 
+def test_decision_multi_certified_lists_all_winners():
+    ctx = FakeCtx({"min_improvement_pct": 5.0})
+    best = _row(mean=8.0, lcb=6.0, ucb=9.0, arm="e-best")
+    best["p_win"] = 0.95
+    second = _row(mean=6.0, lcb=5.5, ucb=7.0, arm="e-second")
+    second["p_win"] = 0.9
+    below_gate = _row(mean=2.0, lcb=1.0, ucb=3.0, arm="e-weak")
+    out = nodes.decision(ctx, all_rows=[second, below_gate, best], baseline_tps=[100.0])
+    assert out.decision == "apply_winner"
+    # The top-ranked winner is the one applied live.
+    assert out.summary["stats"]["mean_delta_pct"] == 8.0
+    winners = out.summary["archive"]["winners"]
+    assert [w["name"] for w in winners] == ["e-best", "e-second", "e-weak"]
+    assert [w["rank"] for w in winners] == [1, 2, 3]
+    expected_keys = {"rank", "name", "plan_hash", "mean", "lcb", "ucb", "p_win",
+                     "n_knobs", "certified"}
+    for w in winners:
+        assert set(w) == expected_keys
+        assert w["plan_hash"]  # gate proof resolves the plan identity
+        assert w["n_knobs"] == 1
+    assert winners[0]["certified"] is True and winners[0]["lcb"] > 5.0
+    assert winners[1]["certified"] is True and winners[1]["lcb"] > 5.0
+    # The below-gate arm is reported for audit but flagged uncertified.
+    assert winners[2]["certified"] is False and winners[2]["lcb"] <= 5.0
+    assert winners[0]["mean"] == 8.0 and winners[0]["p_win"] == 0.95
+    assert winners[1]["mean"] == 6.0 and winners[1]["p_win"] == 0.9
+
+
+def test_decision_uncertified_only_lists_rows_without_applying():
+    ctx = FakeCtx({"min_improvement_pct": 5.0})
+    unconfirmed = _row(mean=8.0, lcb=6.0, confirmed=False, arm="e-unconfirmed")
+    failed = _row(mean=-1.0, lcb=-2.0, status="FAIL", confirmed=False, arm="e-fail")
+    out = nodes.decision(ctx, all_rows=[unconfirmed, failed], baseline_tps=[100.0])
+    assert out.decision == "inconclusive"
+    assert out.summary["status"] == "INCONCLUSIVE"
+    assert out.winner_plan == {}
+    # The unconfirmed PASS arm is listed for audit (flagged uncertified)
+    # while the FAIL arm stays out; nothing applies, exactly as before.
+    winners = out.summary["archive"]["winners"]
+    assert [w["name"] for w in winners] == ["e-unconfirmed"]
+    assert winners[0]["certified"] is False
+
+
+def test_decision_confirmed_pass_below_gate_withholds_but_lists():
+    # Unified design: selection stays certified-only (a confirmed PASS below
+    # the gate still withholds, exactly as the compounding base), while the
+    # arm is listed — flagged uncertified — instead of vanishing from the
+    # winners table.
+    ctx = FakeCtx({"min_improvement_pct": 5.0})
+    row = _row(mean=8.9, lcb=3.5, ucb=12.0, arm="e-unc")
+    out = nodes.decision(ctx, all_rows=[row], baseline_tps=[100.0])
+    assert out.decision == "inconclusive"
+    assert out.winner_plan == {}
+    winners = out.summary["archive"]["winners"]
+    assert len(winners) == 1
+    assert winners[0]["name"] == "e-unc"
+    assert winners[0]["certified"] is False
+    assert winners[0]["plan_hash"]  # withheld arm stays auditable
+
+
 # --- preflight routing ---
 
 
@@ -745,3 +805,27 @@ def test_confirm_winner_no_cap_walks_whole_pool_when_none_pass():
     )
     assert out.decision == "inconclusive"
     assert out.summary["confirmation"]["attempted"] == 4
+
+
+def test_last_rejection_surfaces_in_next_round_bundle():
+    # Rejection feedback (FakeCtx, no ADK runtime): a persisted
+    # last_rejection must reach the evidence bundle the candidate prompt
+    # reads after the next controller refresh.
+    ctx = FakeCtx(
+        _routed_state(
+            last_rejection={
+                "reason": "drop_knob violation: proposal includes excluded knob(s) ['work_mem']",
+                "errors": ["drop_knob: work_mem must be excluded per diagnosis"],
+                "design_name": "e-bad",
+            }
+        )
+    )
+    out = nodes.confirmation_controller(
+        ctx,
+        DiagnosisOutput(correction="retry_same", targets=[], rationale="flake?", confidence=0.6),
+    )
+    assert out["route"] == "retry"
+    bundle = ctx.state.get("evidence_bundle") or ""
+    assert "Last compile rejection" in bundle
+    assert "drop_knob" in bundle
+    assert "e-bad" in bundle

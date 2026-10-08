@@ -20,11 +20,13 @@ from src.knob_tuner.contracts import (
     KnobPlan,
     get_early_stop_min_reps,
     get_max_set_knobs,
+    get_max_winners,
     get_min_improvement_pct,
     get_success_candidates,
     get_validation_attempt,
 )
 from src.knob_tuner.stages.memory_guard import clamp_memory_knobs
+from src.knob_tuner.stages.evidence import winner_families
 from src.knob_tuner.stages.models import (
     CandidateProposal,
     CompiledPlan,
@@ -376,6 +378,290 @@ def _latest_incumbent_ref(
     return {"plan_hash": plan_hash, "mean": mean, "lcb": lcb}
 
 
+def _latest_winner_row(state: Any, node_input: Any) -> dict[str, Any]:
+    """Return the triggering verdict/history row for winner registration.
+
+    Generic: prefers a verdict-shaped ``node_input`` dict, then
+    ``last_screen_row``, then the tail of ``experiment_history``. Never throws.
+    """
+    with contextlib.suppress(Exception):
+        if isinstance(node_input, dict) and (
+            "status" in node_input or "paired" in node_input
+        ):
+            return node_input
+        get = getattr(state, "get", None)
+        if callable(get):
+            row = get("last_screen_row")
+            if isinstance(row, dict) and row:
+                return row
+            hist = get("experiment_history")
+            if isinstance(hist, list) and hist and isinstance(hist[-1], dict):
+                return hist[-1]
+    return {}
+
+
+def _winner_knob_names(row: Any, state: Any) -> list[str]:
+    """Resolve knob name strings for a winner entry (never throws)."""
+    with contextlib.suppress(Exception):
+        candidates: list[Any] = []
+        if isinstance(row, dict):
+            for key in ("knobs", "valid_knobs", "knob_names", "knob_list"):
+                value = row.get(key)
+                if isinstance(value, list) and value:
+                    candidates.append(value)
+            plan = row.get("plan")
+            if isinstance(plan, dict) and isinstance(plan.get("knobs"), list):
+                candidates.append(plan["knobs"])
+            verified = row.get("verified_knobs")
+            if isinstance(verified, list) and verified:
+                candidates.append(verified)
+        get = getattr(state, "get", None)
+        if callable(get):
+            for key in ("last_screen_row",):
+                other = get(key)
+                if isinstance(other, dict):
+                    plan = other.get("plan")
+                    if isinstance(plan, dict) and isinstance(
+                        plan.get("knobs"), list
+                    ):
+                        candidates.append(plan["knobs"])
+        for value in candidates:
+            names: list[str] = []
+            for spec in value or []:
+                if isinstance(spec, str) and spec.strip():
+                    names.append(spec.strip())
+                elif isinstance(spec, dict):
+                    for k in ("name", "knob", "knob_name"):
+                        label = spec.get(k)
+                        if isinstance(label, str) and label.strip():
+                            names.append(label.strip())
+                            break
+            if names:
+                seen: set[str] = set()
+                return [n for n in names if not (n in seen or seen.add(n))]
+    return []
+
+
+def _winner_family(row: Any, state: Any) -> str:
+    """Resolve the knob family/category string (never throws, else ``""``)."""
+    with contextlib.suppress(Exception):
+        if isinstance(row, dict):
+            for key in ("family", "knob_family", "category", "knob_category"):
+                value = row.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        names = _winner_knob_names(row, state)
+        if names:
+            get = getattr(state, "get", None)
+            info = get("knobs_info") if callable(get) else None
+            if isinstance(info, list) and info:
+                by_name: dict[str, str] = {}
+                for entry in info:
+                    if isinstance(entry, dict):
+                        label = str(
+                            entry.get("name", "") or ""
+                        ).strip().lower()
+                        cat = str(
+                            entry.get("category", entry.get("family", ""))
+                            or ""
+                        ).strip()
+                        if label and cat and label not in by_name:
+                            by_name[label] = cat
+                cats = {by_name[n.strip().lower()] for n in names if n.strip().lower() in by_name}
+                if len(cats) == 1:
+                    return next(iter(cats))
+    return ""
+
+
+def _latest_confirmed_pass(
+    state: Any, node_input: Any
+) -> tuple[float, float, bool]:
+    """Return ``(mean, lcb, ok)`` for the triggering verdict (never throws).
+
+    ``ok`` is true only when the triggering verdict is a confirmed PASS —
+    the same condition the apply path uses to crown a winner — with explicit
+    ``mean_delta_pct``/``lcb_pct`` measurements present. Generic: no knob
+    names. ``(0.0, 0.0, False)`` otherwise.
+    """
+    try:
+        if isinstance(node_input, ScreenVerdict):
+            if str(node_input.status or "").upper() == "PASS" and bool(
+                node_input.confirmed
+            ):
+                return (
+                    float(node_input.mean_delta_pct or 0.0),
+                    float(node_input.lcb_pct or 0.0),
+                    True,
+                )
+            return 0.0, 0.0, False
+        row = _latest_winner_row(state, node_input)
+        if not isinstance(row, dict):
+            return 0.0, 0.0, False
+        if str(row.get("status", "") or "").upper() != "PASS":
+            return 0.0, 0.0, False
+        if not bool(row.get("confirmed", False)):
+            return 0.0, 0.0, False
+        mean = _optional_float(row.get("mean_delta_pct"))
+        lcb = _optional_float(row.get("lcb_pct"))
+        if mean is None or lcb is None:
+            return 0.0, 0.0, False
+        return float(mean), float(lcb), True
+    except Exception:  # noqa: BLE001 - predicate lookup never throws
+        return 0.0, 0.0, False
+
+
+def _is_entry_certified(entry: Any, gate: float) -> bool:
+    """Return whether a winner entry clears the win gate (never throws).
+
+    Entries carrying an explicit ``certified`` flag are trusted; legacy
+    entries without one derive it from ``lcb > gate``.
+    """
+    try:
+        if isinstance(entry, dict) and entry.get("certified") is not None:
+            return bool(entry.get("certified"))
+        if isinstance(entry, dict):
+            lcb = _optional_float(entry.get("lcb"))
+            if lcb is None:
+                return False
+            return float(lcb) > float(gate)
+    except Exception:  # noqa: BLE001, S110 - certification check never throws
+        pass
+    return False
+
+
+def _count_certified_winners(state: Any) -> int:
+    """Count registry entries clearing the win gate (never throws).
+
+    Only certified entries satisfy the winner quota; registered-but-
+    uncertified arms are reported but never stop the loop.
+    """
+    try:
+        gate = float(_min_improvement_pct(state))
+        get = getattr(state, "get", None)
+        raw = get("winners") if callable(get) else None
+        if not isinstance(raw, list):
+            return 0
+        return sum(1 for w in raw if _is_entry_certified(w, gate))
+    except Exception:  # noqa: BLE001 - quota count never throws
+        return 0
+
+
+def _update_incumbent(
+    state: Any, node_input: Any, mean: float, lcb: float
+) -> dict[str, Any]:
+    """Track the leading arm by ``(mean, lcb)`` lexicographic (never throws).
+
+    Strictly better challengers replace the incumbent; anything else keeps
+    the current leader. Returns the incumbent either way.
+    """
+    candidate = _latest_incumbent_ref(state, node_input, mean, lcb)
+    incumbent: dict[str, Any] = candidate
+    with contextlib.suppress(Exception):
+        current = state.get("incumbent")
+        if isinstance(current, dict):
+            try:
+                cur_key = (
+                    float(current.get("mean", 0.0) or 0.0),
+                    float(current.get("lcb", 0.0) or 0.0),
+                )
+            except (TypeError, ValueError):
+                cur_key = None
+            if cur_key is not None and (mean, lcb) <= cur_key:
+                incumbent = {
+                    "plan_hash": str(current.get("plan_hash", "") or ""),
+                    "mean": cur_key[0],
+                    "lcb": cur_key[1],
+                }
+            else:
+                with contextlib.suppress(Exception):
+                    state["incumbent"] = dict(candidate)
+        else:
+            with contextlib.suppress(Exception):
+                state["incumbent"] = dict(candidate)
+    return incumbent
+
+
+def _leader_label(state: Any, node_input: Any, incumbent: dict[str, Any]) -> str:
+    """Return the arm label for continue-screening reasons (never throws)."""
+    name = ""
+    with contextlib.suppress(Exception):
+        name, _, _ = _describe_arm(node_input, state)
+        # _describe_arm falls back to "experiment" for diagnosis inputs;
+        # prefer the verdict row's arm label when generic.
+        if name == "experiment":
+            row = state.get("last_screen_row")
+            if isinstance(row, dict):
+                for key in ("arm", "exp_name", "name"):
+                    label = str(row.get(key, "") or "").strip()
+                    if label:
+                        name = label
+                        break
+    with contextlib.suppress(Exception):
+        return str(incumbent.get("plan_hash") or name or "leader")
+    return "leader"
+
+
+def _register_winner(
+    state: Any, node_input: Any, mean: float, lcb: float
+) -> list[dict[str, Any]]:
+    """Append a winner entry for the triggering verdict (never throws).
+
+    Entry shape: ``{plan_hash, mean, lcb, knobs, family, certified}`` where
+    ``certified`` is ``lcb >`` the resolved ``min_improvement_pct``. A
+    ``plan_hash`` already present is never duplicated.
+    """
+    try:
+        get = getattr(state, "get", None)
+        raw = get("winners") if callable(get) else None
+        winners = list(raw) if isinstance(raw, list) else []
+        winners = [w for w in winners if isinstance(w, dict)]
+        ref = _latest_incumbent_ref(state, node_input, mean, lcb)
+        plan_hash = str(ref.get("plan_hash", "") or "")
+        if any(str(w.get("plan_hash", "") or "") == plan_hash for w in winners):
+            with contextlib.suppress(Exception):
+                state["winners"] = winners
+            return winners
+        row = _latest_winner_row(state, node_input)
+        mean_f = float(ref.get("mean", mean) or 0.0)
+        lcb_f = float(ref.get("lcb", lcb) or 0.0)
+        try:
+            certified = lcb_f > float(_min_improvement_pct(state))
+        except (TypeError, ValueError):
+            certified = False
+        entry = {
+            "plan_hash": plan_hash,
+            "mean": mean_f,
+            "lcb": lcb_f,
+            "knobs": _winner_knob_names(row, state),
+            "family": _winner_family(row, state),
+            "certified": bool(certified),
+        }
+        winners.append(entry)
+        with contextlib.suppress(Exception):
+            state["winners"] = winners
+        return winners
+    except Exception:  # noqa: BLE001 - winner registry never throws
+        return []
+
+
+def _winner_stop_halts(state: Any) -> bool:
+    """Return whether a winner-stop halts compile (never throws).
+
+    Generic: a winner stop is NOT terminal by itself — the controller banks
+    the agreed arm in the winners registry and keeps screening
+    (register-and-continue), and the unified quota ends the loop via the
+    confident-win backstop. Only the attempt cap halts compile for a winner
+    stop, so post-cap proposals cannot trigger further measurement. Futility
+    stops always halt (handled by the caller). Missing/unreadable state
+    fails closed to halt (today's behavior).
+    """
+    try:
+        attempt, cap = _resolve_attempt_cap(state)
+        return attempt >= cap
+    except Exception:  # noqa: BLE001 - halt check never throws
+        return True
+
+
 # ---------------------------------------------------------------------------
 # 1. materialize_inventory
 # ---------------------------------------------------------------------------
@@ -503,6 +789,64 @@ def _normalize_levels(raw_levels: Any) -> list[dict[str, Any]]:
     return norm
 
 
+def _family_diversity_violation(
+    state: Any, plan: Any, inventory: dict[str, dict[str, Any]]
+) -> tuple[str, list[str]]:
+    """Reject same-family-only proposals while families remain uncovered.
+
+    Multi-winner steering: when ``state["winners"]`` is non-empty, the next
+    proposal must include at least one knob outside the winners' families
+    (family = inventory ``category``, no new taxonomy) — but ONLY while at
+    least one inventory family remains uncovered by winners. Once every
+    known inventory family is covered (or no family metadata exists at
+    all), the check sunsets so the loop refines the leader instead of
+    idling on compile rejections. Absent/empty winners, unresolvable winner
+    families, or proposal knobs with unknown family all pass through
+    silently.
+    """
+    try:
+        covered = winner_families(state)
+        if not covered:
+            return "", []
+        inventory_families: set[str] = set()
+        for entry in (inventory or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            family = str(entry.get("category", "") or "").strip().lower()
+            if family:
+                inventory_families.add(family)
+        if not inventory_families:
+            return "", []
+        uncovered = inventory_families - covered
+        if not uncovered:
+            return "", []
+        known: set[str] = set()
+        try:
+            specs = plan.knobs if hasattr(plan, "knobs") else []
+        except Exception:  # noqa: BLE001, S110 - bad plan shape passes through
+            return "", []
+        for spec in specs or []:
+            try:
+                name = spec.name if hasattr(spec, "name") else spec.get("name")
+            except Exception:  # noqa: BLE001, S110 - bad spec passes through
+                continue
+            entry = (inventory or {}).get(str(name or "").strip().lower()) or {}
+            family = str(entry.get("category", "") or "").strip().lower()
+            if family:
+                known.add(family)
+        if not known or not known <= covered:
+            return "", []
+        detail = (
+            "family-diversity violation: proposal families "
+            f"{sorted(known)} all covered by winner families "
+            f"{sorted(covered)} (uncovered: {sorted(uncovered)})"
+            " — include >=1 knob outside them"
+        )
+        return detail, [detail]
+    except Exception:  # noqa: BLE001 - diversity check never throws
+        return "", []
+
+
 def _compile_candidate_inner(
     ctx: Any,
     node_input: Any,
@@ -622,22 +966,27 @@ def _compile_candidate_inner(
             prev_map: dict[str, Any] | None = None
             violations: list[str] = []
             violation_errors: list[str] = []
-            # Compounding-DOE: a winner stop is only binding once the LCB
-            # quota is met. While collecting, the controller downgrades a
-            # winner stop to retry (quota_not_met); the stop must then NOT veto
-            # the generator's next proposal, or the campaign can never collect.
+            # Unified quota: a winner stop is never binding on its own. The
+            # controller banks the agreed arm in the winners registry and
+            # keeps screening (register-and-continue); the unified
+            # certified-winner quota ends the campaign via the confident-win
+            # backstop, so the stop must NOT veto the next proposal here or
+            # the campaign spins on compile rejections. Only the attempt cap
+            # keeps a winner stop binding (no post-cap measurement).
             # Futility stops stay binding (the campaign is genuinely over).
-            quota_target = get_success_candidates(state)
-            winners_found = count_success_candidates(state)
             for diag in diags:
                 correction = _correction_str(diag)
                 targets = [str(t) for t in (diag.targets or [])]
                 targets_lower = {t.strip().lower() for t in targets if t.strip()}
                 if correction == "stop":
-                    if (
-                        _stop_reason_str(diag) == "winner"
-                        and winners_found < quota_target
+                    if _stop_reason_str(diag) == "winner" and not _winner_stop_halts(
+                        state
                     ):
+                        # Refine-around-leader: below the attempt cap a winner
+                        # stop is not terminal — skip the halt and let the
+                        # proposal flow to the remaining checks (diversity,
+                        # repeat-hash, adjust/shrink, inventory). Futility
+                        # stops always halt exactly as before.
                         continue
                     violations.append(
                         f"stop: halted by diagnosis ({diag.rationale or 'no rationale'})"
@@ -655,7 +1004,10 @@ def _compile_candidate_inner(
                             f"drop_knob: {', '.join(hit)} must be excluded per diagnosis"
                         )
                 elif correction == "shrink_set":
-                    if last_n is not None and distinct_n >= last_n:
+                    # Floor guard: a single-knob proposal already satisfies
+                    # shrink (cannot go lower), so it measures instead of
+                    # dying on an unsatisfiable "must be fewer" rejection.
+                    if last_n is not None and distinct_n >= last_n and distinct_n > 1:
                         violations.append(
                             "shrink_set violation: proposal has "
                             f"{distinct_n} knobs, must be fewer than last "
@@ -682,8 +1034,24 @@ def _compile_candidate_inner(
                         str(spec.name).strip().lower(): spec.value
                         for spec in plan.knobs
                     }
+                    # Satisfiability guard (enforcement time): targets absent
+                    # from inventory can never be met — skip them here (the
+                    # issue-time guard in diagnosis sync downgrades/filters
+                    # the stored correction). A fully-unknown target list
+                    # is treated as downgraded, never enforced as-is.
+                    try:
+                        inventory_lower = {
+                            str(k).strip().lower() for k in (inventory or {})
+                        }
+                    except Exception:
+                        inventory_lower = set()
+                    known_targets = sorted(
+                        t for t in targets_lower if t in inventory_lower
+                    ) if inventory_lower else sorted(targets_lower)
+                    if not known_targets:
+                        continue
                     problems: list[str] = []
-                    for target in sorted(targets_lower):
+                    for target in known_targets:
                         if target not in new_map:
                             problems.append(f"{target} missing from proposal")
                         elif target in prev_map and str(
@@ -715,6 +1083,22 @@ def _compile_candidate_inner(
                     errors=deduped_e,
                     design_name=exp_name,
                 )
+        # Multi-winner step 3: family-diversity steering. Diagnosis
+        # corrections above keep priority (any diagnosis violation already
+        # returned); this cheap retry only fires on diagnosis-clean,
+        # same-family-only proposals after a winner is registered.
+        try:
+            div_reason, div_errors = _family_diversity_violation(
+                state, plan, inventory
+            )
+        except Exception:  # noqa: BLE001, S110 - diversity never blocks compile
+            div_reason, div_errors = "", []
+        if div_reason:
+            return CompileRejection(
+                reason=div_reason,
+                errors=div_errors,
+                design_name=exp_name,
+            )
         # Wave 2: repeat guard — reject already-seen plan hashes.
         try:
             proposed_hash = plan.plan_hash()
@@ -1249,12 +1633,14 @@ def confirmation_controller(
         route = "retry"
         reason = ""
         gate_info: dict[str, Any] = {}
-        # Compounding-DOE quota: a winner stop is premature while fewer than
-        # `target` arms have cleared the win gate. Same definition of winner
-        # as the winner gate (lcb_pct > min_improvement_pct), read from
-        # history so extra controller visits cannot double-count.
+        # Unified winner quota (single check): the canonical target
+        # (success_candidates/max_winners alias the same quota) against the
+        # unified found count (LCB-clearing history arms plus certified
+        # registry entries, deduplicated by plan hash). The registry FEEDS
+        # the quota; there is no rival quota check.
         target = get_success_candidates(state)
         winners_found = count_success_candidates(state)
+        winner_stop_continue = False
         latest = _latest_diagnosis(state)
         if latest is not None and _correction_str(latest) == "stop":
             # Two-score STOP/NEXT gate: a stop halts only when the diagnosis
@@ -1277,11 +1663,10 @@ def confirmation_controller(
                         agreed, gate = True, "stop_agree_winner"
                 elif stat_p is None or stat_p <= fut_max:
                     agreed, gate = True, "stop_agree_futility"
-            if agreed and stop_reason == "winner" and winners_found < target:
-                # Quota not yet met: a winner stop becomes a continue. Futility
-                # stops still end the run (a dead campaign should not spin).
-                gate = "quota_not_met"
-                agreed = False
+            # No quota downgrade here: an agreed winner always takes the
+            # register-and-continue path below (quota state is reported
+            # truthfully in the continue reason). The unified quota halts the
+            # loop via the backstop, never by vetoing agreement.
             gate_info = {
                 "diag_confidence": diag_conf,
                 "stat_p_win": stat_p,
@@ -1294,20 +1679,73 @@ def confirmation_controller(
                 },
             }
             if agreed:
-                route = "done"
-                reason = "stopped_by_diagnosis"
-            elif gate == "quota_not_met":
-                reason = "quota_not_met"
+                if stop_reason == "futility":
+                    route = "done"
+                    reason = "stopped_by_diagnosis"
+                else:
+                    # Winner agreement: register-and-continue (never an early
+                    # stop). The agreed arm joins the winners registry
+                    # (certified iff it clears the win gate, feeding the
+                    # unified quota) and screening continues so further
+                    # winners can accumulate; the quota halts the loop via
+                    # the confident-win backstop below (or the attempt cap).
+                    # The continue reason stays truthful about quota state:
+                    # quota_not_met while collecting, winner_stop_continue
+                    # once the quota is met but screening continues.
+                    pmean, plcb, is_pass = _latest_confirmed_pass(
+                        state, node_input
+                    )
+                    if is_pass:
+                        _register_winner(state, node_input, pmean, plcb)
+                        winners_found = count_success_candidates(state)
+                    if attempt >= max_attempts:
+                        route = "done"
+                        reason = "attempt_cap"
+                    else:
+                        incumbent_w = (
+                            _update_incumbent(state, node_input, pmean, plcb)
+                            if is_pass
+                            else _latest_incumbent_ref(
+                                state, node_input, pmean, plcb
+                            )
+                        )
+                        leader_w = _leader_label(state, node_input, incumbent_w)
+                        route = "retry"
+                        if winners_found >= target:
+                            reason = (
+                                "winner_stop_continue: leader "
+                                f"{leader_w} mean={pmean:+.2f}% lcb={plcb:+.2f}%"
+                                " - continue screening"
+                            )
+                        else:
+                            # Quota unmet: the agreement stands (gate stays
+                            # stop_agree_winner) but the stop cannot end the
+                            # campaign, so screening continues.
+                            reason = (
+                                "quota_not_met: leader "
+                                f"{leader_w} mean={pmean:+.2f}% lcb={plcb:+.2f}%"
+                                " - continue screening"
+                            )
+                        gate_info = dict(gate_info or {})
+                        gate_info["incumbent"] = dict(incumbent_w)
+                    with contextlib.suppress(Exception):
+                        raw = state.get("winners")
+                        if isinstance(raw, list):
+                            gate_info = dict(gate_info or {})
+                            gate_info["winners"] = list(raw)
+                    winner_stop_continue = True
             else:
                 reason = "diag_stat_disagree"
-        if route == "retry" or reason == "quota_not_met":
-            # Backstop: a latest confident win ends the campaign once the quota
-            # is met. While the quota is unmet the loop keeps collecting, but
-            # the caps below MUST still run — otherwise the campaign can never
-            # exit while collecting (infinite loop).
+        if route == "retry" and not winner_stop_continue:
             mean, lcb, found = _latest_verdict_stats(state, node_input)
+            pmean, plcb, is_pass = _latest_confirmed_pass(state, node_input)
+            if is_pass:
+                _register_winner(state, node_input, pmean, plcb)
+            # Unified quota readiness: certified registry entries already fed
+            # the count above, so one check covers both history and registry.
+            quota_met = count_success_candidates(state) >= target
             if found and mean > 0 and lcb > _min_improvement_pct(state):
-                if winners_found >= target:
+                if quota_met:
                     route = "done"
                     reason = "confident_win_backstop"
                 else:
@@ -1316,56 +1754,21 @@ def confirmation_controller(
                     # lexicographic, the decision's ordering). Generic: no
                     # knob names. Quota-met -> done above is untouched, and the
                     # caps below still run so collecting can always exit.
-                    candidate = _latest_incumbent_ref(state, node_input, mean, lcb)
-                    incumbent: dict[str, Any] = candidate
-                    with contextlib.suppress(Exception):
-                        current = state.get("incumbent")
-                        if isinstance(current, dict):
-                            try:
-                                cur_key = (
-                                    float(current.get("mean", 0.0) or 0.0),
-                                    float(current.get("lcb", 0.0) or 0.0),
-                                )
-                            except (TypeError, ValueError):
-                                cur_key = None
-                            if cur_key is not None and (mean, lcb) <= cur_key:
-                                incumbent = {
-                                    "plan_hash": str(current.get("plan_hash", "") or ""),
-                                    "mean": cur_key[0],
-                                    "lcb": cur_key[1],
-                                }
-                            else:
-                                with contextlib.suppress(Exception):
-                                    state["incumbent"] = dict(candidate)
-                        else:
-                            with contextlib.suppress(Exception):
-                                state["incumbent"] = dict(candidate)
-                    name, _, _ = _describe_arm(node_input, state)
-                    with contextlib.suppress(Exception):
-                        # _describe_arm falls back to "experiment" for
-                        # diagnosis inputs; prefer the verdict row's arm label
-                        # when generic.
-                        if name == "experiment":
-                            row = state.get("last_screen_row")
-                            if isinstance(row, dict):
-                                for key in ("arm", "exp_name", "name"):
-                                    label = str(row.get(key, "") or "").strip()
-                                    if label:
-                                        name = label
-                                        break
-                    leader = str(incumbent.get("plan_hash") or name or "leader")
-                    if reason != "quota_not_met":
-                        # Keep the stop-downgrade reason when present;
-                        # otherwise name the collecting state + leader.
-                        route = "retry"
-                        reason = (
-                            "collecting_success_candidates: leader "
-                            f"{leader} mean={mean:+.2f}% lcb={lcb:+.2f}%"
-                        )
-                    else:
-                        route = "retry"
+                    incumbent = _update_incumbent(state, node_input, mean, lcb)
+                    leader = _leader_label(state, node_input, incumbent)
+                    route = "retry"
+                    reason = (
+                        "collecting_success_candidates: leader "
+                        f"{leader} mean={mean:+.2f}% lcb={lcb:+.2f}%"
+                    )
                     gate_info = dict(gate_info or {})
                     gate_info["incumbent"] = dict(incumbent)
+            elif quota_met:
+                # Quota already banked but the latest verdict is not a
+                # confident win: the campaign is complete (stops screening
+                # past quota instead of running to the attempt cap).
+                route = "done"
+                reason = "quota_met"
             try:
                 rc = int(state.get("retry_same_count", 0) or 0)
             except (TypeError, ValueError):
@@ -1376,17 +1779,69 @@ def confirmation_controller(
             elif attempt >= max_attempts:
                 route = "done"
                 reason = "attempt_cap"
+            with contextlib.suppress(Exception):
+                raw_winners = state.get("winners")
+                if isinstance(raw_winners, list):
+                    gate_info = dict(gate_info or {})
+                    gate_info["winners"] = list(raw_winners)
+        winners_found = count_success_candidates(state)
         gate_info["success_candidates"] = {
             "found": winners_found,
             "target": target,
             "min_improvement_pct": _min_improvement_pct(state),
         }
+        # Handoff rule 1 (disagree overwrite): a retry that overrules a stop
+        # must neutralize the stale stop order, or compile (full-history
+        # enforcement) halts every next proposal for an overruled order.
+        # Downgrade the latest stop to a satisfiable retry_same so the next
+        # round measures; the downgrade rides in the output so
+        # last_controller/controller_history record it. Never throws.
+        stop_overruled = False
+        try:
+            latest_now = _latest_diagnosis(state)
+            if route == "retry" and latest_now is not None and _correction_str(
+                latest_now
+            ) == "stop":
+                try:
+                    from src.knob_tuner.stages.nodes.diagnosis import (
+                        _downgrade_latest as _dg_latest,
+                    )
+                except Exception:
+                    _dg_latest = None  # type: ignore[assignment]
+                if _dg_latest is not None:
+                    if _dg_latest(
+                        state,
+                        "retry_same",
+                        "controller: stop overruled by stats gate",
+                    ):
+                        stop_overruled = True
+                if stop_overruled:
+                    with contextlib.suppress(Exception):
+                        _sync_prompt_constraints(state)
+                    with contextlib.suppress(Exception):
+                        _refresh_memory(state)
+                    gate_info = dict(gate_info or {})
+                    gate_info["stop_overruled"] = True
+                    gate_info["overruled_correction"] = "stop"
+                    gate_info["downgraded_correction"] = "retry_same"
+        except Exception:  # noqa: BLE001, S110 - overwrite never blocks routing
+            stop_overruled = False
         with contextlib.suppress(Exception):
             ctx.route = route
+        with contextlib.suppress(Exception):
+            if "winners" not in gate_info:
+                raw = state.get("winners")
+                if isinstance(raw, list):
+                    gate_info = dict(gate_info or {})
+                    gate_info["winners"] = list(raw)
+        out_max_winners = 3
+        with contextlib.suppress(Exception):
+            out_max_winners = get_max_winners(state)
         out: dict[str, Any] = {
             # R3: canonical-only (legacy "attempt" mirror deleted).
             "validation_attempt_count": attempt,
             "max_attempts": max_attempts,
+            "max_winners": out_max_winners,
             "route": route,
             "status": status_label,
             "experiment_history": list(experiment_history),

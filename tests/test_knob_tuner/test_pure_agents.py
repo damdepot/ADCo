@@ -90,3 +90,14 @@ def test_prompts_contain_no_write_tool_references():
         assert prompt_text.strip(), "prompt must not be empty"
         for banned in _FORBIDDEN_PROMPT_STRINGS:
             assert banned not in prompt_text, f"prompt references {banned!r}"
+
+
+def test_candidate_prompt_keeps_campaign_guidance_with_20_cap():
+    # Unified prompt: the compounding campaign directive stays (EXPLOIT+EXPLORE
+    # seeds from the confirmed building blocks at 2-4 knobs) under the hard
+    # 20-knob cap.
+    text = gen_prompt_mod.CANDIDATE_GENERATOR_PROMPT
+    assert "at most 20 distinct knobs" in text
+    assert "1-4 knobs" not in text
+    assert "campaign directive" in text
+    assert "2-4 knobs" in text

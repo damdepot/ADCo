@@ -43,6 +43,9 @@ DEFAULT_MAX_ATTEMPTS: int = 20
 #: premature while fewer than this many candidates have cleared the win gate.
 DEFAULT_SUCCESS_CANDIDATES: int = 10
 
+#: Default maximum certified winners before the loop stops.
+DEFAULT_MAX_WINNERS: int = 3
+
 #: Default cap on distinct knobs per experiment proposal.
 DEFAULT_MAX_SET_KNOBS: int = 20
 
@@ -140,23 +143,65 @@ def get_max_attempts(state: Any) -> int:
         return DEFAULT_MAX_ATTEMPTS
 
 
-def get_success_candidates(state: Any) -> int:
-    """Return the winner-quota target (default :data:`DEFAULT_SUCCESS_CANDIDATES`).
+def _resolve_quota_target(state: Any) -> int:
+    """Return the unified winner-quota target (never throws).
 
-    Floored at 1 so a campaign always requires at least one confirmed winner
-    before a winner stop is permitted; a missing/``None`` entry falls back to
-    the default.
+    ``success_candidates`` is canonical; ``max_winners`` is a working alias
+    onto the same quota (both CLI flags feed one state value). The effective
+    target is the max over the keys actually present, so either flag can set
+    the bar in hand-built states; absent/unparseable keys fall back to
+    :data:`DEFAULT_SUCCESS_CANDIDATES`. Floored at 1 so a campaign always
+    requires at least one certified winner before a winner stop is complete.
     """
     try:
         getter = getattr(state, "get", None)
-        raw = (
-            getter(SUCCESS_CANDIDATES_STATE_KEY, DEFAULT_SUCCESS_CANDIDATES)
-            if callable(getter)
-            else DEFAULT_SUCCESS_CANDIDATES
-        )
-        return max(1, int(raw or DEFAULT_SUCCESS_CANDIDATES))
-    except (TypeError, ValueError):
+        if not callable(getter):
+            return DEFAULT_SUCCESS_CANDIDATES
+        values: list[int] = []
+        for key in (SUCCESS_CANDIDATES_STATE_KEY, "max_winners"):
+            try:
+                raw = getter(key, None)
+            except Exception:
+                continue
+            if raw is None:
+                continue
+            try:
+                text = str(raw).strip()
+            except Exception:
+                continue
+            if not text:
+                continue
+            try:
+                parsed = int(float(text))
+            except (TypeError, ValueError):
+                continue
+            if parsed == 0:
+                # A zero quota is meaningless (same as unset): fall back to
+                # the default rather than flooring to 1.
+                continue
+            values.append(parsed)
+        if not values:
+            return DEFAULT_SUCCESS_CANDIDATES
+        return max(1, max(values))
+    except Exception:
         return DEFAULT_SUCCESS_CANDIDATES
+
+
+def get_success_candidates(state: Any) -> int:
+    """Return the winner-quota target (default :data:`DEFAULT_SUCCESS_CANDIDATES`).
+
+    Canonical reader for the unified quota (see :func:`_resolve_quota_target`).
+    """
+    return _resolve_quota_target(state)
+
+
+def get_max_winners(state: Any) -> int:
+    """Return the winner quota (alias onto :func:`get_success_candidates`).
+
+    ``max_winners`` maps onto the same quota as ``success_candidates``
+    (single check, single target); both readers agree by construction.
+    """
+    return _resolve_quota_target(state)
 
 
 def get_min_improvement_pct(state: Any) -> float:

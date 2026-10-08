@@ -163,26 +163,226 @@ def _last_verdict_pwin(row: dict[str, Any]) -> str:
     return "n/a"
 
 
-def _incumbent_lines(rows: list[dict[str, Any]]) -> list[str]:
+def _incumbent_lines(
+    rows: list[dict[str, Any]], families: set[str] | None = None
+) -> list[str]:
     """One-line incumbent-leader anchor for post-win steering (never throws).
 
     Picks the confirmed row with the best mean delta; empty when there is
     no confirmed winner yet (absent leader = generator screens normally).
+    When ``families`` is non-empty, names the covered winner families so
+    the generator can steer the next proposal outside them.
     """
     try:
         confirmed = [r for r in rows if isinstance(r, dict) and r.get("confirmed")]
         if not confirmed:
             return []
         best = max(confirmed, key=lambda r: _num(r.get("mean_delta_pct")))
-        return [
+        line = (
             f"Incumbent leader: {best.get('name', '?')} "
             f"[{best.get('phase', '?')}] "
             f"knobs={best.get('n_knobs', '?')} "
             f"mean={_fmt_pct(best.get('mean_delta_pct'))} "
             f"(vary around it; never re-propose its exact set)"
-        ]
+        )
+        covered = sorted(f for f in (families or set()) if str(f).strip())
+        if covered:
+            line += (
+                f" Winner families covered: {', '.join(covered)} "
+                f"— include ≥1 knob outside them"
+            )
+        return [line]
     except Exception:  # noqa: BLE001 - bundle must never throw
         return []
+
+
+def _knob_family_map(knobs_info: Any) -> dict[str, str]:
+    """Index ``{lower knob name: normalized family}`` from inventory.
+
+    Family reuses the inventory ``category`` field (no new taxonomy);
+    empty/missing categories map to ``""`` (unknown). Never throws.
+    """
+    families: dict[str, str] = {}
+    try:
+        if not isinstance(knobs_info, list):
+            return families
+        for entry in knobs_info:
+            if isinstance(entry, dict):
+                name, category = entry.get("name"), entry.get("category", "")
+            elif hasattr(entry, "model_dump"):
+                try:
+                    dumped = entry.model_dump()
+                except Exception:  # noqa: BLE001, S110 - bad dumpables skip
+                    continue
+                if not isinstance(dumped, dict):
+                    continue
+                name, category = dumped.get("name"), dumped.get("category", "")
+            else:
+                name, category = getattr(entry, "name", None), getattr(
+                    entry, "category", ""
+                )
+            if name is None:
+                continue
+            families[str(name).strip().lower()] = str(category or "").strip().lower()
+    except Exception:  # noqa: BLE001 - family lookup never throws
+        pass
+    return families
+
+
+def _names_from_knob_list(value: Any) -> list[str]:
+    """Collect knob names from a knob-spec list (never throws)."""
+    names: list[str] = []
+    try:
+        if not isinstance(value, list):
+            return names
+        for spec in value:
+            if isinstance(spec, str):
+                if spec.strip():
+                    names.append(spec.strip())
+            elif isinstance(spec, dict):
+                for key in ("name", "knob", "knob_name"):
+                    raw = spec.get(key)
+                    if isinstance(raw, str) and raw.strip():
+                        names.append(raw.strip())
+                        break
+            elif hasattr(spec, "model_dump"):
+                try:
+                    dumped = spec.model_dump()
+                except Exception:  # noqa: BLE001, S110 - bad dumpables skip
+                    continue
+                if isinstance(dumped, dict):
+                    for key in ("name", "knob", "knob_name"):
+                        raw = dumped.get(key)
+                        if isinstance(raw, str) and raw.strip():
+                            names.append(raw.strip())
+                            break
+            else:
+                raw = getattr(spec, "name", getattr(spec, "knob", None))
+                if isinstance(raw, str) and raw.strip():
+                    names.append(raw.strip())
+    except Exception:  # noqa: BLE001 - name extraction never throws
+        pass
+    return names
+
+
+def _plan_knobs_for_arm(state: Any, arm: str) -> list[str]:
+    """Resolve an arm name to knob names via plan_hash join (never throws).
+
+    ``experiment_history`` rows carry the arm name + ``plan_hash`` but no
+    knob list; ``candidates``/``all_rows``/``last_screen_row`` carry the
+    plan dumps. Joins on ``plan_hash``; ``[]`` when unresolvable.
+    """
+    try:
+        get = getattr(state, "get", None)
+        if not callable(get) or not arm:
+            return []
+        want = arm.strip()
+        plan_hash = ""
+        hist = get("experiment_history")
+        if isinstance(hist, list):
+            for row in hist:
+                if not isinstance(row, dict):
+                    continue
+                for key in ("arm", "name", "exp_name"):
+                    if str(row.get(key) or "").strip() == want:
+                        plan_hash = str(row.get("plan_hash") or "")
+                        break
+                if plan_hash:
+                    break
+        if not plan_hash:
+            return []
+        pools: list[Any] = [get("candidates"), get("all_rows")]
+        last = get("last_screen_row")
+        if isinstance(last, dict):
+            pools.append([last])
+        for pool in pools:
+            if not isinstance(pool, list):
+                continue
+            for entry in pool:
+                if not isinstance(entry, dict) or entry.get("plan_hash") != plan_hash:
+                    continue
+                plan = entry.get("plan")
+                knobs = plan.get("knobs") if isinstance(plan, dict) else None
+                names = _names_from_knob_list(knobs)
+                if names:
+                    return names
+    except Exception:  # noqa: BLE001 - arm resolution never throws
+        pass
+    return []
+
+
+def winner_families(state: Any) -> set[str]:
+    """Return families covered by registered winners (never throws).
+
+    Reads ``state["winners"]`` (registered by the multi-winner selector;
+    absent/empty means no steering). Entries may be knob-name strings or
+    dicts carrying knob lists (``knobs``/``levels``/``valid_knobs``/
+    ``knob_names``/``knob_list``/``verified_knobs`` keys, a ``plan`` dump,
+    a single ``knob``), a precomputed ``family``/``category`` label, or arm
+    references (``arm``/``exp_name``/``name`` resolved via history join).
+    Families come from the inventory ``category`` field; knobs with
+    unknown/missing family are skipped (pass-through, never throw).
+    """
+    try:
+        get = getattr(state, "get", None)
+        if not callable(get):
+            return set()
+        winners = get("winners")
+        if not isinstance(winners, list) or not winners:
+            return set()
+        family_of = _knob_family_map(get("knobs_info"))
+        covered: set[str] = set()
+        names: list[str] = []
+        arms: list[str] = []
+        for entry in winners:
+            if isinstance(entry, str):
+                if entry.strip():
+                    names.append(entry.strip())
+                continue
+            if not isinstance(entry, dict):
+                continue
+            for key in ("family", "knob_family", "category", "knob_category"):
+                raw_family = entry.get(key)
+                if isinstance(raw_family, str) and raw_family.strip():
+                    covered.add(raw_family.strip().lower())
+            for key in (
+                "knobs",
+                "levels",
+                "valid_knobs",
+                "knob_names",
+                "knob_list",
+                "verified_knobs",
+            ):
+                names.extend(_names_from_knob_list(entry.get(key)))
+            plan = entry.get("plan")
+            if isinstance(plan, dict):
+                names.extend(_names_from_knob_list(plan.get("knobs")))
+            elif isinstance(plan, list):
+                names.extend(_names_from_knob_list(plan))
+            single = entry.get("knob", entry.get("knob_name"))
+            if isinstance(single, str) and single.strip():
+                names.append(single.strip())
+            for key in ("arm", "exp_name", "design_name"):
+                raw = entry.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    arms.append(raw.strip())
+            # Bare {"name": ...} is ambiguous (arm vs knob): treat as an
+            # arm only when it is not a known knob name.
+            raw_name = entry.get("name")
+            if isinstance(raw_name, str) and raw_name.strip():
+                if raw_name.strip().lower() in family_of:
+                    names.append(raw_name.strip())
+                else:
+                    arms.append(raw_name.strip())
+        for arm in arms:
+            names.extend(_plan_knobs_for_arm(state, arm))
+        for n in names:
+            family = family_of.get(n.strip().lower())
+            if family:
+                covered.add(family)
+        return covered
+    except Exception:  # noqa: BLE001 - winner lookup never throws
+        return set()
 
 
 def _last_verdict_lines(state: Mapping[str, Any]) -> list[str]:
@@ -236,6 +436,34 @@ def _winners_line(state: Mapping[str, Any]) -> str:
     return f"Winners {found}/{target} (lcb >= {_num(min_pct):.1f}%)"
 
 
+def _last_rejection_lines(state: Mapping[str, Any]) -> list[str]:
+    """Render the last compile rejection as fix-first feedback (never throws)."""
+    try:
+        rej = state.get("last_rejection") if isinstance(state, Mapping) else None
+        if hasattr(rej, "model_dump"):
+            try:
+                rej = rej.model_dump()
+            except Exception:
+                return []
+        if not isinstance(rej, dict):
+            return []
+        reason = str(rej.get("reason", "") or "").strip()
+        errors = rej.get("errors") or []
+        if not isinstance(errors, list):
+            errors = [errors]
+        errors = [str(e).strip() for e in errors if str(e).strip()][:2]
+        design = str(rej.get("design_name", "") or "").strip()
+        if not reason and not errors:
+            return []
+        lines = ["### Last compile rejection (fix THIS violation first)"]
+        head = f"- {design}: {reason}" if design else f"- {reason}"
+        lines.append(head or "- rejected")
+        lines.extend(f"  - {e}" for e in errors)
+        return lines
+    except Exception:  # noqa: BLE001 - bundle must never throw
+        return []
+
+
 def build_evidence_bundle(state: Mapping[str, Any] | None) -> str:
     """Render a capped markdown evidence bundle from a state mapping."""
     try:
@@ -260,7 +488,9 @@ def build_evidence_bundle(state: Mapping[str, Any] | None) -> str:
         detail_head = ["### Last experiments (detail, last 2)"]
         detail = _detail_lines(rows) or ["- none yet."]
         verdict_head = ["### Last verdict"]
-        verdict = _last_verdict_lines(state) + _incumbent_lines(rows)
+        verdict = _last_verdict_lines(state) + _incumbent_lines(
+            rows, winner_families(state)
+        )
         rejected_head = ["### Rejected notes"]
         # History table is the first thing truncated; rejected notes second.
         table = (
@@ -280,15 +510,24 @@ def build_evidence_bundle(state: Mapping[str, Any] | None) -> str:
         if omitted:
             table.append(f"... +{omitted} older run(s) omitted (cap {MAX_BUNDLE_LINES} lines)")
         notes = [f"- {r}" for r in rejected[-5:]] or ["- none."]
+        last_rej = _last_rejection_lines(state if isinstance(state, Mapping) else {})
         while (
             len(head) + len(table) + len(detail_head) + len(detail)
             + len(verdict_head) + len(verdict) + len(rejected_head)
             + len(notes) > MAX_BUNDLE_LINES and len(notes) > 1
         ):
             del notes[0]
+        # Rejection feedback is additive context (never drops history rows);
+        # trim its detail lines first when over the cap.
+        while (
+            len(head) + len(table) + len(detail_head) + len(detail)
+            + len(verdict_head) + len(verdict) + len(rejected_head)
+            + len(notes) + len(last_rej) > MAX_BUNDLE_LINES and len(last_rej) > 1
+        ):
+            del last_rej[-1]
         lines = (
             head + table + detail_head + detail + verdict_head + verdict
-            + rejected_head + notes
+            + rejected_head + notes + last_rej
         )
         return "\n".join(lines[:MAX_BUNDLE_LINES])
     except Exception as exc:  # noqa: BLE001 - bundle must never throw

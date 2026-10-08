@@ -37,6 +37,7 @@ from src.knob_tuner.contracts import (
     DEFAULT_EARLY_STOP_MIN_REPS,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_SET_KNOBS,
+    DEFAULT_MAX_WINNERS,
     DEFAULT_MEASURE_REPS,
     DEFAULT_MEASURE_SECONDS,
     DEFAULT_MEASURE_WARMUP_SECONDS,
@@ -347,6 +348,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--max-winners",
+        type=int,
+        default=None,
+        help=(
+            "Alias onto the same winner quota as --success-candidates: when "
+            "given, it sets the number of certified winners to collect "
+            f"(default: unset, falls back to --success-candidates; {DEFAULT_MAX_WINNERS} "
+            "is the historical multi-winner default)"
+        ),
+    )
+    parser.add_argument(
         "--min-improvement-pct",
         type=float,
         default=DEFAULT_MIN_IMPROVEMENT_PCT,
@@ -427,9 +439,21 @@ def build_initial_state(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     success_candidates: int = DEFAULT_SUCCESS_CANDIDATES,
     min_improvement_pct: float = DEFAULT_MIN_IMPROVEMENT_PCT,
+    max_winners: int | None = None,
 ) -> dict[str, Any]:
     """Construct the initial session state for the knob tuner workflow."""
     profile = profile or SysbenchProfile()
+    # Unified winner quota: --max-winners maps onto the same quota as
+    # --success-candidates (an explicit --max-winners wins); both state keys
+    # carry the single value so every reader agrees.
+    quota = max(
+        1,
+        int(
+            max_winners
+            if max_winners is not None
+            else (success_candidates or DEFAULT_SUCCESS_CANDIDATES)
+        ),
+    )
     state: dict[str, Any] = {
         "target": target,
         "db_type": db_type,
@@ -448,9 +472,8 @@ def build_initial_state(
         "dry_run": dry_run,
         "validation_attempt_count": 0,
         "max_attempts": max(1, int(max_attempts or DEFAULT_MAX_ATTEMPTS)),
-        "success_candidates": max(
-            1, int(success_candidates or DEFAULT_SUCCESS_CANDIDATES)
-        ),
+        "success_candidates": quota,
+        "max_winners": quota,
         "min_improvement_pct": float(min_improvement_pct),
         "screen_total_rows": int(screen_total_rows),
         "screen_max_rows": int(screen_max_rows),
@@ -528,6 +551,635 @@ def _manifest_from_state(state: dict[str, Any]) -> RunManifest:
     return build_run_manifest(state)
 
 
+def _archive_winners(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the decision's ranked winners table (pure projection).
+
+    Reads the ``winners`` rows recorded in ``candidate_archive`` by the
+    decision node; missing keys degrade to an empty table, never throw.
+    Generic: no knob names.
+    """
+    try:
+        archive = state.get("candidate_archive") or {}
+        if not isinstance(archive, dict):
+            return []
+        winners = archive.get("winners") or []
+        return [dict(w) for w in winners if isinstance(w, dict)]
+    except Exception:
+        return []
+
+
+def _family_coverage(state: dict[str, Any]) -> dict[str, Any]:
+    """Count tried vs inventoried knob families (pure projection).
+
+    The inventory (``knobs_info``) carries each knob's ``category`` family;
+    tried knob names are collected from ``experiment_history`` rows (tolerant
+    key reads plus a ``plan_hash`` join into ``candidates``/``all_rows``
+    plans, plus the per-knob belief keys already attributed in state). No
+    new measurement; missing keys degrade to empty counts, never throw.
+    Generic: no knob names.
+    """
+    try:
+        inventory = state.get("knobs_info") or state.get("available_knobs") or []
+        if not isinstance(inventory, list):
+            inventory = []
+        family_of: dict[str, str] = {}
+        inventory_counts: dict[str, int] = {}
+        for entry in inventory:
+            try:
+                if isinstance(entry, dict):
+                    name = str(entry.get("name") or "").strip().lower()
+                    family = str(entry.get("category") or "").strip() or "uncategorized"
+                elif hasattr(entry, "model_dump"):
+                    dumped = entry.model_dump()
+                    name = str(dumped.get("name") or "").strip().lower()
+                    family = str(dumped.get("category") or "").strip() or "uncategorized"
+                else:
+                    name = str(getattr(entry, "name", "") or "").strip().lower()
+                    family = str(getattr(entry, "category", "") or "").strip() or "uncategorized"
+            except Exception:
+                continue
+            if not name:
+                continue
+            family_of[name] = family
+            inventory_counts[family] = inventory_counts.get(family, 0) + 1
+
+        def _names_from_plan(plan: Any) -> list[str]:
+            try:
+                knobs = plan.get("knobs") if isinstance(plan, dict) else getattr(plan, "knobs", None)
+                if not isinstance(knobs, list):
+                    return []
+                return [
+                    str(spec.get("name") or "").strip().lower()
+                    for spec in knobs
+                    if isinstance(spec, dict) and spec.get("name")
+                ]
+            except Exception:
+                return []
+
+        plans_by_hash: dict[str, Any] = {}
+        for key in ("candidates", "all_rows"):
+            try:
+                for entry in state.get(key) or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("plan_hash") and entry.get("plan") is not None:
+                        plans_by_hash.setdefault(str(entry["plan_hash"]), entry["plan"])
+            except Exception:
+                continue
+
+        tried: set[str] = set()
+        try:
+            history = state.get("experiment_history") or []
+            for row in history if isinstance(history, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                for hkey in ("knobs", "knob_names", "verified_knobs", "targets"):
+                    try:
+                        raw = row.get(hkey) or []
+                        for item in raw if isinstance(raw, list) else []:
+                            name = str(item.get("name") if isinstance(item, dict) else item or "").strip().lower()
+                            if name:
+                                tried.add(name)
+                    except Exception:
+                        continue
+                plan = row.get("plan")
+                if plan is not None:
+                    tried.update(_names_from_plan(plan))
+                try:
+                    phash = row.get("plan_hash")
+                except AttributeError:
+                    phash = None
+                if phash and phash in plans_by_hash:
+                    tried.update(_names_from_plan(plans_by_hash[str(phash)]))
+        except Exception:
+            pass
+        try:
+            beliefs = state.get("knob_beliefs") or {}
+            if isinstance(beliefs, dict):
+                for name in beliefs:
+                    if str(name or "").strip():
+                        tried.add(str(name).strip().lower())
+        except Exception:
+            pass
+
+        tried_counts: dict[str, int] = {}
+        for name in tried:
+            family = family_of.get(name, "uncategorized")
+            tried_counts[family] = tried_counts.get(family, 0) + 1
+        per_category = {
+            family: {"inventory": inventory_counts.get(family, 0), "tried": tried_counts.get(family, 0)}
+            for family in sorted(set(inventory_counts) | set(tried_counts))
+        }
+        return {
+            "per_category": per_category,
+            "categories_covered": sum(1 for counts in per_category.values() if counts["tried"] > 0),
+            "categories_total": len(per_category),
+            "knobs_tried": len(tried),
+            "knobs_inventory": len(family_of),
+        }
+    except Exception:
+        return {
+            "per_category": {},
+            "categories_covered": 0,
+            "categories_total": 0,
+            "knobs_tried": 0,
+            "knobs_inventory": 0,
+        }
+
+
+def _tuning_gate_raw(state: dict[str, Any]) -> float | None:
+    """Return the configured win-gate pct, or None when unrecorded.
+
+    Pure projection: state ``min_improvement_pct`` first, then the decision
+    archive's copy; missing/non-numeric degrades to None, never throws.
+    Generic: no knob names.
+    """
+    try:
+        if not isinstance(state, dict):
+            return None
+        raw = state.get("min_improvement_pct")
+        if raw is None:
+            archive = state.get("candidate_archive") or {}
+            if isinstance(archive, dict):
+                raw = archive.get("min_improvement_pct")
+        if raw is None:
+            return None
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+    except Exception:
+        return None
+
+
+def _tuning_applied(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project applied knobs as ``[{knob, value}]`` (pure; never throws).
+
+    Reads ``live_result.applied_knobs`` with the top-level ``applied_knobs``
+    fallback (mirroring the CLI); entries accept ``knob``/``name`` keys.
+    Generic: no knob names.
+    """
+    try:
+        if not isinstance(state, dict):
+            return []
+        live = _maybe_parse(state.get("live_result", {}))
+        if not isinstance(live, dict):
+            live = {}
+        raw = live.get("applied_knobs") or state.get("applied_knobs") or []
+        if not isinstance(raw, list):
+            return []
+        projected: list[dict[str, Any]] = []
+        for entry in raw:
+            try:
+                if isinstance(entry, dict):
+                    name = entry.get("knob") or entry.get("name") or ""
+                    value = entry.get("value", "")
+                else:
+                    name = str(entry or "")
+                    value = ""
+                name = str(name or "").strip()
+                if not name:
+                    continue
+                projected.append({"knob": name, "value": value})
+            except Exception:
+                continue
+        return projected
+    except Exception:
+        return []
+
+
+def _build_tuning_summary(state: dict[str, Any]) -> dict[str, Any]:
+    """Project the end-of-run tuning summary for result.json (pure).
+
+    Never throws; missing keys degrade to zero/empty counts (the gate falls
+    back to the canonical default). Generic: no knob names.
+    """
+    try:
+        if not isinstance(state, dict):
+            state = {}
+        try:
+            winners = _archive_winners(state)
+        except Exception:
+            winners = []
+        try:
+            history = state.get("experiment_history")
+            hist_rows = list(history) if isinstance(history, list) else []
+        except Exception:
+            hist_rows = []
+        try:
+            rejected = state.get("rejected_history")
+            rejected_len = len(rejected) if isinstance(rejected, list) else 0
+        except Exception:
+            rejected_len = 0
+        try:
+            attempts_total = max(
+                int(state.get("validation_attempt_count") or 0),
+                len(hist_rows) + rejected_len,
+            )
+        except (TypeError, ValueError):
+            attempts_total = len(hist_rows) + rejected_len
+        except Exception:
+            attempts_total = 0
+        try:
+            passed = sum(
+                1
+                for row in hist_rows
+                if isinstance(row, dict)
+                and str(row.get("status", "")).upper() == "PASS"
+                and bool(row.get("confirmed", False))
+            )
+            if not hist_rows and winners:
+                passed = len(winners)
+        except Exception:
+            passed = 0
+        try:
+            certified_count = sum(
+                1 for w in winners if isinstance(w, dict) and bool(w.get("certified", False))
+            )
+        except Exception:
+            certified_count = 0
+        gate = _tuning_gate_raw(state)
+        if gate is None:
+            try:
+                from src.knob_tuner.contracts import DEFAULT_MIN_IMPROVEMENT_PCT
+
+                gate = float(DEFAULT_MIN_IMPROVEMENT_PCT)
+            except Exception:
+                gate = 5.0
+        try:
+            conf_by_round = _diagnosis_confidences_by_round(state)
+        except Exception:
+            conf_by_round = []
+        try:
+            hist_index_by_name: dict[str, int] = {}
+            for idx, row in enumerate(hist_rows):
+                if not isinstance(row, dict):
+                    continue
+                for key in ("arm", "name", "exp_name"):
+                    label = str(row.get(key) or "").strip()
+                    if label and label not in hist_index_by_name:
+                        hist_index_by_name[label] = idx
+                        break
+            llm_confidences: list[float | None] = []
+            for w in winners:
+                try:
+                    wname = str(w.get("name") or "").strip() if isinstance(w, dict) else ""
+                except Exception:
+                    wname = ""
+                idx = hist_index_by_name.get(wname) if wname else None
+                if idx is not None and 0 <= idx < len(conf_by_round):
+                    llm_confidences.append(conf_by_round[idx])
+                else:
+                    llm_confidences.append(None)
+            winner_llm_confidence: float | None = None
+            if winners and llm_confidences:
+                try:
+                    rank1_pos = None
+                    for pos, w in enumerate(winners):
+                        if isinstance(w, dict) and w.get("rank") is not None:
+                            try:
+                                if int(w.get("rank")) == 1:
+                                    rank1_pos = pos
+                                    break
+                            except (TypeError, ValueError):
+                                continue
+                    if rank1_pos is not None and rank1_pos < len(llm_confidences):
+                        winner_llm_confidence = llm_confidences[rank1_pos]
+                    else:
+                        winner_llm_confidence = llm_confidences[0]
+                except Exception:
+                    winner_llm_confidence = None
+        except Exception:
+            llm_confidences = []
+            winner_llm_confidence = None
+        return {
+            "attempts_total": attempts_total,
+            "screens_measured": len(hist_rows),
+            "passed": passed,
+            "certified_count": certified_count,
+            "applied": _tuning_applied(state),
+            "gate_pct": gate,
+            "llm_confidences": llm_confidences,
+            "winner_llm_confidence": winner_llm_confidence,
+        }
+    except Exception:
+        return {
+            "attempts_total": 0,
+            "screens_measured": 0,
+            "passed": 0,
+            "certified_count": 0,
+            "applied": [],
+            "gate_pct": 5.0,
+            "llm_confidences": [],
+            "winner_llm_confidence": None,
+        }
+
+
+def _fmt_pct_or_na(value: Any) -> str:
+    """Format a pct number as ``+x.xx%``, else ``n/a`` (never throws)."""
+    try:
+        if value is None or isinstance(value, bool):
+            return "n/a"
+        number = float(value)
+        if number != number:
+            return "n/a"
+        return f"{number:+.2f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+    except Exception:
+        return "n/a"
+
+
+def _fmt_count_or_na(value: Any) -> str:
+    """Format an int count, else ``n/a`` (never throws)."""
+    try:
+        if value is None or isinstance(value, bool):
+            return "n/a"
+        return str(int(value))
+    except (TypeError, ValueError):
+        return "n/a"
+    except Exception:
+        return "n/a"
+
+
+def _diag_confidence_raw(entry: Any) -> float | None:
+    """Extract a 0..1 diagnosis confidence from one history entry (never throws)."""
+    try:
+        if entry is None or isinstance(entry, bool):
+            return None
+        raw: Any = None
+        if isinstance(entry, dict):
+            raw = entry.get("confidence")
+        elif hasattr(entry, "model_dump"):
+            try:
+                raw = entry.model_dump().get("confidence")
+            except Exception:
+                raw = None
+        else:
+            raw = getattr(entry, "confidence", None)
+        if raw is None or isinstance(raw, bool):
+            return None
+        conf = float(raw)
+        if conf != conf or not (0.0 <= conf <= 1.0):
+            return None
+        return conf
+    except (TypeError, ValueError):
+        return None
+    except Exception:
+        return None
+
+
+def _diagnosis_confidences_by_round(state: dict[str, Any]) -> list[float | None]:
+    """Return per-round diagnosis confidences aligned to experiment_history.
+
+    Join rule: experiment_history row ``i`` joins to diagnosis_history entry
+    ``i`` by round order (0-based index); extra entries on either side are
+    ignored and missing/invalid entries yield ``None``. Never throws.
+    Generic: no knob names.
+    """
+    try:
+        if not isinstance(state, dict):
+            return []
+        hist_raw = state.get("experiment_history")
+        hist_rows = list(hist_raw) if isinstance(hist_raw, list) else []
+        diag_raw = state.get("diagnosis_history")
+        diag_rows = list(diag_raw) if isinstance(diag_raw, list) else []
+        confidences: list[float | None] = []
+        for idx in range(len(hist_rows)):
+            if idx < len(diag_rows):
+                confidences.append(_diag_confidence_raw(diag_rows[idx]))
+            else:
+                confidences.append(None)
+        return confidences
+    except Exception:
+        return []
+
+
+def _fmt_conf_or_na(value: Any) -> str:
+    """Format a 0..1 confidence as ``0.00``-style, else ``n/a`` (never throws)."""
+    try:
+        if value is None or isinstance(value, bool):
+            return "n/a"
+        number = float(value)
+        if number != number or not (0.0 <= number <= 1.0):
+            return "n/a"
+        return f"{number:.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+    except Exception:
+        return "n/a"
+
+
+def _print_tuning_results(state: dict[str, Any]) -> None:
+    """Print the ``=== Tuning Results ===`` end-of-run summary.
+
+    Attempts (measured screens vs total attempts incl. cheap rejections),
+    confirmed-PASS / certified counts, a capped rank table built from
+    ``winners[]`` plus failed arms from ``experiment_history``, the final
+    applied knobs, and a 3-line mean/LCB/LLM-conf gloss. Missing keys render as
+    ``n/a``; never throws. Generic: no knob names.
+    """
+    try:
+        if not isinstance(state, dict):
+            state = {}
+        try:
+            winners = _archive_winners(state)
+            if not isinstance(winners, list):
+                winners = []
+        except Exception:
+            winners = []
+        try:
+            raw_attempt = state.get("validation_attempt_count")
+            attempts = int(raw_attempt) if raw_attempt is not None else None
+        except (TypeError, ValueError):
+            attempts = None
+        except Exception:
+            attempts = None
+        try:
+            hist_raw = state.get("experiment_history")
+            hist_rows = list(hist_raw) if isinstance(hist_raw, list) else None
+        except Exception:
+            hist_rows = None
+        screens = len(hist_rows) if hist_rows is not None else None
+        if hist_rows is not None:
+            try:
+                passed = sum(
+                    1
+                    for row in hist_rows
+                    if isinstance(row, dict)
+                    and str(row.get("status", "")).upper() == "PASS"
+                    and bool(row.get("confirmed", False))
+                )
+            except Exception:
+                passed = 0
+        elif winners:
+            passed = len(winners)
+        else:
+            passed = None
+        gate = _tuning_gate_raw(state)
+        if winners:
+            try:
+                certified = sum(
+                    1
+                    for w in winners
+                    if isinstance(w, dict) and bool(w.get("certified", False))
+                )
+            except Exception:
+                certified = 0
+        elif hist_rows is not None:
+            certified = 0
+        else:
+            certified = None
+
+        print("\n=== Tuning Results ===")
+        print(
+            f"Attempts tried:        {_fmt_count_or_na(screens)} measured screens / "
+            f"{_fmt_count_or_na(attempts)} total attempts (incl. cheap rejections)"
+        )
+        gate_s = f"{gate:.1f}%" if gate is not None else "n/a"
+        print(
+            f"Successful candidates: {_fmt_count_or_na(passed)} confirmed PASS; "
+            f"Certified: {_fmt_count_or_na(certified)} (LCB > {gate_s})"
+        )
+
+        hist_by_name: dict[str, dict[str, Any]] = {}
+        hist_index_by_name: dict[str, int] = {}
+        if hist_rows is not None:
+            for idx, row in enumerate(hist_rows):
+                if not isinstance(row, dict):
+                    continue
+                for key in ("arm", "name", "exp_name"):
+                    label = str(row.get(key) or "").strip()
+                    if label:
+                        hist_by_name.setdefault(label, row)
+                        if label not in hist_index_by_name:
+                            hist_index_by_name[label] = idx
+                        break
+        try:
+            conf_by_round = _diagnosis_confidences_by_round(state)
+        except Exception:
+            conf_by_round = []
+        def _conf_for_hist_idx(idx: Any) -> str:
+            try:
+                if idx is None or isinstance(idx, bool):
+                    return "n/a"
+                pos = int(idx)
+                if 0 <= pos < len(conf_by_round):
+                    return _fmt_conf_or_na(conf_by_round[pos])
+                return "n/a"
+            except (TypeError, ValueError):
+                return "n/a"
+            except Exception:
+                return "n/a"
+        listed: set[str] = set()
+        table: list[dict[str, str]] = []
+        for w in winners:
+            if not isinstance(w, dict):
+                continue
+            name = str(w.get("name") or "").strip() or "n/a"
+            hist = hist_by_name.get(name, {})
+            status = str(hist.get("status", "") or "").upper() if hist else "PASS"
+            if not status:
+                status = "n/a"
+            rank_raw = w.get("rank")
+            try:
+                rank_s = str(int(rank_raw)) if rank_raw is not None else "-"
+            except (TypeError, ValueError):
+                rank_s = "-"
+            except Exception:
+                rank_s = "-"
+            try:
+                n_knobs = w.get("n_knobs")
+                if n_knobs is None and hist:
+                    n_knobs = hist.get("n_knobs")
+                knobs_s = str(int(n_knobs)) if n_knobs is not None else "n/a"
+            except (TypeError, ValueError):
+                knobs_s = "n/a"
+            except Exception:
+                knobs_s = "n/a"
+            table.append(
+                {
+                    "rank": rank_s,
+                    "name": name,
+                    "knobs": knobs_s,
+                    "mean": _fmt_pct_or_na(w.get("mean")),
+                    "lcb": _fmt_pct_or_na(w.get("lcb")),
+                    "status": status,
+                    "certified": "yes" if bool(w.get("certified", False)) else "no",
+                    # Join rule: experiment_history row i joins to
+                    # diagnosis_history entry i by round order (index-based,
+                    # length-mismatch tolerant); missing/invalid renders n/a.
+                    "llm_conf": _conf_for_hist_idx(hist_index_by_name.get(name)),
+                }
+            )
+            listed.add(name)
+        if hist_rows is not None:
+            for pos, row in enumerate(hist_rows):
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("status", "")).upper() == "PASS":
+                    continue
+                name = ""
+                for key in ("arm", "name", "exp_name"):
+                    label = str(row.get(key) or "").strip()
+                    if label:
+                        name = label
+                        break
+                if not name:
+                    name = "n/a"
+                if name in listed:
+                    continue
+                listed.add(name)
+                try:
+                    knobs_s = (
+                        str(int(row.get("n_knobs")))
+                        if row.get("n_knobs") is not None
+                        else "n/a"
+                    )
+                except (TypeError, ValueError):
+                    knobs_s = "n/a"
+                except Exception:
+                    knobs_s = "n/a"
+                status = str(row.get("status", "") or "").upper() or "n/a"
+                table.append(
+                    {
+                        "rank": "-",
+                        "name": name,
+                        "knobs": knobs_s,
+                        "mean": _fmt_pct_or_na(row.get("mean_delta_pct")),
+                        "lcb": _fmt_pct_or_na(row.get("lcb_pct")),
+                        "status": status,
+                        "certified": "no",
+                        # Join rule: experiment_history row i joins to
+                        # diagnosis_history entry i by round order
+                        # (index-based, length-mismatch tolerant).
+                        "llm_conf": _conf_for_hist_idx(pos),
+                    }
+                )
+        table = table[:10]
+        print("Candidates (top 10): rank, name, knobs, mean%, LCB%, status, certified, LLM conf")
+        if table:
+            for row in table:
+                print(
+                    f"  {row['rank']:<4} {row['name']:<24} {row['knobs']:<5} "
+                    f"{row['mean']:<9} {row['lcb']:<9} {row['status']:<6} {row['certified']:<8} {row.get('llm_conf', 'n/a')}"
+                )
+        else:
+            print("  n/a (no candidates recorded)")
+
+        applied = _tuning_applied(state)
+        print("Final knobs applied:")
+        if applied:
+            for spec in applied:
+                print(f"  {spec.get('knob')} = {spec.get('value')}")
+        else:
+            print("  none")
+        print("mean% = average measured speedup vs baseline;")
+        print("LCB% = pessimistic bound (95% sure the true gain is at least this).")
+        print("LLM conf = diagnosing agent's confidence in its round assessment (0-1), not a success probability.")
+    except Exception:
+        pass
+
+
 def _write_output_result(output_path: str, state: dict[str, Any]) -> None:
     """Serialize the combined tuning outcome to *output_path*."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -561,6 +1213,9 @@ def _write_output_result(output_path: str, state: dict[str, Any]) -> None:
         "knob_recommender_output": recommender_out,
         "validation_attestation": validation_out,
         "live_result": live_out,
+        "winners": _archive_winners(state),
+        "family_coverage": _family_coverage(state),
+        "tuning_summary": _build_tuning_summary(state),
         "outputs": {
             "db_inspector": db_inspector_out,
             "intent_analyzer": db_inspector_out,
@@ -624,6 +1279,7 @@ async def run_pipeline(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     success_candidates: int = DEFAULT_SUCCESS_CANDIDATES,
     min_improvement_pct: float = DEFAULT_MIN_IMPROVEMENT_PCT,
+    max_winners: int | None = None,
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using the ADK Runner and session service."""
     # 1. Resource contract FIRST: fail before any side effect.
@@ -702,6 +1358,7 @@ async def run_pipeline(
         max_attempts=max_attempts,
         success_candidates=success_candidates,
         min_improvement_pct=min_improvement_pct,
+        max_winners=max_winners,
     )
 
     initial_state["verbose"] = verbose
@@ -910,6 +1567,7 @@ def main() -> None:
                 max_attempts=args.max_attempts,
                 success_candidates=args.success_candidates,
                 min_improvement_pct=args.min_improvement_pct,
+                max_winners=args.max_winners,
             )
         )
     except Exception as exc:
@@ -991,6 +1649,11 @@ def main() -> None:
             print("No restart is required (nothing was applied).")
     else:
         print("No database restart is required.")
+
+    try:
+        _print_tuning_results(result)
+    except Exception:
+        pass
 
     # Phase 1.6: the exit code follows the real status. A failed validation
     # is a failure even in dry-run mode (dry-run only skips mutations).

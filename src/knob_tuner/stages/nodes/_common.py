@@ -283,16 +283,61 @@ def _plan_knob_names(plan: Any) -> set[str]:
     return names
 
 
+def _registry_certified_hashes(state: Any) -> tuple[set[str], int]:
+    """Split certified registry entries into hashed vs hashless (never throws).
+
+    Certification uses the same rule as the winner gate: an explicit
+    ``certified`` flag is trusted, otherwise ``lcb > min_improvement_pct``.
+    Returns ``(non_empty_plan_hashes, hashless_count)``.
+    """
+    hashes: set[str] = set()
+    hashless = 0
+    try:
+        threshold = get_min_improvement_pct(state)
+        raw = state.get("winners") if hasattr(state, "get") else None
+        if not isinstance(raw, list):
+            return hashes, hashless
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            flag = entry.get("certified")
+            if flag is not None:
+                certified = bool(flag)
+            else:
+                try:
+                    lcb = entry.get("lcb")
+                    certified = bool(lcb is not None and float(lcb) > float(threshold))
+                except (TypeError, ValueError):
+                    certified = False
+            if not certified:
+                continue
+            plan_hash = entry.get("plan_hash")
+            text = str(plan_hash).strip() if plan_hash is not None else ""
+            if text:
+                hashes.add(text)
+            else:
+                hashless += 1
+    except Exception:
+        pass
+    return hashes, hashless
+
+
 def count_success_candidates(state: Any) -> int:
-    """Count LCB-clearing winner rows in ``experiment_history``.
+    """Count distinct LCB-clearing winner arms (unified quota progress).
 
     A success candidate is a screen row whose ``lcb_pct`` exceeds the current
-    ``min_improvement_pct`` — the SAME definition the winner gate uses, so
-    "winner" has one meaning in the codebase. Pure read of persisted history;
-    no counter, so extra controller visits cannot double-count. Never throws.
+    ``min_improvement_pct`` — the SAME definition the winner gate uses — plus
+    every certified winners-registry entry (a certified entry counts toward
+    the quota even before its history row is considered). Both sides feed one
+    count, deduplicated by ``plan_hash`` so an arm registered AND recorded
+    is never double-counted; hashless rows/entries use ``max`` for the same
+    reason. Pure read of persisted state; extra controller visits cannot
+    double-count. Never throws. With no registry present this is exactly the
+    history count (base behavior unchanged).
     """
     threshold = get_min_improvement_pct(state)
-    count = 0
+    hist_hashes: set[str] = set()
+    hashless_hist = 0
     try:
         hist = state.get("experiment_history") if hasattr(state, "get") else None
         if isinstance(hist, list):
@@ -307,10 +352,16 @@ def count_success_candidates(state: Any) -> int:
                 except (TypeError, ValueError):
                     continue
                 if lcb > threshold:
-                    count += 1
+                    plan_hash = entry.get("plan_hash")
+                    text = str(plan_hash).strip() if plan_hash is not None else ""
+                    if text:
+                        hist_hashes.add(text)
+                    else:
+                        hashless_hist += 1
     except Exception:
         return 0
-    return count
+    reg_hashes, hashless_reg = _registry_certified_hashes(state)
+    return len(hist_hashes | reg_hashes) + max(hashless_hist, hashless_reg)
 
 
 def _cleared_knob_sets(state: Any) -> list[set[str]]:

@@ -35,7 +35,7 @@ Decide FIRST whether the campaign should halt (correction `stop`, targets empty)
   (b) Futility: the trend is flat/negative across attempts with fewer than 2 attempts left (Attempt line vs cap), OR the same design fails repeatedly with identical reasons (repeat-hash / same-error-text notes in the rejected history). Set `stop_reason` to "futility".
 - For every NEXT correction, `stop_reason` stays "futility" (it is only read on `stop`).
 - Otherwise NEXT: emit exactly one of shrink_set, change_phase, drop_knob, adjust_value, retry_same with the knob names it applies to (targets; empty list allowed only for retry_same):
-  - shrink_set: the set was too broad to attribute; retry with fewer knobs.
+  - shrink_set: the set was too broad to attribute; retry with fewer knobs. NEVER emit shrink_set at the shrink floor — when the last experiment's n_knobs <= 1 (single-knob set, or no history showing more than one knob) fewer is unsatisfiable. Fallback priority there: drop_knob (a named knob is hopeless/unsafe) > adjust_value (direction/step suspect) > retry_same (noise/flake) > stop (futility, no movers left).
   - change_phase: the phase was wrong for this stage (e.g. screening when refinement was due).
   - drop_knob: one or more named knobs are hopeless or unsafe; exclude them next round.
   - adjust_value: named knobs moved in the wrong direction or with too large a step.
@@ -70,6 +70,6 @@ Before returning, verify:
 - [ ] Targets contain knob names only — no values, levels, ranges, or settings appear anywhere.
 - [ ] No run verdicts issued — the output prescribes a strategy, not an outcome.
 - [ ] Rationale cites the specific evidence-bundle rows/columns (or rejected-history entries when the bundle is absent) behind the classification.
-- [ ] Resource line checked: RAM pressure routes to shrink_set.
+- [ ] Resource line checked: RAM pressure routes to shrink_set (unless at the shrink floor, n_knobs <= 1, where the fallback priority above applies).
 - [ ] Nothing persisted anywhere: the structured diagnosis is the sole output.
 """
