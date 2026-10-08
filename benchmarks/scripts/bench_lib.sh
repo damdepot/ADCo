@@ -84,6 +84,68 @@ bench_arm() {
     bench_measure "${optimized_dir}" "${tag}_${run_id}.csv"
 }
 
+# Snapshot a pristine dataset once so multi-arm runs load only once.
+# bench_snapshot <db> <seed>: CHECKPOINT, settle, then
+#   CREATE DATABASE <seed> TEMPLATE <db>. The template stays untouched;
+#   per-arm resets recreate <db> from it in seconds.
+# bench_restore <db> <seed>: DROP + recreate <db> from <seed>, then
+#   checkpoint and settle so measurement starts from identical data.
+# Knob settings (postgresql.auto.conf) are cluster-level and survive both.
+bench_snapshot() {
+    local db="$1"
+    local seed="$2"
+    "${BENCH_CMDDOCKER}" Checkpoint "${BENCH_DB_CONTAINER}"
+    bench_settle
+    psql -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname IN ('${db}', '${seed}') AND pid <> pg_backend_pid();"
+    psql -d postgres -c "DROP DATABASE IF EXISTS \"${seed}\" WITH (FORCE);"
+    psql -d postgres -c "CREATE DATABASE \"${seed}\" TEMPLATE \"${db}\";"
+}
+
+bench_restore() {
+    local db="$1"
+    local seed="$2"
+    psql -d postgres -c "DROP DATABASE IF EXISTS \"${db}\" WITH (FORCE);"
+    psql -d postgres -c "CREATE DATABASE \"${db}\" TEMPLATE \"${seed}\";"
+    "${BENCH_CMDDOCKER}" Checkpoint "${BENCH_DB_CONTAINER}"
+    bench_settle
+}
+
+# Load the dataset exactly once for a whole run, then snapshot it for fast
+# per-arm restores. Replaces N slow loader passes with one.
+# bench_seed_once <db> <seed>
+bench_seed_once() {
+    local db="$1"
+    local seed="$2"
+    local run_id="${RUN_ID:?RUN_ID must be set before bench_seed_once}"
+    bench_reset
+    bench_load "load_seed_${run_id}.csv"
+    bench_snapshot "${db}" "${seed}"
+}
+
+# Measure one arm from an already-snapshotted seed (see bench_seed_once).
+# bench_arm_from_seed <tag> <dir> <db> <seed> [tool_fn]
+# Same symmetry as bench_arm (identical data + cold buffers per arm) with
+# restore -> [tool -> restore] -> restart -> measure instead of reset ->
+# load -> tool -> restart -> clean reload -> measure. The post-tool restore
+# keeps tool screening writes out of measurement.
+bench_arm_from_seed() {
+    local tag="$1"
+    local optimized_dir="$2"
+    local db="$3"
+    local seed="$4"
+    local tool_fn="${5:-}"
+    local run_id="${RUN_ID:?RUN_ID must be set before bench_arm_from_seed}"
+
+    bench_restore "${db}" "${seed}"
+    if [ -n "${tool_fn}" ]; then
+        "${tool_fn}"
+        bench_restore "${db}" "${seed}"
+    fi
+    "${BENCH_CMDDOCKER}" Restart "${BENCH_DB_CONTAINER}"
+    "${BENCH_CMDDOCKER}" WaitFor "${BENCH_DB_CONTAINER}"
+    bench_measure "${optimized_dir}" "${tag}_${run_id}.csv"
+}
+
 psql() {
     docker exec -i -u postgres "${BENCH_DB_CONTAINER}" psql -v ON_ERROR_STOP=1 -q "$@"
 }

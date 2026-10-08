@@ -21,6 +21,11 @@ RESULTS_DIR="${ROOT}/results/smallbank"
 mkdir -p "${RESULTS_DIR}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 
+# Pristine dataset snapshot: loaded once, restored per arm in seconds.
+# Knob settings live in postgresql.auto.conf and survive the restore, so the
+# restore resets data only, not tuning.
+SEED_DB="${db_name}_seed"
+
 run_aco_tool() {
     "${CMDRunACo}" "${dir_name}" "${db_type}" "${db_name}"
 }
@@ -39,21 +44,27 @@ run_adco_tool() {
     fi
 }
 
-# ── Shared baseline, measured once via the symmetric protocol (no tool) ──
-echo "----------------->> Baseline <<-----------------"
-bench_arm "baseline" "baseline"
+# Load the dataset exactly once, then snapshot it. All four arms restore from
+# the snapshot instead of reloading: identical data, cold buffers per arm, one
+# slow load instead of eight.
+echo "----------------->> Seed (load once + snapshot) <<-----------------"
+bench_seed_once "${db_name}" "${SEED_DB}"
 
-# ── ACo (rewrite-only; same symmetric protocol) ──
+# ── Shared baseline, measured once (no tool) ──
+echo "----------------->> Baseline <<-----------------"
+bench_arm_from_seed "baseline" "baseline" "${db_name}" "${SEED_DB}"
+
+# ── ACo (rewrite-only) ──
 echo "----------------->> ACo <<-----------------"
-bench_arm "aco" "smallbank_aco" run_aco_tool
+bench_arm_from_seed "aco" "smallbank_aco" "${db_name}" "${SEED_DB}" run_aco_tool
 
 # ── DCo (tunes knobs; optimized arm runs the original app) ──
 echo "----------------->> DCo <<-----------------"
-bench_arm "dco" "baseline" run_dco_tool
+bench_arm_from_seed "dco" "baseline" "${db_name}" "${SEED_DB}" run_dco_tool
 
 # ── ADCo (rewrites the app and tunes knobs) ──
 echo "----------------->> ADCo <<-----------------"
-bench_arm "adco" "smallbank_adco" run_adco_tool
+bench_arm_from_seed "adco" "smallbank_adco" "${db_name}" "${SEED_DB}" run_adco_tool
 
 echo "----------------->> Comparison <<-----------------"
 RESULTS_DIR="${ROOT}/results/smallbank" "${ROOT}/benchmarks/run_comparison.sh" "${RUN_ID}"
