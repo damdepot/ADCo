@@ -1151,7 +1151,24 @@ def _compile_candidate_inner(
             # the campaign spins on compile rejections. Only the attempt cap
             # keeps a winner stop binding (no post-cap measurement).
             # Futility stops stay binding (the campaign is genuinely over).
-            for diag in diags:
+            # change_phase is modal: only the NEWEST valid-phase directive
+            # binds — older ones are superseded. Conjoining distinct required
+            # phases is unsatisfiable (every proposal fails one of them) and
+            # once burned an entire campaign budget with the agent flip-flopping
+            # interaction<->refinement. If the newest directive is invalid it
+            # is handled by the guard below; older valid ones then bind as
+            # fallback intent.
+            newest_phase_idx: int = -1
+            try:
+                for _pdi, _pdg in enumerate(diags or []):
+                    if _correction_str(_pdg) != "change_phase":
+                        continue
+                    _pts = [str(_t) for _t in (getattr(_pdg, "targets", None) or [])]
+                    if _pts and str(_pts[0]).strip().lower() in _VALID_EXPERIMENT_PHASES:
+                        newest_phase_idx = _pdi
+            except Exception:
+                newest_phase_idx = -1
+            for _pdi, diag in enumerate(diags):
                 correction = _correction_str(diag)
                 targets = [str(t) for t in (diag.targets or [])]
                 targets_lower = {t.strip().lower() for t in targets if t.strip()}
@@ -1194,6 +1211,12 @@ def _compile_candidate_inner(
                             f"shrink_set: {distinct_n} >= {last_n}; drop to fewer knobs"
                         )
                 elif correction == "change_phase":
+                    if _pdi != newest_phase_idx:
+                        # Superseded by a newer valid-phase directive (or the
+                        # newest directive is invalid and handled by the guard
+                        # below) — skip so contradictory directives cannot
+                        # jointly reject every proposal.
+                        continue
                     if targets:
                         want = str(targets[0]).strip().lower()
                         # Satisfiability guard: diagnosis sometimes emits a knob
@@ -1388,12 +1411,22 @@ def compile_candidate(
         # Circuit breaker (central: every inner early-return — unknown phase,
         # over cap, no usable knobs, diagnosis/diversity/repeat-hash — funnels
         # through here, so no rejection site can miss the tracking). Tracks
-        # consecutive byte-identical rejection reasons; on the third identical
-        # consecutive rejection the stale constraint is broken by downgrading
-        # the latest diagnosis. Generic: reason-agnostic, no knob names. Never
-        # throws.
+        # consecutive rejections by violation CLASS (quoted experiment/knob/
+        # phase names stripped, then text before the first ":"); on the third
+        # consecutive same-class rejection the stale constraint is broken by
+        # downgrading the latest diagnosis. Class (not byte-identical reason)
+        # because contradictory directives make the details alternate while
+        # the class repeats — e.g. "required 'interaction'" vs "required
+        # 'refinement'" flip-flopping forever. Generic: reason-agnostic, no
+        # knob names. Never throws.
         with contextlib.suppress(Exception):
             sig = str(result.reason or "")
+            try:
+                import re as _re
+
+                sig = _re.sub(r"'[^']*'", "", sig).split(":", 1)[0].strip() or sig
+            except Exception:
+                sig = str(result.reason or "")
             last_sig = str(state.get("consecutive_rejection_sig") or "")
             try:
                 count = int(state.get("consecutive_rejection_count") or 0)

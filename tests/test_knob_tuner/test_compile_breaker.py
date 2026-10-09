@@ -137,4 +137,40 @@ def test_counter_resets_on_success_and_on_differing_reason():
     assert isinstance(second, CompileRejection)
     assert second.reason != first.reason
     assert int(ctx2.state.get("consecutive_rejection_count") or 0) == 1
-    assert ctx2.state.get("consecutive_rejection_sig") == second.reason
+    # Class-tracked sig strips quoted values: "unknown phase 'nope-phase'".
+    assert ctx2.state.get("consecutive_rejection_sig") == "unknown phase"
+
+
+def test_change_phase_latest_valid_directive_wins():
+    # Contradictory directives: older interaction, newer refinement.
+    # The refinement proposal must compile; the interaction one is rejected.
+    # (Production: agent flip-flopping interaction<->refinement burned 40+
+    # attempts because BOTH were enforced.)
+    ctx = _ctx()
+    _diagnose(ctx, "change_phase", ["interaction"])
+    _diagnose(ctx, "change_phase", ["refinement"])
+    good = nodes.compile_candidate(ctx, _proposal(name="new", phase="refinement"))
+    assert isinstance(good, CompiledPlan)
+    bad = nodes.compile_candidate(ctx, _proposal(name="old", phase="interaction"))
+    assert isinstance(bad, CompileRejection)
+    assert "change_phase" in bad.reason
+
+
+def test_alternating_same_class_rejections_trip_breaker():
+    # Same class ("drop_knob violation"), alternating details: the old
+    # byte-identical tracker would reset every time and never trip.
+    ctx = _ctx()
+    _diagnose(ctx, "drop_knob", ["work_mem", "shared_buffers"])
+    levels_a = [{"knob": "work_mem", "value": "64MB"}]
+    levels_b = [{"knob": "shared_buffers", "value": "256MB"}]
+    for i, lv in enumerate([levels_a, levels_b, levels_a]):
+        rejected = nodes.compile_candidate(ctx, _proposal(name=f"alt-{i}", levels=lv))
+        assert isinstance(rejected, CompileRejection)
+        assert rejected.reason.startswith("drop_knob violation")
+    assert ctx.state.get("consecutive_rejection_count") == 0
+    assert ctx.state.get("consecutive_rejection_sig") == ""
+    hist = ctx.state.get("diagnosis_history")
+    assert hist and hist[-1]["correction"] == "retry_same"
+    # Constraint lifted: the previously-excluded knob now compiles.
+    freed = nodes.compile_candidate(ctx, _proposal(name="freed", levels=levels_a))
+    assert isinstance(freed, CompiledPlan)
