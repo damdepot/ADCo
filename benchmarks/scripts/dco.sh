@@ -23,9 +23,9 @@ screen_max_rows="${SCREEN_MAX_ROWS:-5000000}"
 # Screening gate measurement: sysbench OLTP (default) or pgbench sort/hash.
 screening_benchmark="${SCREENING_BENCHMARK:-sysbench}"
 
-# Measurement timing. Defaults match the tuner CLI (10/10/2/4).
+# Measurement timing. Defaults match the tuner CLI (10/30/8/4).
 measure_reps="${MEASURE_REPS:-10}"
-measure_seconds="${MEASURE_SECONDS:-10}"
+measure_seconds="${MEASURE_SECONDS:-30}"
 measure_warmup_seconds="${MEASURE_WARMUP_SECONDS:-8}"
 early_stop_min_reps="${EARLY_STOP_MIN_REPS:-4}"
 

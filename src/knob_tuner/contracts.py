@@ -60,8 +60,10 @@ DEFAULT_CERTIFY_LCB_PCT: float = 1.0
 #: Default measurement reps per arm in single-fidelity mode.
 DEFAULT_MEASURE_REPS: int = 10
 
-#: Default measured seconds per repetition.
-DEFAULT_MEASURE_SECONDS: int = 10
+#: Default measured seconds per repetition: 30s windows average out
+#: per-rep scheduling jitter that dominates 10s samples on small boxes,
+#: narrowing Welch CIs enough for single-digit effects to certify.
+DEFAULT_MEASURE_SECONDS: int = 30
 
 #: Default warmup seconds per measurement arm: ~10s of load covers the
 #: observed post-restore cold window (rep-1 dips resolve within the first
