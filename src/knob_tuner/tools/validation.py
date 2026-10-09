@@ -650,17 +650,130 @@ def _measure_shared_baseline(
         else:
             on_prepared = None
 
-        emit("running shared baseline measurement...")
-        t0 = time.monotonic()
-        baseline = runner(
-            staging_cfg,
-            profile,
-            workdir,
-            progress=emit,
-            prepare=True,
-            on_prepared=on_prepared,
-        )
-        timings["baseline_seconds"] = round(time.monotonic() - t0, 3)
+        use_snapshot_restore = snapshot is not None and bool(snapshot_key)
+        if use_snapshot_restore:
+            emit("preparing shared-baseline dataset for snapshot...")
+            try:
+                prep_result = runner(
+                    staging_cfg,
+                    profile,
+                    workdir,
+                    progress=emit,
+                    prepare=True,
+                    prepare_only=True,
+                    on_prepared=on_prepared,
+                )
+            except TypeError as e:
+                emit(
+                    "prepare_only unsupported by runner "
+                    f"(measuring on preparing container): {e}"
+                )
+                t0 = time.monotonic()
+                baseline = runner(
+                    staging_cfg,
+                    profile,
+                    workdir,
+                    progress=emit,
+                    prepare=True,
+                    on_prepared=on_prepared,
+                )
+                timings["baseline_seconds"] = round(time.monotonic() - t0, 3)
+                prep_result = None  # type: ignore[assignment]
+            except Exception as e:
+                emit(f"shared baseline prepare failed: {e}")
+                return {
+                    "status": "error",
+                    "baseline": None,
+                    "reasons": [f"shared baseline measurement prepare failed: {e}"],
+                    "artifacts": artifacts,
+                    "snapshot_key": snapshot_key,
+                    "snapshot_image": None,
+                }
+            if prep_result is None:
+                pass  # legacy TypeError fallback already measured; skip to tail
+            else:
+                if prep_result.status != "ok":
+                    timings["baseline_seconds"] = 0.0
+                    timings["prepare_seconds"] = prep_result.prepare_seconds
+                    artifacts["timings"] = timings
+                    artifacts["shared_baseline"] = write_artifact(
+                        run_dir, f"{label}-shared-baseline", prep_result.model_dump()
+                    )
+                    reasons.append(
+                        f"shared baseline measurement status is '{prep_result.status}'"
+                        + (f": {prep_result.error}" if prep_result.error else "")
+                    )
+                    return {
+                        "status": "error",
+                        "baseline": prep_result,
+                        "reasons": reasons,
+                        "artifacts": artifacts,
+                        "snapshot_key": snapshot_key,
+                        "snapshot_image": snapshot.get(snapshot_key)
+                        if snapshot is not None and snapshot_key
+                        else None,
+                    }
+                image = (
+                    snapshot.get(snapshot_key)
+                    if snapshot is not None and snapshot_key
+                    else None
+                )
+                staging_cfg_for_baseline = staging_cfg
+                if image:
+                    emit("restoring shared baseline from snapshot...")
+                    t0 = time.monotonic()
+                    try:
+                        ok, new_container, new_cfg = recreate_docker_db(
+                            container,
+                            db_type=db_type,
+                            db_version=db_version,
+                            database=database,
+                            budget=budget,
+                            base_image=image,
+                        )
+                    except Exception as e:
+                        ok, new_container, new_cfg = False, container, f"{e}"
+                    if ok and new_cfg is not None:
+                        container = new_container
+                        staging_cfg = new_cfg
+                        staging_cfg_for_baseline = new_cfg
+                        timings["restore_seconds"] = round(
+                            timings.get("restore_seconds", 0.0)
+                            + (time.monotonic() - t0),
+                            3,
+                        )
+                    else:
+                        emit(
+                            "snapshot restore failed "
+                            f"(measuring on preparing container): {new_cfg}"
+                        )
+                else:
+                    emit(
+                        "snapshot unavailable "
+                        "(measuring baseline on preparing container)"
+                    )
+                emit("running shared baseline measurement...")
+                t0 = time.monotonic()
+                baseline = runner(
+                    staging_cfg_for_baseline,
+                    profile,
+                    workdir,
+                    progress=emit,
+                    prepare=False,
+                )
+                timings["baseline_seconds"] = round(time.monotonic() - t0, 3)
+        else:
+            emit("running shared baseline measurement...")
+            t0 = time.monotonic()
+            baseline = runner(
+                staging_cfg,
+                profile,
+                workdir,
+                progress=emit,
+                prepare=True,
+                on_prepared=on_prepared,
+            )
+            timings["baseline_seconds"] = round(time.monotonic() - t0, 3)
         timings["prepare_seconds"] = baseline.prepare_seconds
         artifacts["timings"] = timings
         artifacts["shared_baseline"] = write_artifact(

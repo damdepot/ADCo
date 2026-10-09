@@ -376,6 +376,7 @@ def run_sysbench_measurement(
     prepare: bool = True,
     on_prepared: Callable[[], None] | None = None,
     on_rep: Callable[[list[float]], bool] | None = None,
+    prepare_only: bool = False,
 ) -> SysbenchMeasurement:
     """Run a deterministic, repeated sysbench OLTP measurement.
 
@@ -406,6 +407,12 @@ def run_sysbench_measurement(
             The measurement is then aggregated over the completed reps and the
             short sample is visible via ``per_run_tps``. A failing callback
             never fails the measurement.
+        prepare_only: When ``True`` run cleanup + prepare + settle + the
+            ``on_prepared`` callback (snapshot commit), then return early
+            WITHOUT warmup/reps, with status ``"ok"``, empty per-run lists,
+            ``prepare_seconds`` set, and error None. Used to load and
+            snapshot the dataset on the preparing container before measuring
+            on a fresh container restored from the snapshot.
 
     Returns:
         A ``SysbenchMeasurement``; ``status`` is ``"ok"`` only when every
@@ -499,6 +506,27 @@ def run_sysbench_measurement(
                         "snapshot hook failed (continuing without snapshot): "
                         f"{e}"
                     )
+
+        if prepare_only:
+            return SysbenchMeasurement(
+                status="ok",
+                tps=0.0,
+                qps=0.0,
+                latency_avg_ms=0.0,
+                latency_p95_ms=0.0,
+                ignored_errors=0,
+                reconnects=0,
+                threads=profile.threads,
+                tables=profile.tables,
+                rows_per_table=profile.rows_per_table,
+                duration=profile.measurement_seconds,
+                seed=profile.seed,
+                repetitions=profile.repetitions,
+                per_run_tps=[],
+                prepare_seconds=prepare_seconds,
+                log_file=log_file,
+                error=None,
+            )
 
         # (c) Optional discarded warmup run.
         if profile.warmup_seconds > 0:
@@ -652,6 +680,7 @@ def run_pgbench_measurement(
     prepare: bool = True,
     on_prepared: Callable[[], None] | None = None,
     on_rep: Callable[[list[float]], bool] | None = None,
+    prepare_only: bool = False,
 ) -> SysbenchMeasurement:
     """Run a repeated, host-side pgbench measurement of the sort/hash workload.
 
@@ -681,6 +710,10 @@ def run_pgbench_measurement(
         on_rep: Optional per-repetition callback receiving the TPS samples
             collected so far; return True to stop the arm early (futility).
             A failing callback never fails the measurement.
+        prepare_only: When ``True`` run cleanup + prepare + settle + the
+            ``on_prepared`` callback (snapshot commit), then return early
+            WITHOUT warmup/reps, with status ``"ok"``, empty per-run lists,
+            ``prepare_seconds`` set, and error None.
 
     Returns:
         A ``SysbenchMeasurement`` whose ``tps`` is the median of the per-run
@@ -777,6 +810,27 @@ def run_pgbench_measurement(
                         "snapshot hook failed (continuing without snapshot): "
                         f"{e}"
                     )
+
+        if prepare_only:
+            return SysbenchMeasurement(
+                status="ok",
+                tps=0.0,
+                qps=0.0,
+                latency_avg_ms=0.0,
+                latency_p95_ms=0.0,
+                ignored_errors=0,
+                reconnects=0,
+                threads=clients,
+                tables=profile.tables,
+                rows_per_table=profile.rows_per_table,
+                duration=profile.measurement_seconds,
+                seed=profile.seed,
+                repetitions=profile.repetitions,
+                per_run_tps=[],
+                prepare_seconds=prepare_seconds,
+                log_file=log_file,
+                error=None,
+            )
 
         def _pgbench_cmd(seconds: int) -> list[str]:
             return [
