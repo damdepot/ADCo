@@ -261,6 +261,26 @@ def test_double_retry_same_goes_done():
     assert int(ctx.state.get("retry_same_count") or 0) == 2
 
 
+def test_retry_same_limit_scales_with_attempt_budget():
+    # Floor: max_attempts=6 -> limit 2 (legacy behavior, covered above).
+    # Scaled: max_attempts=30 -> limit 3, so two consecutive stability
+    # retries keep screening instead of ending the campaign.
+    ctx = _ctx()
+    ctx.state["max_attempts"] = 30
+    first = _diagnose(ctx, "retry_same", [], "flake?")
+    assert first["route"] == "retry"
+    second = nodes.confirmation_controller(
+        ctx, DiagnosisOutput(correction="retry_same", targets=[], rationale="verify stability", confidence=0.7)
+    )
+    assert second["route"] == "retry"
+    assert second.get("reason") != "retry_same_exhausted"
+    third = nodes.confirmation_controller(
+        ctx, DiagnosisOutput(correction="retry_same", targets=[], rationale="still flaky", confidence=0.6)
+    )
+    assert third["route"] == "done"
+    assert third.get("reason") == "retry_same_exhausted"
+
+
 def test_repeat_hash_rejected_and_retry_same_bypasses():
     ctx = _ctx()
     first = nodes.compile_candidate(ctx, _proposal(name="dup"))

@@ -1775,7 +1775,15 @@ def confirmation_controller(
                 rc = int(state.get("retry_same_count", 0) or 0)
             except (TypeError, ValueError):
                 rc = 0
-            if rc >= 2:
+            # Flake-loop guard scales with the attempt budget: consecutive
+            # stability retries are legitimate (verify-then-move-on), so the
+            # cap is max(2, max_attempts // 10) — 2 for a 10-attempt budget
+            # (legacy behavior), 3 for the default 30-attempt budget.
+            try:
+                retry_same_limit = max(2, int(max_attempts or 0) // 10)
+            except (TypeError, ValueError):
+                retry_same_limit = 2
+            if rc >= retry_same_limit:
                 route = "done"
                 reason = "retry_same_exhausted"
             elif attempt >= max_attempts:
