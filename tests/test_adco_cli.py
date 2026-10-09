@@ -63,7 +63,7 @@ def test_build_parser():
     assert args.success_candidates == 3
     assert args.measure_reps == 10
     assert args.measure_seconds == 10
-    assert args.measure_warmup_seconds == 2
+    assert args.measure_warmup_seconds == 8
     assert args.early_stop_min_reps == 4
 
 
@@ -291,7 +291,7 @@ def test_run_pipeline_forwards_screening_config_to_tuner(
     assert extra["screening_benchmark"] == "pgbench"
     assert extra["measure_reps"] == 10
     assert extra["measure_seconds"] == 10
-    assert extra["measure_warmup_seconds"] == 2
+    assert extra["measure_warmup_seconds"] == 8
     assert extra["early_stop_min_reps"] == 4
 
 

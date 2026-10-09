@@ -1497,7 +1497,7 @@ def test_cli_parser_defaults_with_required_resources():
     assert args.screen_max_rows == 5_000_000
     assert args.measure_reps == 10
     assert args.measure_seconds == 10
-    assert args.measure_warmup_seconds == 2
+    assert args.measure_warmup_seconds == 8
     assert args.early_stop_min_reps == 4
     assert args.screening_benchmark == "sysbench"
     assert args.max_attempts == 30
@@ -1707,7 +1707,7 @@ def test_build_initial_state_without_config_file():
     assert state["workload_hint"] == ""
     assert state["measure_reps"] == 10
     assert state["measure_seconds"] == 10
-    assert state["measure_warmup_seconds"] == 2
+    assert state["measure_warmup_seconds"] == 8
     assert state["early_stop_min_reps"] == 4
     for dead_key in (
         "screen_measurement_seconds",

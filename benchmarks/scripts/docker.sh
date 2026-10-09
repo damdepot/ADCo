@@ -41,7 +41,8 @@ elif [ "$op" == "Up" ]; then
         actual_nano="$(docker inspect -f '{{.HostConfig.NanoCpus}}' "${container}")"
         actual_mem="$(docker inspect -f '{{.HostConfig.Memory}}' "${container}")"
         if [ -n "${CPU_CORES:-}" ]; then
-            expected_nano="$(awk -v c="${CPU_CORES}" 'BEGIN { printf "%d", c * 1000000000 }')"
+            # %.0f (not %d): mawk's %d is 32-bit and overflows above ~2.1e9.
+            expected_nano="$(awk -v c="${CPU_CORES}" 'BEGIN { printf "%.0f", c * 1000000000 }')"
             if [ "${actual_nano}" == "${expected_nano}" ]; then
                 echo "PASS: container '${container}' cpus=${CPU_CORES} (NanoCpus=${actual_nano})."
             else
@@ -50,7 +51,8 @@ elif [ "$op" == "Up" ]; then
             fi
         fi
         if [ -n "${MEMORY_GB:-}" ]; then
-            expected_mem="$(awk -v m="${MEMORY_GB}" 'BEGIN { printf "%d", m * 1073741824 }')"
+            # %.0f (not %d): mawk's %d is 32-bit and overflows above ~2.1e9.
+            expected_mem="$(awk -v m="${MEMORY_GB}" 'BEGIN { printf "%.0f", m * 1073741824 }')"
             if [ "${actual_mem}" == "${expected_mem}" ]; then
                 echo "PASS: container '${container}' memory=${MEMORY_GB}g (Memory=${actual_mem})."
             else

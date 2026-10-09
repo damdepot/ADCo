@@ -26,7 +26,7 @@ screening_benchmark="${SCREENING_BENCHMARK:-sysbench}"
 # Measurement timing. Defaults match the tuner CLI (10/10/2/4).
 measure_reps="${MEASURE_REPS:-10}"
 measure_seconds="${MEASURE_SECONDS:-10}"
-measure_warmup_seconds="${MEASURE_WARMUP_SECONDS:-2}"
+measure_warmup_seconds="${MEASURE_WARMUP_SECONDS:-8}"
 early_stop_min_reps="${EARLY_STOP_MIN_REPS:-4}"
 
 # Tuner loop caps. Defaults match the tuner (30/20).

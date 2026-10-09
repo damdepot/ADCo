@@ -63,8 +63,10 @@ DEFAULT_MEASURE_REPS: int = 10
 #: Default measured seconds per repetition.
 DEFAULT_MEASURE_SECONDS: int = 10
 
-#: Default warmup seconds per measurement arm.
-DEFAULT_MEASURE_WARMUP_SECONDS: int = 2
+#: Default warmup seconds per measurement arm: ~10s of load covers the
+#: observed post-restore cold window (rep-1 dips resolve within the first
+#: measured rep), with margin kept small since warmup runs per arm.
+DEFAULT_MEASURE_WARMUP_SECONDS: int = 8
 
 #: Default minimum reps before an arm may stop early for futility.
 DEFAULT_EARLY_STOP_MIN_REPS: int = 4
