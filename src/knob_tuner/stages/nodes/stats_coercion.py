@@ -64,6 +64,7 @@ from src.knob_tuner.stages.nodes.diagnosis import (
     _all_diagnoses,
     _coerce_diagnosis,
     _correction_str,
+    _downgrade_latest,
     _latest_diagnosis,
     _refresh_memory,
     _sync_prompt_constraints,
@@ -1195,13 +1196,23 @@ def _compile_candidate_inner(
                 elif correction == "change_phase":
                     if targets:
                         want = str(targets[0]).strip().lower()
+                        # Satisfiability guard: diagnosis sometimes emits a knob
+                        # name (e.g. "work_mem") as the phase target instead of
+                        # a real phase; proposals repair unknown phases to
+                        # "screen" so such a target can never match and would
+                        # reject forever — downgraded, never enforced as-is
+                        # (mirrors the adjust_value guard below).
+                        if want not in _VALID_EXPERIMENT_PHASES:
+                            continue
                         if phase != want:
                             violations.append(
                                 "change_phase violation: proposal phase "
-                                f"{phase!r} != required {want!r}"
+                                f"{phase!r} != required {want!r} "
+                                f"(valid: {sorted(_VALID_EXPERIMENT_PHASES)})"
                             )
                             violation_errors.append(
-                                f"change_phase: use required phase {want!r}"
+                                f"change_phase: use required phase {want!r} "
+                                f"(valid: {sorted(_VALID_EXPERIMENT_PHASES)})"
                             )
                 elif correction == "adjust_value" and targets_lower:
                     if prev_map is None:
@@ -1374,6 +1385,45 @@ def compile_candidate(
         _commit_rejection_accounting(
             state, reason=result.reason, errors=list(result.errors or [])
         )
+        # Circuit breaker (central: every inner early-return — unknown phase,
+        # over cap, no usable knobs, diagnosis/diversity/repeat-hash — funnels
+        # through here, so no rejection site can miss the tracking). Tracks
+        # consecutive byte-identical rejection reasons; on the third identical
+        # consecutive rejection the stale constraint is broken by downgrading
+        # the latest diagnosis. Generic: reason-agnostic, no knob names. Never
+        # throws.
+        with contextlib.suppress(Exception):
+            sig = str(result.reason or "")
+            last_sig = str(state.get("consecutive_rejection_sig") or "")
+            try:
+                count = int(state.get("consecutive_rejection_count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if sig == last_sig:
+                count += 1
+            else:
+                count = 1
+            with contextlib.suppress(Exception):
+                state["consecutive_rejection_sig"] = sig
+                state["consecutive_rejection_count"] = count
+            if count >= 3:
+                with contextlib.suppress(Exception):
+                    _downgrade_latest(
+                        state,
+                        "retry_same",
+                        "compile breaker: 3 consecutive identical rejections",
+                    )
+                with contextlib.suppress(Exception):
+                    _sync_prompt_constraints(state)
+                with contextlib.suppress(Exception):
+                    _refresh_memory(state)
+                with contextlib.suppress(Exception):
+                    state["consecutive_rejection_sig"] = ""
+                    state["consecutive_rejection_count"] = 0
+    else:
+        with contextlib.suppress(Exception):
+            state["consecutive_rejection_sig"] = ""
+            state["consecutive_rejection_count"] = 0
     return result
 
 

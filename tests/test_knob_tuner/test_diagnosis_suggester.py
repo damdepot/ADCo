@@ -67,3 +67,23 @@ def test_diagnosis_output_accepts_all_six_enum_values():
         )
         assert out.correction is correction
     assert {c.value for c in CorrectionType} == set(_SUGGESTION_TAXONOMY) | {"stop"}
+
+
+def test_prompt_requires_valid_phase_name_for_change_phase_targets():
+    from src.knob_tuner.contracts import VALID_EXPERIMENT_PHASES
+
+    text = diag_prompt_mod.DIAGNOSIS_AGENT_PROMPT
+    assert VALID_EXPERIMENT_PHASES == ("screen", "interaction", "refinement")
+    lowered = text.lower()
+    for phase in VALID_EXPERIMENT_PHASES:
+        assert phase in lowered, f"prompt must name valid phase {phase!r}"
+    # change_phase bullet must bind targets to exactly one valid phase name
+    assert "targets must be exactly one valid phase name" in lowered
+
+
+def test_prompt_forbids_knob_names_in_change_phase_targets():
+    text = diag_prompt_mod.DIAGNOSIS_AGENT_PROMPT
+    assert (
+        "change_phase targets: phase name only — never knob names "
+        "(a knob name there is unenforceable and will be ignored)" in text
+    )

@@ -30,9 +30,10 @@ The rejected history carries the failed-benchmark evidence (rejection reasons, d
 - adjust_value: named knobs moved in the wrong direction or with too large a step. State the direction in words (e.g. raise/lower) and which knobs it applies to — never concrete values.
 - drop_knob: one or more named knobs are hopeless or unsafe; exclude them next round.
 - shrink_set: the set was too broad to attribute; retry with fewer knobs. NEVER suggest shrink_set at the shrink floor — when the last experiment's n_knobs <= 1 (single-knob set, or no history showing more than one knob) fewer is unsatisfiable. Fallback priority there: drop_knob (a named knob is hopeless/unsafe) > adjust_value (direction/step suspect) > retry_same (noise/flake).
-- change_phase: the phase was wrong for this stage (e.g. screening when refinement was due).
+- change_phase: the phase was wrong for this stage (e.g. screening when refinement was due). targets MUST be exactly one valid phase name from (screen, interaction, refinement) — the next phase to run. Knob focus belongs in the rationale (and in targets of OTHER suggestion types), never in change_phase targets.
 - retry_same: the evidence looks like noise/flake, not a design flaw; one retry is justified (also the fallback when no fact supports a targeted suggestion).
 Name knobs in `targets` only — never propose replacement values, levels, or settings for them. You never emit correction `stop`: halting belongs to the deterministic controller, not to you.
+change_phase targets: phase name only — never knob names (a knob name there is unenforceable and will be ignored).
 
 ## stop_reason (schema compat only)
 Always emit "futility". This field is retained for schema compat only — it still accepts "winner", but you must never emit "winner": winner declarations are removed. The deterministic controller owns all halting and winner decisions.
@@ -69,6 +70,7 @@ Before returning, verify:
 - [ ] `stop_reason` is always "futility" (schema-compat constant; never "winner").
 - [ ] `confidence` is calibrated per the calibration section (0.9+ decisive reads only, 0.5-0.7 judgment calls, never 1.0).
 - [ ] Targets contain knob names only — no values, levels, ranges, or settings appear anywhere.
+- [ ] change_phase targets hold exactly one phase name from (screen, interaction, refinement) — never knob names.
 - [ ] No run verdicts issued — the output suggests an improvement, not an outcome; no winners declared.
 - [ ] Rationale cites the specific evaluation facts behind the suggestion (arm names, mean/lcb/ucb/status, Winners line, knob beliefs, or rejected-history entries when the bundle is absent) — no fact, no suggestion.
 - [ ] Resource line checked: RAM pressure routes to shrink_set (unless at the shrink floor, n_knobs <= 1, where the fallback priority above applies).
