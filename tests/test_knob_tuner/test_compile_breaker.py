@@ -113,8 +113,7 @@ def test_three_identical_rejections_downgrade_and_reset():
     assert hist and hist[-1]["correction"] == "retry_same"
 
 
-def test_counter_resets_on_success_and_on_differing_reason():
-    # Reset on success.
+def test_counter_resets_on_success_and_on_differing_reason():    # Reset on success.
     ctx = _ctx()
     bad = nodes.compile_candidate(ctx, {"name": "empty", "phase": "screen", "levels": []})
     assert isinstance(bad, CompileRejection)
@@ -174,3 +173,48 @@ def test_alternating_same_class_rejections_trip_breaker():
     # Constraint lifted: the previously-excluded knob now compiles.
     freed = nodes.compile_candidate(ctx, _proposal(name="freed", levels=levels_a))
     assert isinstance(freed, CompiledPlan)
+
+
+def _rotating_rejection(ctx, i):
+    # Alternate two classes: unknown-phase vs empty-levels. Neither alone
+    # repeats 3x, so only the any-class streak can trip.
+    if i % 2 == 0:
+        return nodes.compile_candidate(
+            ctx, {"name": f"weird-{i}", "phase": "nope-phase",
+                  "levels": [{"knob": "work_mem", "value": "64MB"}]}
+        )
+    return nodes.compile_candidate(
+        ctx, {"name": f"empty-{i}", "phase": "screen", "levels": []}
+    )
+
+
+def test_rotating_classes_trip_any_streak_and_dissolve_oldest():
+    # Production shape: rotating change_phase/shrink/diversity rejections
+    # reset the same-class counter forever; the any-class streak (6) must
+    # still break the knot by dissolving the OLDEST diagnosis first.
+    ctx = _ctx()
+    _diagnose(ctx, "drop_knob", ["shared_buffers"])
+    _diagnose(ctx, "shrink_set", [])
+    for i in range(5):
+        rejected = _rotating_rejection(ctx, i)
+        assert isinstance(rejected, CompileRejection)
+        assert int(ctx.state.get("consecutive_rejection_any_count") or 0) == i + 1
+    sixth = _rotating_rejection(ctx, 5)
+    assert isinstance(sixth, CompileRejection)
+    assert int(ctx.state.get("consecutive_rejection_any_count") or 0) == 0
+    hist = ctx.state.get("diagnosis_history")
+    assert hist and hist[0]["correction"] == "retry_same"
+    # Newest diagnosis untouched: only the oldest was dissolved.
+    assert hist[-1]["correction"] != "retry_same" or len(hist) == 1
+
+
+def test_any_streak_resets_on_success():
+    ctx = _ctx()
+    _diagnose(ctx, "drop_knob", ["shared_buffers"])
+    for i in range(3):
+        rejected = _rotating_rejection(ctx, i)
+        assert isinstance(rejected, CompileRejection)
+    assert int(ctx.state.get("consecutive_rejection_any_count") or 0) == 3
+    good = nodes.compile_candidate(ctx, _proposal(name="ok"))
+    assert isinstance(good, CompiledPlan)
+    assert int(ctx.state.get("consecutive_rejection_any_count") or 0) == 0

@@ -180,6 +180,38 @@ def _downgrade_latest(state: Any, new_correction: str, note: str) -> bool:
     return False
 
 
+def _downgrade_oldest(state: Any, new_correction: str, note: str) -> bool:
+    """Rewrite the oldest diagnosis correction in place (never throws).
+
+    Mirror of :func:`_downgrade_latest` for the rotation case: when
+    rejections cycle across violation classes, the knot is the conjunction
+    of accumulated constraints, so relief must dissolve the oldest one
+    first. Deliberately does NOT mirror into ``diagnosis_output`` (which
+    tracks the latest). Returns True when a history entry was rewritten.
+    """
+    try:
+        get = getattr(state, "get", None)
+        if not callable(get):
+            return False
+        hist = get("diagnosis_history")
+        if isinstance(hist, list) and hist:
+            first = hist[0]
+            if isinstance(first, dict):
+                first["correction"] = new_correction
+                if note:
+                    prior = str(first.get("rationale", "") or "")
+                    first["rationale"] = f"{prior} [{note}]".strip()
+            else:
+                try:
+                    setattr(first, "correction", new_correction)
+                except Exception:
+                    return False
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _last_n_knobs(state: Any) -> int | None:
     """Return the last attempt's n_knobs, or None when unknown (never throws)."""
     try:

@@ -65,10 +65,20 @@ from src.knob_tuner.stages.nodes.diagnosis import (
     _coerce_diagnosis,
     _correction_str,
     _downgrade_latest,
+    _downgrade_oldest,
     _latest_diagnosis,
     _refresh_memory,
     _sync_prompt_constraints,
 )
+
+
+#: Compile-breaker trip points (consecutive compile rejections with no
+#: intervening success). Same-class streaks downgrade the latest diagnosis
+#: (it directly produced the repeating class); any-class streaks dissolve
+#: the oldest diagnosis first (the knot is the conjunction of accumulated
+#: constraints, so relief must come from the oldest one).
+_BREAKER_SAME_CLASS_TRIP = 3
+_BREAKER_ANY_CLASS_TRIP = 6
 
 
 def _as_float_list(value: Any) -> list[float]:
@@ -1410,15 +1420,16 @@ def compile_candidate(
         )
         # Circuit breaker (central: every inner early-return — unknown phase,
         # over cap, no usable knobs, diagnosis/diversity/repeat-hash — funnels
-        # through here, so no rejection site can miss the tracking). Tracks
-        # consecutive rejections by violation CLASS (quoted experiment/knob/
-        # phase names stripped, then text before the first ":"); on the third
-        # consecutive same-class rejection the stale constraint is broken by
-        # downgrading the latest diagnosis. Class (not byte-identical reason)
-        # because contradictory directives make the details alternate while
-        # the class repeats — e.g. "required 'interaction'" vs "required
-        # 'refinement'" flip-flopping forever. Generic: reason-agnostic, no
-        # knob names. Never throws.
+        # through here, so no rejection site can miss the tracking). Two trip
+        # wires, both reason-agnostic and knob-nameless:
+        # - same class 3x in a row -> the constraint behind it is stale:
+        #   downgrade the LATEST diagnosis (it directly produced this class);
+        # - ANY 6 rejections in a row with no intervening success, even across
+        #   rotating classes -> the CONJUNCTION of accumulated constraints is
+        #   unsatisfiable (each fix trips the next rule): dissolve the OLDEST
+        #   diagnosis first and repeat until proposals measure again.
+        # Class = reason with quoted experiment/knob/phase names stripped,
+        # then text before the first ":". Generic. Never throws.
         with contextlib.suppress(Exception):
             sig = str(result.reason or "")
             try:
@@ -1432,14 +1443,20 @@ def compile_candidate(
                 count = int(state.get("consecutive_rejection_count") or 0)
             except (TypeError, ValueError):
                 count = 0
+            try:
+                any_count = int(state.get("consecutive_rejection_any_count") or 0)
+            except (TypeError, ValueError):
+                any_count = 0
             if sig == last_sig:
                 count += 1
             else:
                 count = 1
+            any_count += 1
             with contextlib.suppress(Exception):
                 state["consecutive_rejection_sig"] = sig
                 state["consecutive_rejection_count"] = count
-            if count >= 3:
+                state["consecutive_rejection_any_count"] = any_count
+            if count >= _BREAKER_SAME_CLASS_TRIP:
                 with contextlib.suppress(Exception):
                     _downgrade_latest(
                         state,
@@ -1453,10 +1470,27 @@ def compile_candidate(
                 with contextlib.suppress(Exception):
                     state["consecutive_rejection_sig"] = ""
                     state["consecutive_rejection_count"] = 0
+                    state["consecutive_rejection_any_count"] = 0
+            elif any_count >= _BREAKER_ANY_CLASS_TRIP:
+                with contextlib.suppress(Exception):
+                    _downgrade_oldest(
+                        state,
+                        "retry_same",
+                        "compile breaker: 6 consecutive rejections across rotating classes",
+                    )
+                with contextlib.suppress(Exception):
+                    _sync_prompt_constraints(state)
+                with contextlib.suppress(Exception):
+                    _refresh_memory(state)
+                with contextlib.suppress(Exception):
+                    state["consecutive_rejection_sig"] = ""
+                    state["consecutive_rejection_count"] = 0
+                    state["consecutive_rejection_any_count"] = 0
     else:
         with contextlib.suppress(Exception):
             state["consecutive_rejection_sig"] = ""
             state["consecutive_rejection_count"] = 0
+            state["consecutive_rejection_any_count"] = 0
     return result
 
 
