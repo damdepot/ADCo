@@ -16,6 +16,9 @@ RESULTS_DIR="${ROOT}/results/tpcc"
 mkdir -p "${RESULTS_DIR}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 
+# Single-writer: never Down/Restart the DB under a concurrent run.
+bench_lock "${ROOT}"
+
 # Pristine dataset snapshot: loaded once, restored per arm in seconds.
 SEED_DB="${db_name}_seed"
 

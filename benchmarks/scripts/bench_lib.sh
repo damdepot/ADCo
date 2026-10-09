@@ -146,6 +146,19 @@ bench_arm_from_seed() {
     bench_measure "${optimized_dir}" "${tag}_${run_id}.csv"
 }
 
+# Mutual exclusion for DB-destructive runs. bench_lock <root> takes a
+# non-blocking flock on <root>/.bench.lock (held until the script exits);
+# a second concurrent run fails fast instead of Down/Restart-ing the
+# database out from under the first one mid-load or mid-measure.
+bench_lock() {
+    local root="$1"
+    exec 9>"${root}/.bench.lock"
+    if ! flock -n 9; then
+        echo "ERROR: another benchmark run holds ${root}/.bench.lock; refusing to run concurrently." >&2
+        exit 1
+    fi
+}
+
 psql() {
     docker exec -i -u postgres "${BENCH_DB_CONTAINER}" psql -v ON_ERROR_STOP=1 -q "$@"
 }

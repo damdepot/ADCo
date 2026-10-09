@@ -21,6 +21,9 @@ RESULTS_DIR="${ROOT}/results/smallbank"
 mkdir -p "${RESULTS_DIR}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 
+# Single-writer: never Down/Restart the DB under a concurrent run.
+bench_lock "${ROOT}"
+
 # Pristine dataset snapshot: loaded once, restored per arm in seconds.
 # Knob settings live in postgresql.auto.conf and survive the restore, so the
 # restore resets data only, not tuning.
