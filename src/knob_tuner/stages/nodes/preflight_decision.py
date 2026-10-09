@@ -459,6 +459,7 @@ def decision(
             "durability_profile": durability_profile,
             "single_fidelity": single_fidelity,
             "min_improvement_pct": float(min_improvement_pct),
+            "certify_threshold": float(certify_threshold),
             "candidates": [
                 {
                     k: _jsonable(v)
@@ -512,6 +513,72 @@ def decision(
                 "unconfirmed best withheld: no confirmed winner above "
                 "threshold; nothing applied"
             ]
+        if winner_row is None:
+            try:
+                try:
+                    bar_str = f"{float(certify_threshold):.2f}"
+                except (TypeError, ValueError):
+                    bar_str = "n/a"
+                except Exception:
+                    bar_str = "n/a"
+                try:
+                    gate_str = f"{float(min_improvement_pct):.2f}"
+                except (TypeError, ValueError):
+                    gate_str = "n/a"
+                except Exception:
+                    gate_str = "n/a"
+                audit_lines: list[str] = []
+                for idx, row in enumerate(list(rows or [])[:10]):
+                    try:
+                        if not isinstance(row, dict):
+                            audit_lines.append(
+                                f"withheld row-{idx + 1}: status=? confirmed=False "
+                                f"lcb=n/a vs certify bar {bar_str} "
+                                f"(ranking gate {gate_str})"
+                            )
+                            continue
+                        raw_name: str | None = None
+                        for key in ("name", "arm", "exp_name", "plan_hash"):
+                            try:
+                                val = row.get(key)
+                            except Exception:
+                                continue
+                            if val:
+                                raw_name = str(val)
+                                break
+                        name = raw_name or f"row-{idx + 1}"
+                        try:
+                            status = str(row.get("status", "") or "").upper() or "?"
+                        except Exception:
+                            status = "?"
+                        try:
+                            confirmed = bool(row.get("confirmed", False))
+                        except Exception:
+                            confirmed = False
+                        # Reuse _row_float so LCB parsing stays consistent;
+                        # display degrades to n/a when the raw value is unparseable.
+                        try:
+                            _row_float(row, "lcb_pct")
+                            raw_lcb = row.get("lcb_pct", None)
+                            if raw_lcb is None or (
+                                isinstance(raw_lcb, str) and not raw_lcb.strip()
+                            ):
+                                raise ValueError("missing lcb")
+                            lcb_str = f"{float(raw_lcb):.2f}"
+                        except (TypeError, ValueError):
+                            lcb_str = "n/a"
+                        except Exception:
+                            lcb_str = "n/a"
+                        audit_lines.append(
+                            f"withheld {name}: status={status} confirmed={confirmed} "
+                            f"lcb={lcb_str} vs certify bar {bar_str} "
+                            f"(ranking gate {gate_str})"
+                        )
+                    except Exception:
+                        continue
+                reasons = list(reasons) + audit_lines
+            except Exception:
+                pass
         if lead_note is not None and lead_note not in reasons:
             reasons.append(lead_note)
         if controller_route or controller_reason:
