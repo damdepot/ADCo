@@ -791,6 +791,180 @@ def _normalize_levels(raw_levels: Any) -> list[dict[str, Any]]:
     return norm
 
 
+def _noop_drop_names(inv_rejected: Any) -> list[str]:
+    """Return knob names dropped as no-ops from ``inv_rejected`` strings.
+
+    Generic: no hardcoded knob names. A drop counts as a no-op when its
+    reason mentions ``no-op`` (the ``_validate_recommendations`` marker for
+    proposes-at-current-value, e.g. ``"k: 'on' equals the current value
+    (no-op, nothing to change)"``). The name is the text before the first
+    ``":"``. Never throws.
+    """
+    names: list[str] = []
+    try:
+        items = inv_rejected if isinstance(inv_rejected, list) else []
+        for item in items:
+            try:
+                text = str(item or "")
+            except Exception:  # noqa: BLE001, S110 - bad entries skip
+                continue
+            if "no-op" not in text.lower():
+                continue
+            head = text.split(":", 1)[0].strip().strip("'\"")
+            if head and head.lower() not in {n.lower() for n in names}:
+                names.append(head)
+    except Exception:  # noqa: BLE001 - drop parsing never throws
+        pass
+    return names
+
+
+def _diversity_dropout_suffix(
+    state: Any,
+    plan: Any,
+    inventory: Any,
+    inv_rejected: Any,
+) -> tuple[str, str]:
+    """Build the no-op-dropout suffix for a diversity rejection.
+
+    Returns ``(suffix, warning)`` where ``suffix`` appends to the rejection
+    ``reason`` and ``warning`` is a one-line entry for the rejection
+    ``errors`` list so the LLM sees it via ``rejected_history``/bundle.
+    Both are ``""`` when there is nothing to say (no no-op drops, no
+    inventory, no uncovered families, or no suggestible alternatives) — the
+    caller then keeps the original message unchanged. Generic (no hardcoded
+    knob names), capped at 3 suggestions, deduped; never throws.
+    """
+    try:
+        dropped = _noop_drop_names(inv_rejected)
+        if not dropped:
+            return "", ""
+        if not isinstance(inventory, dict) or not inventory:
+            return "", ""
+        covered = winner_families(state)
+        if not covered:
+            return "", ""
+        # Family index + uncovered families (family = inventory category).
+        fam_of: dict[str, str] = {}
+        by_fam: dict[str, list[str]] = {}
+        current_of: dict[str, str] = {}
+        for key, entry in inventory.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                raw_name = entry.get("name", key)
+                name = str(raw_name or "").strip()
+                fam = str(entry.get("category", "") or "").strip().lower()
+                if not name or not fam:
+                    continue
+                fam_of[name.lower()] = fam
+                by_fam.setdefault(fam, [])
+                if name.lower() not in [n.lower() for n in by_fam[fam]]:
+                    by_fam[fam].append(name)
+                for ck in ("current_value", "setting"):
+                    cur = entry.get(ck)
+                    if cur not in (None, ""):
+                        try:
+                            current_of[name.lower()] = str(cur)
+                        except Exception:  # noqa: BLE001, S110 - bad current skips
+                            pass
+                        break
+            except Exception:  # noqa: BLE001, S110 - bad entries skip
+                continue
+        if not by_fam:
+            return "", ""
+        uncovered = set(by_fam) - covered
+        if not uncovered:
+            return "", ""
+        # Proposed value per dropped knob (parsed from the drop string when
+        # possible) so alternatives whose current value already differs sort
+        # first; unparseable values fall back to "any current known".
+        proposed_of: dict[str, str] = {}
+        try:
+            items = inv_rejected if isinstance(inv_rejected, list) else []
+            for item in items:
+                text = str(item or "")
+                if "no-op" not in text.lower() or ":" not in text:
+                    continue
+                head, _, tail = text.partition(":")
+                head = head.strip().strip("'\"")
+                if not head:
+                    continue
+                tail = tail.strip()
+                # Drop shape: ``'value' equals the current value ...``.
+                marker = "equals the current value"
+                if marker in tail.lower():
+                    idx = tail.lower().index(marker)
+                    proposed_of[head.lower()] = tail[:idx].strip().strip("'\"")
+        except Exception:  # noqa: BLE001, S110 - value parsing is best-effort
+            pass
+        try:
+            surviving: set[str] = set()
+            specs = plan.knobs if hasattr(plan, "knobs") else []
+            for spec in specs or []:
+                try:
+                    nm = spec.name if hasattr(spec, "name") else spec.get("name")
+                except Exception:  # noqa: BLE001, S110 - bad spec skips
+                    continue
+                if nm:
+                    surviving.add(str(nm).strip().lower())
+        except Exception:  # noqa: BLE001, S110 - bad plan shape excludes nothing
+            surviving = set()
+        excluded = surviving | {d.strip().lower() for d in dropped if d.strip()}
+        dropped_fams = {
+            fam_of[d.strip().lower()]
+            for d in dropped
+            if d.strip().lower() in fam_of
+        }
+        ranked: list[tuple[int, int, str]] = []
+        seen: set[str] = set()
+        for fam in uncovered:
+            for cand in by_fam.get(fam, []):
+                low = cand.lower()
+                if low in excluded or low in seen:
+                    continue
+                seen.add(low)
+                same_fam = 0 if fam in dropped_fams else 1
+                # Prefer alternatives whose known current value differs
+                # from a dropped proposal's value (actionable change).
+                diff = 1
+                try:
+                    cur = current_of.get(low, "")
+                    if cur:
+                        prop_vals = [
+                            proposed_of.get(d.strip().lower(), "")
+                            for d in dropped
+                        ]
+                        if any(
+                            pv and cur.strip().lower() != pv.strip().lower()
+                            for pv in prop_vals
+                        ):
+                            diff = 0
+                        elif not any(prop_vals):
+                            diff = 0
+                except Exception:  # noqa: BLE001, S110 - preference is best-effort
+                    pass
+                ranked.append((same_fam, diff, cand))
+        if not ranked:
+            return "", ""
+        ranked.sort(key=lambda t: (t[0], t[1], t[2].lower()))
+        suggestions = [c for _, _, c in ranked[:3]]
+        if not suggestions:
+            return "", ""
+        suffix = (
+            f" note: proposed knob(s) [{', '.join(dropped)}] were dropped "
+            "before this check (already at current value); try e.g. "
+            f"[{', '.join(suggestions)}] instead"
+        )
+        warning = (
+            f"dropped as no-op before diversity check: "
+            f"[{', '.join(dropped)}] (already at current value); "
+            f"try [{', '.join(suggestions)}] instead"
+        )
+        return suffix, warning
+    except Exception:  # noqa: BLE001 - suffix never throws
+        return "", ""
+
+
 def _family_diversity_violation(
     state: Any, plan: Any, inventory: dict[str, dict[str, Any]]
 ) -> tuple[str, list[str]]:
@@ -1096,6 +1270,15 @@ def _compile_candidate_inner(
         except Exception:  # noqa: BLE001, S110 - diversity never blocks compile
             div_reason, div_errors = "", []
         if div_reason:
+            try:
+                _suffix, _warning = _diversity_dropout_suffix(
+                    state, plan, inventory, inv_rejected
+                )
+            except Exception:  # noqa: BLE001, S110 - suffix never blocks compile
+                _suffix, _warning = "", ""
+            if _suffix:
+                div_reason = f"{div_reason}{_suffix}"
+                div_errors = list(div_errors or []) + [_warning]
             return CompileRejection(
                 reason=div_reason,
                 errors=div_errors,
@@ -1148,6 +1331,7 @@ def _compile_candidate_inner(
             exp_name=exp_name,
             phase=phase,
             valid_knobs=[spec.name for spec in plan.knobs],
+            dropped_knobs=list(inv_rejected or []),
         )
     except Exception as exc:
         name = "experiment"

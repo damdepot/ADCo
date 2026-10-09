@@ -173,6 +173,15 @@ class CompiledPlan(BaseModel):
     valid_knobs: list[str] = Field(
         default_factory=list, description="Knob names that passed validation"
     )
+    dropped_knobs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Per-knob drop reasons from inventory validation "
+            "(e.g. no-op equals-current-value notes); always populated, "
+            "even when valid knobs remain, so downstream gates can name "
+            "silently-dropped proposals instead of idling on them."
+        ),
+    )
 
 
 class CompileRejection(BaseModel):

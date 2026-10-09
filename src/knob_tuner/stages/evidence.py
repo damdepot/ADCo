@@ -454,7 +454,10 @@ def _last_rejection_lines(state: Mapping[str, Any]) -> list[str]:
         errors = rej.get("errors") or []
         if not isinstance(errors, list):
             errors = [errors]
-        errors = [str(e).strip() for e in errors if str(e).strip()][:2]
+        # Up to 3 errors: compile rejections now carry a one-line no-op
+        # dropout warning behind the diversity detail, and the LLM must see
+        # it to stop re-proposing knobs already at their current value.
+        errors = [str(e).strip() for e in errors if str(e).strip()][:3]
         design = str(rej.get("design_name", "") or "").strip()
         if not reason and not errors:
             return []
