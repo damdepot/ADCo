@@ -379,6 +379,14 @@ def materialize_inventory(ctx: Any, node_input: Any) -> dict[str, Any]:
         state["schema_info"] = schema_info
         state["db_version"] = output.db_version
         state["db_type"] = output.db_type
+        try:
+            state["inspector_status"] = str(output.status or "").strip().upper()
+        except Exception:
+            state["inspector_status"] = ""
+        try:
+            state["inspector_error"] = str(output.error_message or "")
+        except Exception:
+            state["inspector_error"] = ""
         return {
             "status": write_status,
             "knob_file": out_file,
@@ -605,7 +613,10 @@ def _compile_candidate_inner(
                             f"drop_knob: {', '.join(hit)} must be excluded per diagnosis"
                         )
                 elif correction == "shrink_set":
-                    if last_n is not None and distinct_n >= last_n:
+                    # Lower bound: a proposal needs >= 1 knob (empty levels are
+                    # rejected earlier), so at last_n <= 1 there is nothing left
+                    # to shrink — treat as satisfied instead of deadlocked.
+                    if last_n is not None and last_n > 1 and distinct_n >= last_n:
                         violations.append(
                             "shrink_set violation: proposal has "
                             f"{distinct_n} knobs, must be fewer than last "
@@ -1098,6 +1109,77 @@ def confirmation_controller(
             with contextlib.suppress(TypeError, ValueError):
                 max_attempts = int(max_attempts or DEFAULT_MAX_ATTEMPTS)
         max_attempts = max(1, int(max_attempts or DEFAULT_MAX_ATTEMPTS))
+
+        # Empty-inventory short-circuit: when the inspector FAILED (or yielded
+        # no knobs at all), every proposal — including stop_no_knobs_available
+        # — would be rejected with "no usable knobs after inventory
+        # validation" and retried to the cap. Exit done immediately instead.
+        try:
+            _knobs_info = state.get("knobs_info") or []
+            _available = state.get("available_knob_names")
+            _insp_status = str(state.get("inspector_status") or "").strip().upper()
+            # Only treat as empty-inventory when inventory was actually
+            # materialized (BOTH keys present and empty). States that never
+            # ran materialize_inventory (keys absent) must route normally.
+            try:
+                _sentinel: Any = object()
+                _has_both_keys = (
+                    state.get("knobs_info", _sentinel) is not _sentinel
+                    and state.get("available_knob_names", _sentinel)
+                    is not _sentinel
+                )
+            except Exception:
+                _has_both_keys = False
+            _inventory_empty = (
+                _has_both_keys and (not _knobs_info and not _available)
+            )
+            if _inventory_empty or _insp_status == "FAILED":
+                try:
+                    _err = str(state.get("inspector_error") or "").strip()
+                except Exception:
+                    _err = ""
+                _label = "failed:inventory_empty"
+                if _err:
+                    _label = f"failed:inventory_empty:{_err}"[:300]
+                _exp_hist = state.get("experiment_history")
+                if not isinstance(_exp_hist, list):
+                    _exp_hist = []
+                _rej_hist = state.get("rejected_history")
+                if not isinstance(_rej_hist, list):
+                    _rej_hist = []
+                with contextlib.suppress(Exception):
+                    ctx.route = "done"
+                _early_out: dict[str, Any] = {
+                    "validation_attempt_count": attempt,
+                    "max_attempts": max_attempts,
+                    "route": "done",
+                    "status": _label,
+                    "experiment_history": list(_exp_hist),
+                    "rejected_history": list(_rej_hist),
+                    "last_failure": list(_rej_hist),
+                    "reason": "inventory_empty",
+                }
+                # Preserve rejection audit trail on the early exit too.
+                try:
+                    _v = node_input
+                    if isinstance(_v, CompileRejection):
+                        _early_out["rejection_reason"] = _v.reason
+                        _early_out["rejection_errors"] = list(_v.errors or [])
+                        _early_out["design_name"] = _v.design_name or ""
+                    elif isinstance(_v, dict):
+                        if _v.get("reason"):
+                            _early_out["rejection_reason"] = str(_v.get("reason"))
+                        if isinstance(_v.get("errors"), list):
+                            _early_out["rejection_errors"] = [
+                                str(e) for e in (_v.get("errors") or [])
+                            ]
+                        if _v.get("design_name"):
+                            _early_out["design_name"] = str(_v.get("design_name"))
+                except Exception:
+                    pass
+                return _early_out
+        except Exception:
+            pass
 
         experiment_history = state.get("experiment_history")
         if not isinstance(experiment_history, list):
