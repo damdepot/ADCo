@@ -52,6 +52,34 @@ _RESTART_MODES = (ApplyMode.MANUAL,)
 _POSTGRES_TYPES = ("postgres", "postgresql")
 
 
+def _refresh_staging_port(staging_cfg: DBConfig, container: str | None) -> None:
+    """Refresh the staging port after a container restart without breaking DNS.
+
+    When the staging config uses a loopback/host-port path (``127.0.0.1`` or
+    ``localhost``), re-read the mapped host port via ``docker port``. When it
+    uses a container DNS name (Docker network path), keep the internal port
+    (3306 for MySQL, else 5432) and never call ``docker port``. Never raises.
+    """
+    try:
+        internal_port = 3306 if "my" in staging_cfg.db_type.lower() else 5432
+    except Exception:
+        internal_port = 5432
+    try:
+        host = str(staging_cfg.host or "").strip().lower()
+    except Exception:
+        host = ""
+    if host in ("127.0.0.1", "localhost"):
+        try:
+            staging_cfg.port = get_container_host_port(container, internal_port)
+        except Exception:
+            pass
+    else:
+        try:
+            staging_cfg.port = internal_port
+        except Exception:
+            pass
+
+
 class SnapshotRegistry:
     """Run-scoped cache of prepared-dataset snapshot images.
 
@@ -550,11 +578,7 @@ def _measure_baseline_reversal(
         timings["revert_restart_seconds"] = round(time.monotonic() - t0, 3)
         if not ok:
             raise RuntimeError(f"staging restart after revert failed: {message}")
-        internal_port = 3306 if "my" in staging_cfg.db_type.lower() else 5432
-        try:
-            staging_cfg.port = get_container_host_port(container, internal_port)
-        except Exception:
-            pass
+        _refresh_staging_port(staging_cfg, container)
 
     emit("running baseline reversal measurement...")
     t0 = time.monotonic()
@@ -1046,11 +1070,7 @@ def validate_plan(
                 reasons.append(f"staging restart failed: {message}")
                 emit(f"staging restart failed: {message}")
             else:
-                internal_port = 3306 if "my" in db_type.lower() else 5432
-                try:
-                    staging_cfg.port = get_container_host_port(container, internal_port)
-                except Exception:
-                    pass
+                _refresh_staging_port(staging_cfg, container)
 
         # 6. Verify the active settings.
         verify_input = [{"name": knob.name, "value": knob.value} for knob in plan.knobs]
