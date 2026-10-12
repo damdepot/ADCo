@@ -12,7 +12,7 @@ SHELL := /bin/bash
 # rewrite-only, intent-analyze and check do not require resources.
 
 # Define shortcuts/tasks that do not generate output files
-.PHONY: knob-tune check run rewrite-only tune-only intent-analyze lint test verify
+.PHONY: knob-tune check knob-check run rewrite-only tune-only intent-analyze lint test verify
 
 # ── Codebase intent analyzer ──
 intent-analyze:
@@ -77,6 +77,11 @@ check:
 	@echo "Running correctness checker..."
 	uv run python -m src.code_checker $(DIR) \
 		--model=gemini-3.5-flash-lite
+
+# ── Verify tuner-applied knobs are live on the database ──
+knob-check:
+	@echo "Running knob checker..."
+	uv run python -m src.knob_checker $(RUN_DIR) --db-type=$(DB_TYPE) --db-name=$(DB_NAME) --verbose
 
 # ── Phase 0 quality gate (Ruff-only) ──
 # NOTE: `check` is already the sandbox safety audit (`make check DIR=...`, see
