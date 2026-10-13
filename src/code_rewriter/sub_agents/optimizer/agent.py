@@ -21,7 +21,11 @@ def create_optimizer_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite",
         before_model_callback=make_buffer_callback(buffer_time),
         instruction=prompt.OPTIMIZER_AGENT_PROMPT,
         description="Optimizes one target function's database interaction code using the optimization context and surgically replaces it.",
-        tools=[tools.get_optimization_context, tools.replace_function],
+        tools=[
+            tools.get_optimization_context,
+            tools.replace_function,
+            tools.replace_query_constant,
+        ],
         output_key="optimizer_output",
         output_schema=OptimizerOutput,
         generate_content_config=types.GenerateContentConfig(

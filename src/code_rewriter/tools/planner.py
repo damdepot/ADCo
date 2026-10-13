@@ -11,6 +11,7 @@ from google.adk.tools import ToolContext
 
 from src.code_rewriter._common import _maybe_parse, format_intent_lines
 from src.code_rewriter.tools.pipeline_analysis import build_contracts_from_intent, build_target_context_map
+from src.code_rewriter.tools.query_constant import SINGLE_QUERY_PATTERN
 
 
 @dataclass
@@ -142,6 +143,41 @@ def _clean_name(name: str) -> str:
     return re.sub(r"^[\d.]+\s+", "", name).strip()
 
 
+def _preserve_single_query_contracts(
+    rebuilt: list, current: list[dict]
+) -> list[dict]:
+    """Dump *rebuilt* contracts, restoring SINGLE_QUERY pattern/strategy.
+
+    ``build_contracts_from_intent`` stamps the selected (often combining) strategy
+    onto every contract, which clobbers the SINGLE_QUERY pattern chosen during
+    discovery. Contracts already present with that pattern keep their original
+    pattern and strategy; everything else is left as rebuilt.
+    """
+    preserved: dict[tuple[str, str], tuple[str, str]] = {}
+    for contract in current or []:
+        if (contract.get("pattern") or "").upper() != SINGLE_QUERY_PATTERN:
+            continue
+        target = contract.get("target") or {}
+        key = (
+            target.get("file", ""),
+            target.get("qualified_function") or target.get("function") or "",
+        )
+        preserved[key] = (contract.get("pattern", ""), contract.get("strategy", ""))
+
+    merged: list[dict] = []
+    for contract in rebuilt:
+        data = contract.model_dump()
+        target = data.get("target") or {}
+        key = (
+            target.get("file", ""),
+            target.get("qualified_function") or target.get("function") or "",
+        )
+        if key in preserved:
+            data["pattern"], data["strategy"] = preserved[key]
+        merged.append(data)
+    return merged
+
+
 def get_optimization_strategies(tool_context: ToolContext) -> str:
     """Select applicable optimization strategies based on the extracted intent.
 
@@ -177,7 +213,9 @@ def get_optimization_strategies(tool_context: ToolContext) -> str:
                 selected_strategy_names=selected_names,
             )
             if contracts:
-                tool_context.state["rewrite_contracts"] = [c.model_dump() for c in contracts]
+                tool_context.state["rewrite_contracts"] = _preserve_single_query_contracts(
+                    contracts, tool_context.state.get("rewrite_contracts", [])
+                )
                 tool_context.state["target_context_map"] = build_target_context_map(
                     analyses, contracts, target_dir
                 )

@@ -6,6 +6,15 @@ Everything you need is provided by `get_optimization_context` — the target con
 
 The `replace_function` tool will REJECT your output if it is identical to the original — you MUST make real optimization changes. Successful replacements append a `Coverage:` line; if coverage is not complete, keep optimizing.
 
+## SINGLE_QUERY targets
+
+Some targets follow the SINGLE_QUERY pattern: the function issues exactly ONE SQL statement whose text is a plain-string `QUERY_<n>` class constant read via `cur.execute(self.QUERY_<n>)`. Only that constant reaches the benchmark (a decompiler extracts `QUERY_<n>` constants; the app itself is never run), so the function body is irrelevant and `replace_function` has no effect on the measured behavior.
+
+- Use `replace_query_constant(file, qualified_function, new_sql)` to rewrite ONLY the referenced `QUERY_<n>` constant's SQL. Do NOT call `replace_function` for these targets.
+- Keep the query semantics, the selected columns, and the SQL dialect identical; keep every placeholder and its parameter count identical; emit exactly one SQL statement.
+- Do NOT touch the function body, the class, or any other constant.
+- For every NON-SINGLE_QUERY target, use `replace_function` as described above; `get_optimization_context` renders the target class, the referenced constant name, and the CURRENT SQL for SINGLE_QUERY targets.
+
 ## Process
 
 0. NORMALIZE (do this first, before any batching change): convert any Python `%`-templating of SQL into an f-string. Interpolate ONLY the dynamic identifier (e.g. `S_DIST_%02d` -> a pre-formatted variable, or `{d_id:02d}`), and un-escape every `%%s` to a plain `%s`. Keep every value placeholder as `%s` (or `?`) and pass the values through `execute()` params. NEVER inline a parameter VALUE into SQL via f-string or `%`. NEVER apply Python `%` to a string that contains `%s` (Python consumes the `%s` and raises `TypeError: not enough arguments for format string`), and never mix f-string interpolation with `%` formatting in one statement. Do this FIRST so the `%`/`%s` collision is gone before you touch batching.
@@ -64,6 +73,7 @@ When a **Repair Request** is present, you are repairing your OWN previous attemp
 
 - You MUST change the database interaction code; replacing the function with unchanged code will be REJECTED.
 - Use `replace_function(file, qualified_function, new_function_code)` for the one target function; do not read the file and do not touch other functions.
+- For a SINGLE_QUERY target, use `replace_query_constant(file, qualified_function, new_sql)` instead and rewrite only the referenced `QUERY_<n>` constant's SQL.
 - Pass real newlines in `new_function_code`, NOT literal backslash-n. Don't escape quotes.
 - `replace_function` validates Python syntax — fix and retry if an ERROR is returned.
 - Do NOT change imports, EXCEPT the one allowed function-local `from psycopg2.extras import execute_batch` (or `execute_values`) for bulk writes.

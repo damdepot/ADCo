@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import sys
+import traceback
 from typing import Any
 
 from dotenv import load_dotenv
@@ -474,6 +475,7 @@ def main() -> None:
         )
     except Exception as exc:
         print(f"\n=== ADCo Pipeline FAILED ===\nError: {exc}", file=sys.stderr)
+        traceback.print_exc()
         sys.exit(1)
 
     print("\n=== ADCo Pipeline COMPLETED ===")

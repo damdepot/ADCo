@@ -24,6 +24,14 @@ from src.code_rewriter.models.rewrite_models import RewriteContract
 from src.code_rewriter.tools.ast_replacer import function_ast_dump, replace_function_ast
 from src.code_rewriter.tools.contract_verifier import verify_contract
 from src.code_rewriter.tools.pipeline_analysis import verify_all_contracts
+from src.code_rewriter.tools.query_constant import (
+    SINGLE_QUERY_PATTERN,
+    constant_ast_dump,
+    get_class_constant,
+    owning_class_name,
+    replace_class_constant,
+    target_constant_name,
+)
 from src.code_rewriter.tools.transformation_risk import (
     analyze_candidate,
     analyze_transformation,
@@ -474,6 +482,150 @@ def replace_function(
     )
 
 
+def _constant_diff(const_name: str, old_value: str, new_value: str) -> str:
+    """Render a unified diff between the current and candidate constant SQL."""
+    diff = difflib.unified_diff(
+        (old_value or "").splitlines(),
+        (new_value or "").splitlines(),
+        fromfile=f"{const_name} (current)",
+        tofile=f"{const_name} (candidate)",
+        lineterm="",
+    )
+    return "\n".join(diff)
+
+
+def replace_query_constant(
+    file: str,
+    qualified_function: str,
+    new_sql: str,
+    tool_context: ToolContext,
+) -> str:
+    """Replace the SQL text of the `QUERY_<n>` class constant a target reads.
+
+    A SINGLE_QUERY target issues exactly one statement via
+    ``cur.execute(self.QUERY_<n>)``; the benchmark extracts that constant, not the
+    function body, so optimizing it means rewriting the constant's SQL. Unlike
+    ``replace_function``, full coverage is not recomputed — the candidate is
+    validated with the single-target deterministic verifier.
+
+    Args:
+        file: Relative path to the file within the sandbox.
+        qualified_function: Qualified name of the target function (e.g. 'DatabaseClient.run_query1').
+        new_sql: Complete replacement SQL text for the referenced QUERY_<n> constant.
+    """
+    if not file:
+        return "ERROR: file is required"
+    if not isinstance(new_sql, str) or not new_sql.strip():
+        return "ERROR: new_sql must be a non-empty SQL string"
+
+    sandbox = tool_context.state.get("sandbox", "")
+    full = os.path.join(sandbox, file) if sandbox else file
+    if not os.path.isfile(full):
+        return f"ERROR: File not found: {file}"
+
+    try:
+        content = Path(full).read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"ERROR: Could not read file '{file}': {e}"
+
+    const_name = target_constant_name(content, qualified_function)
+    if const_name is None:
+        return _reject(
+            tool_context,
+            file,
+            qualified_function,
+            ["NO_QUERY_CONSTANT"],
+            (
+                f"ERROR: target '{qualified_function}' in {file} does not read a "
+                f"QUERY_<n> class constant — there is nothing for replace_query_constant "
+                f"to rewrite. Use replace_function for this target."
+            ),
+            "",
+            "",
+        )
+    class_name = owning_class_name(content, qualified_function)
+
+    exists, old_value = get_class_constant(content, class_name, const_name)
+    if not exists:
+        return _reject(
+            tool_context,
+            file,
+            qualified_function,
+            ["CONSTANT_NOT_FOUND"],
+            (
+                f"ERROR: '{qualified_function}' reads '{const_name}' but that constant "
+                f"was not found on class '{class_name}' in {file}."
+            ),
+            "",
+            "",
+        )
+
+    before_dump = constant_ast_dump(content, class_name, const_name)
+    success, reconstructed, err = replace_class_constant(
+        content, class_name, const_name, new_sql
+    )
+    if not success:
+        return _reject(
+            tool_context,
+            file,
+            qualified_function,
+            ["CONSTANT_REPLACE_FAILED"],
+            f"ERROR: Failed to replace constant '{const_name}': {err}",
+            "",
+            "",
+        )
+
+    after_dump = constant_ast_dump(reconstructed, class_name, const_name)
+    candidate_key = (
+        (after_dump or "")
+        + ":sha256:"
+        + hashlib.sha256(new_sql.encode("utf-8")).hexdigest()
+    )
+    diff = _constant_diff(const_name, old_value or "", new_sql)
+
+    if before_dump is not None and before_dump == after_dump:
+        return _reject(
+            tool_context,
+            file,
+            qualified_function,
+            ["AST_IDENTICAL"],
+            (
+                f"ERROR: replacement for constant '{const_name}' in {file} is identical "
+                f"to the original — you must ACTUALLY change the SQL."
+            ),
+            candidate_key,
+            diff,
+        )
+
+    codes, rejection = _write_time_gate(tool_context, file, content, reconstructed)
+    if rejection:
+        rejection = rejection.replace("replace_function", "replace_query_constant")
+        return _reject(
+            tool_context, file, qualified_function, codes, rejection, candidate_key, diff
+        )
+
+    sandbox_id = os.path.basename(sandbox) if sandbox else ""
+    reconstructed = _add_tag(file, reconstructed, sandbox_id)
+
+    try:
+        Path(full).write_text(reconstructed, encoding="utf-8")
+    except Exception as e:
+        return f"ERROR: Could not write file '{file}': {e}"
+
+    modified_files = tool_context.state.setdefault("modified_files", [])
+    if file not in modified_files:
+        modified_files.append(file)
+
+    _record_attempt(
+        tool_context, file, qualified_function, "APPLIED", [], "applied", candidate_key, diff
+    )
+
+    return (
+        f"Successfully replaced constant '{const_name}' in '{file}' "
+        f"for '{qualified_function}'"
+    )
+
+
 def _render_query_catalog(context_entry: dict) -> str:
     """Render the ground-truth query catalog (anti-hallucination)."""
     catalog = context_entry.get("query_catalog") or []
@@ -586,13 +738,53 @@ def _no_rewrite_directive(
         or previous_dump != original_dump
     ):
         return ""
+
+    contract = state.get("current_contract")
+    is_single_query = (
+        isinstance(contract, dict)
+        and (contract.get("pattern") or "").upper() == SINGLE_QUERY_PATTERN
+    )
+    if is_single_query:
+        const_name = target_constant_name(sandbox_source, qualified)
+        target_source = ""
+        target_dir = state.get("target", "")
+        if target_dir and file:
+            target_path = os.path.join(target_dir, file)
+            if os.path.isfile(target_path):
+                try:
+                    target_source = Path(target_path).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except Exception:
+                    target_source = ""
+        _, original_value = (
+            get_class_constant(
+                target_source, owning_class_name(target_source, qualified), const_name
+            )
+            if const_name and target_source
+            else (False, None)
+        )
+        _, sandbox_value = (
+            get_class_constant(
+                sandbox_source, owning_class_name(sandbox_source, qualified), const_name
+            )
+            if const_name
+            else (False, None)
+        )
+        if const_name and sandbox_value != original_value:
+            return ""
+        tool_call = "`replace_query_constant"
+        tool_args = "file, qualified_function, new_sql)` with new SQL for the referenced QUERY_<n> constant"
+    else:
+        tool_call = "`replace_function"
+        tool_args = "file, qualified_function, new_function_code)` with a complete, materially different implementation"
+
     return (
         "## CRITICAL: No rewrite applied\n"
         f"The sandbox function `{qualified}` is IDENTICAL to the original — your "
-        "previous run did not successfully call `replace_function`. Returning a "
+        "previous run did not successfully make a real change. Returning a "
         "summary alone is NOT acceptable. You MUST call "
-        "`replace_function(file, qualified_function, new_function_code)` with a "
-        "complete, materially different implementation and keep calling it until it "
+        f"{tool_call}{tool_args} and keep calling it until it "
         "returns `Successfully replaced`. If a rewrite is genuinely impossible, make "
         "your best valid attempt rather than finishing with no tool call."
     )
@@ -636,6 +828,17 @@ def _render_checklist(pattern: str) -> str:
     """Render the deterministic acceptance checklist for the target."""
     checklist = ["## Acceptance Checklist (deterministic — all must hold)"]
     pattern_upper = (pattern or "").upper()
+    if pattern_upper == SINGLE_QUERY_PATTERN:
+        checklist.extend(
+            [
+                "- rewrite ONLY the referenced QUERY_<n> constant's SQL; do not touch the function body or other constants",
+                "- keep query semantics, selected columns, and SQL dialect identical",
+                "- keep every placeholder and its parameter count identical",
+                "- exactly one SQL statement",
+                "- optimize ONLY this target via replace_query_constant; do not call replace_function",
+            ]
+        )
+        return "\n".join(checklist)
     if "N+1" in pattern_upper or "N_PLUS_ONE" in pattern_upper:
         checklist.append(
             "- 0 database operations inside any loop (strict zero — no "
@@ -655,6 +858,40 @@ def _render_checklist(pattern: str) -> str:
         ]
     )
     return "\n".join(checklist)
+
+
+def _render_single_query_target(
+    tool_context: ToolContext, file: str, qualified: str
+) -> str:
+    """Render the SINGLE_QUERY target: class, referenced constant, and current SQL."""
+    source = ""
+    for base in (tool_context.state.get("sandbox", ""), tool_context.state.get("target", "")):
+        if base and file and os.path.isfile(os.path.join(base, file)):
+            try:
+                source = Path(os.path.join(base, file)).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                break
+            except Exception:
+                continue
+
+    const_name = target_constant_name(source, qualified) if source else None
+    class_name = owning_class_name(source, qualified) if source else None
+    value = None
+    if source and const_name:
+        _, value = get_class_constant(source, class_name, const_name)
+
+    lines = ["## SINGLE_QUERY target"]
+    lines.append(f"- Target class: {class_name or '(none)'}")
+    lines.append(f"- Referenced constant: {const_name or '(none)'}")
+    if isinstance(value, str):
+        lines.append("- Current SQL:")
+        lines.append("```sql")
+        lines.extend((value or "").splitlines() or [""])
+        lines.append("```")
+    else:
+        lines.append("- Current SQL: (unresolved)")
+    return "\n".join(lines)
 
 
 def get_optimization_context(tool_context: ToolContext) -> str:
@@ -694,6 +931,11 @@ def get_optimization_context(tool_context: ToolContext) -> str:
     if function_source:
         sections.append(
             "## Target Function Source\n```python\n" + function_source + "\n```"
+        )
+
+    if (pattern or "").upper() == SINGLE_QUERY_PATTERN:
+        sections.append(
+            _render_single_query_target(tool_context, file, display_function)
         )
 
     sections.extend(
