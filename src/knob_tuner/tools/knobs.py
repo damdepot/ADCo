@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import os
-from pathlib import Path
 from typing import Any
 
 from src.knob_tuner.contracts import (
@@ -14,21 +11,41 @@ from src.knob_tuner.contracts import (
     SysbenchProfile,
 )
 from src.knob_tuner.tools.db_connector import DBConfig
-from src.knob_tuner.tools.knob_scope import build_knob_plan
+from src.knob_tuner.tools.knob_scope import build_knob_plan, requires_restart
+
+
+_APPLY_MODE_ALIASES = {
+    "dynamic": ApplyMode.LIVE,
+    "safe-auto": ApplyMode.LIVE,
+    "persist-static": ApplyMode.MANUAL,
+    "maintenance-assisted": ApplyMode.MANUAL,
+    "maintenance_assisted": ApplyMode.MANUAL,
+}
 
 
 def coerce_apply_mode(value: Any) -> ApplyMode:
     """Best-effort conversion of a raw apply-mode value to ``ApplyMode``."""
     if isinstance(value, ApplyMode):
         return value
+    if not isinstance(value, str):
+        return ApplyMode.LIVE
+    text = value.strip().lower()
+    if text in _APPLY_MODE_ALIASES:
+        return _APPLY_MODE_ALIASES[text]
     try:
-        return ApplyMode(str(value).strip().lower())
-    except (ValueError, AttributeError):
-        return ApplyMode.DYNAMIC
+        return ApplyMode(text)
+    except ValueError:
+        return ApplyMode.LIVE
 
 
 def coerce_profile(value: Any) -> SysbenchProfile:
-    """Coerce a raw profile value into a :class:`SysbenchProfile`."""
+    """Coerce a raw profile value into a :class:`SysbenchProfile`.
+
+    ponytail: this is a permissive state reader, so an invalid dict still falls
+    back to defaults rather than raising. CLI/JSON profiles go through
+    ``main._load_profile``, which validates strictly (extra keys are rejected by
+    ``SysbenchProfile``'s ``extra="forbid"``).
+    """
     if isinstance(value, SysbenchProfile):
         return value
     if isinstance(value, dict):
@@ -54,12 +71,8 @@ def coerce_db_config(value: Any) -> DBConfig | None:
                 port=int(value.get("port", default_port)),
                 user=value.get("user", ""),
                 password=value.get("password", ""),
-                database=(
-                    value.get("database")
-                    or value.get("db_name")
-                    or value.get("dbname")
-                    or ""
-                ),
+                # R3: canonical database name only (db_name/dbname mirrors deleted).
+                database=(value.get("database") or ""),
                 db_type=db_type,
                 env=value.get("env", "staging"),
                 restart_type=value.get("restart_type", "docker"),
@@ -116,8 +129,6 @@ def extract_knob_list(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
         if "recommendations" in value:
             value = value.get("recommendations") or []
-        elif "selected_knobs" in value:
-            value = value.get("selected_knobs") or []
         elif "knobs" in value:
             value = value.get("knobs") or []
         else:
@@ -144,25 +155,14 @@ def dedupe_by_name(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def load_raw_knobs(state: Any) -> list[dict[str, Any]]:
-    """Load raw knob recommendations from session state or a selected-knobs file.
+    """Load raw knob recommendations from session state.
 
-    Prefers ``selected_knobs`` (already memory-clamped by the recommender tool),
-    then ``knob_recommender_output``, then ``{knob_path}/knobs-selected.json``.
+    Reads ``knob_recommender_output``. Wave 4: the ``{knob_path}/knobs-selected.json``
+    file fallback was removed — the staged graph never writes that file, so
+    state is the single source of truth.
     """
     candidates: list[dict[str, Any]] = []
-    candidates.extend(extract_knob_list(state.get("selected_knobs")))
     candidates.extend(extract_knob_list(state.get("knob_recommender_output")))
-
-    if not candidates:
-        knob_path = state.get("knob_path") or state.get("target")
-        if knob_path:
-            path = os.path.join(str(knob_path), "knobs-selected.json")
-            if os.path.isfile(path):
-                try:
-                    data = json.loads(Path(path).read_text(encoding="utf-8"))
-                    candidates.extend(extract_knob_list(data))
-                except Exception:
-                    pass
 
     return dedupe_by_name(candidates)
 
@@ -179,7 +179,10 @@ def build_plan(
         if raw.get("name") and raw.get("restart_required")
     }
     for spec in plan.knobs:
-        if spec.scope == KnobScope.UNKNOWN and spec.name in raw_restart:
+        # Phase 4.7: single requires_restart helper (UNKNOWN-scope preserve).
+        if spec.scope == KnobScope.UNKNOWN and requires_restart(
+            scope=spec.scope, restart_required=spec.name in raw_restart
+        ):
             spec.restart_required = True
 
     return plan

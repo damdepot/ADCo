@@ -27,7 +27,6 @@ def test_build_rewrite_contract_valid_function_target():
         target=target,
         pattern="N+1 query",
         strategy="Batching",
-        must_preserve=["semantics"]
     )
     
     assert contract.target.file == "test.py"
@@ -36,8 +35,6 @@ def test_build_rewrite_contract_valid_function_target():
     assert contract.target.source_location.start_line == 10
     assert contract.pattern == "N+1 query"
     assert contract.strategy == "Batching"
-    assert len(contract.must_preserve) == 1
-    assert contract.must_preserve[0] == "semantics"
     assert contract.rewrite_id is not None
 
 def test_build_rewrite_contract_valid_method_target():

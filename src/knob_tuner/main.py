@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import dataclasses
 import datetime
 import json
 import math
@@ -33,31 +34,38 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from src.knob_tuner.agent import create_root_agent
 from src.knob_tuner.contracts import (
+    DEFAULT_EARLY_STOP_MIN_REPS,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_SET_KNOBS,
+    DEFAULT_MEASURE_REPS,
+    DEFAULT_MEASURE_SECONDS,
+    DEFAULT_MEASURE_WARMUP_SECONDS,
     ResourceBudget,
     RunManifest,
     SysbenchProfile,
     TuningStatus,
+    get_early_stop_min_reps,
+    get_measure_reps,
+    get_measure_seconds,
+    get_measure_warmup_seconds,
 )
-from src.knob_tuner.tools.db_connector import load_db_config
+from src.knob_tuner.stages.models import normalize_workload_profile
+from src.knob_tuner.tools.db_connector import DBConfig, load_db_config
 from src.knob_tuner.tools.docker_tools import (
     ACTIVE_CONTAINERS,
     cleanup_orphan_containers,
     stop_staging_db,
 )
 from src.knob_tuner.tools.run_artifacts import (
-    application_code_hash,
     create_run_dir,
     new_run_id,
     write_manifest,
 )
-from src.knob_tuner.tools.knobs import coerce_profile
 from src.intent_analyzer.main import run_pipeline as run_intent_analyzer
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-
-_cleanup_handlers_registered = False
 
 
 def _process_cleanup() -> None:
@@ -79,15 +87,12 @@ def _signal_handler(signum: int, frame: Any) -> None:
 
 def register_cleanup_handlers() -> None:
     """Register process-level atexit and signal handlers for safe container teardown."""
-    global _cleanup_handlers_registered
-    if not _cleanup_handlers_registered:
-        atexit.register(_process_cleanup)
-        try:
-            signal.signal(signal.SIGINT, _signal_handler)
-            signal.signal(signal.SIGTERM, _signal_handler)
-        except (ValueError, AttributeError):
-            pass
-        _cleanup_handlers_registered = True
+    atexit.register(_process_cleanup)
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except (ValueError, AttributeError):
+        pass
 
 
 # Automatically register on module import
@@ -161,38 +166,27 @@ def _parse_budget(cpu_cores_arg: Any, memory_arg: Any) -> ResourceBudget:
     return ResourceBudget(cpu_cores=cpu_cores, memory_gb=memory_gb)
 
 
-def _load_profile(source: Any) -> SysbenchProfile:
-    """Load a :class:`SysbenchProfile` from a path, dict, or profile instance.
+def _load_profile(source: str | None) -> SysbenchProfile:
+    """Load a :class:`SysbenchProfile` from a JSON path (or return defaults).
 
     Raises:
-        ValueError: If a supplied profile path or payload is missing or invalid.
+        ValueError: If a supplied profile path is missing or invalid.
     """
     if source is None:
         return SysbenchProfile()
-    if isinstance(source, SysbenchProfile):
-        return source
-    if isinstance(source, dict):
-        try:
-            return SysbenchProfile(**source)
-        except Exception as exc:
-            raise ValueError(f"invalid sysbench profile: {exc}") from exc
-    if isinstance(source, str):
-        path = os.path.abspath(source)
-        if not os.path.isfile(path):
-            raise ValueError(f"sysbench profile file not found: {path}")
-        try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise ValueError(
-                f"invalid sysbench profile JSON at {path}: {exc}"
-            ) from exc
-        if not isinstance(data, dict):
-            raise ValueError(f"sysbench profile at {path} must be a JSON object")
-        try:
-            return SysbenchProfile(**data)
-        except Exception as exc:
-            raise ValueError(f"invalid sysbench profile at {path}: {exc}") from exc
-    raise ValueError(f"unsupported sysbench profile value: {source!r}")
+    path = os.path.abspath(source)
+    if not os.path.isfile(path):
+        raise ValueError(f"sysbench profile file not found: {path}")
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"invalid sysbench profile JSON at {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"sysbench profile at {path} must be a JSON object")
+    try:
+        return SysbenchProfile(**data)
+    except Exception as exc:
+        raise ValueError(f"invalid sysbench profile at {path}: {exc}") from exc
 
 
 def _log_event(msg: str, log_file: str | None = None, verbose: bool = False) -> None:
@@ -205,8 +199,10 @@ def _log_event(msg: str, log_file: str | None = None, verbose: bool = False) -> 
         try:
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(formatted_msg + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            print(
+                f"[{timestamp}] warning: cannot write log file {log_file}: {exc}"
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -246,12 +242,95 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--apply-mode",
-        choices=["none", "dynamic", "persist-static"],
-        default="dynamic",
+        choices=[
+            "none",
+            "live",
+            "manual",
+        ],
+        default="live",
         help=(
-            "How validated knobs are applied live: 'dynamic' applies reloadable "
-            "knobs; 'persist-static' also persists restart-required knobs for a "
-            "manual restart (default: dynamic)"
+            "How validated knobs are applied: 'live' applies reloadable knobs "
+            "now and persists restart-required knobs for the next restart "
+            "(never auto-restarts); 'manual' emits SQL only and never mutates "
+            "(default: live; legacy spellings dynamic, safe-auto, "
+            "persist-static, maintenance-assisted still accepted)"
+        ),
+    )
+    parser.add_argument(
+        "--screen-total-rows",
+        type=int,
+        default=0,
+        help=(
+            "Total sysbench rows for the screening dataset; 0 derives it from the "
+            "inspected target's row estimates (default: 0)"
+        ),
+    )
+    parser.add_argument(
+        "--screen-max-rows",
+        type=int,
+        default=5_000_000,
+        help="Upper bound on the derived screening dataset size (default: 5000000)",
+    )
+    parser.add_argument(
+        "--screening-benchmark",
+        choices=["sysbench", "pgbench"],
+        default="sysbench",
+        help=(
+            "Measurement used by the screening gate: 'sysbench' OLTP (default) or "
+            "'pgbench' sort/hash analytical workload"
+        ),
+    )
+    parser.add_argument(
+        "--measure-reps",
+        type=int,
+        default=DEFAULT_MEASURE_REPS,
+        help=(
+            "Measurement reps per arm in single-fidelity mode: one "
+            "shared baseline plus one arm per plan, each with this many runs "
+            f"(default: {DEFAULT_MEASURE_REPS})"
+        ),
+    )
+    parser.add_argument(
+        "--measure-seconds",
+        type=int,
+        default=DEFAULT_MEASURE_SECONDS,
+        help=f"Measured seconds per repetition (default: {DEFAULT_MEASURE_SECONDS})",
+    )
+    parser.add_argument(
+        "--measure-warmup-seconds",
+        type=int,
+        default=DEFAULT_MEASURE_WARMUP_SECONDS,
+        help=(
+            "Warmup seconds per measurement arm "
+            f"(default: {DEFAULT_MEASURE_WARMUP_SECONDS})"
+        ),
+    )
+    parser.add_argument(
+        "--early-stop-min-reps",
+        type=int,
+        default=DEFAULT_EARLY_STOP_MIN_REPS,
+        help=(
+            "Minimum reps before an arm may stop early for futility "
+            "(95%% upper bound below zero); winners always run the full count "
+            f"(default: {DEFAULT_EARLY_STOP_MIN_REPS})"
+        ),
+    )
+    parser.add_argument(
+        "--max-set-knobs",
+        type=int,
+        default=DEFAULT_MAX_SET_KNOBS,
+        help=(
+            "Maximum distinct knobs per experiment; larger sets are rejected "
+            f"without spending a benchmark run (default: {DEFAULT_MAX_SET_KNOBS})"
+        ),
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_MAX_ATTEMPTS,
+        help=(
+            "Maximum screening attempts before the loop stops "
+            f"(default: {DEFAULT_MAX_ATTEMPTS})"
         ),
     )
     parser.add_argument(
@@ -260,35 +339,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Base directory for run-scoped artifacts (default: results/dco)",
     )
     parser.add_argument(
-        "--sysbench-profile",
-        default=None,
-        help="Optional path to a JSON sysbench profile",
-    )
-    parser.add_argument(
         "--db-config",
         default="db.config",
         help="Path to database connection config INI file (default: db.config)",
     )
     parser.add_argument(
-        "--production-db",
-        action="store_true",
-        default=False,
-        help="Target production environment database instead of staging",
-    )
-    parser.add_argument(
         "--log-file",
         default="logs/knob_tuner.log",
         help="Path to execution log file (default: logs/knob_tuner.log)",
-    )
-    parser.add_argument(
-        "--knob-path",
-        default="out/knob_tuner",
-        help="Directory to save generated knob configuration files (default: out/knob_tuner)",
-    )
-    parser.add_argument(
-        "--output-path",
-        default=None,
-        help="Optional additional path to write the final tuning result",
     )
     parser.add_argument(
         "--dry-run",
@@ -302,13 +360,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print detailed progress of each pipeline step",
     )
     parser.add_argument(
-        "--no-cleanup-orphans",
-        dest="cleanup_orphans",
-        action="store_false",
-        default=True,
-        help="Skip cleaning up orphan staging database containers on start (default: cleanup enabled)",
-    )
-    parser.add_argument(
         "--buffer-time",
         type=float,
         default=0.0,
@@ -317,61 +368,89 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _redact_db_config(cfg: DBConfig) -> dict[str, Any]:
+    """Return a JSON-serializable view of *cfg* with the password removed.
+
+    Session state is persisted and may be sent to a remote session service, so
+    secrets must never be stored there. The real :class:`DBConfig` is
+    reconstructed from ``db_config_path`` by the nodes that connect.
+    """
+    redacted = dataclasses.asdict(cfg)
+    redacted.pop("password", None)
+    return redacted
+
+
 def build_initial_state(
     target: str,
     db_type: str,
     budget: ResourceBudget,
     db_config_path: str,
-    production_db: bool,
     log_file: str,
     knob_path: str,
-    output_path: str | None,
     dry_run: bool,
     db_name: str = "",
     profile: SysbenchProfile | None = None,
     run_id: str = "",
     run_dir: str = "",
-    apply_mode: str = "dynamic",
+    apply_mode: str = "live",
+    screen_total_rows: int = 0,
+    screen_max_rows: int = 5_000_000,
+    screening_benchmark: str = "sysbench",
+    measure_reps: int = DEFAULT_MEASURE_REPS,
+    measure_seconds: int = DEFAULT_MEASURE_SECONDS,
+    measure_warmup_seconds: int = DEFAULT_MEASURE_WARMUP_SECONDS,
+    early_stop_min_reps: int = DEFAULT_EARLY_STOP_MIN_REPS,
+    max_set_knobs: int = DEFAULT_MAX_SET_KNOBS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> dict[str, Any]:
     """Construct the initial session state for the knob tuner workflow."""
     profile = profile or SysbenchProfile()
-    env = "production" if production_db else "staging"
     state: dict[str, Any] = {
         "target": target,
         "db_type": db_type,
-        "db_name": db_name,
         "database": db_name,
-        "dbname": db_name,
         "resource_budget": budget.model_dump(),
         "cpu_cores": budget.cpu_cores,
         "memory_gb": budget.memory_gb,
-        "memory": budget.memory_gb,
         "sysbench_profile": profile.model_dump(),
         "sysbench_profile_hash": profile.profile_hash(),
         "apply_mode": apply_mode,
         "run_id": run_id,
         "run_dir": run_dir,
         "db_config_path": db_config_path,
-        "config_path": db_config_path,
-        "production_db": production_db,
-        "env": env,
         "log_file": log_file,
         "knob_path": knob_path,
-        "output_path": output_path,
         "dry_run": dry_run,
         "validation_attempt_count": 0,
-        "max_validation_attempts": 4,
+        "max_attempts": max(1, int(max_attempts or DEFAULT_MAX_ATTEMPTS)),
+        "screen_total_rows": int(screen_total_rows),
+        "screen_max_rows": int(screen_max_rows),
+        "durability_profile": "strict",
+        "screening_benchmark": str(screening_benchmark or "sysbench"),
+        "workload_hint": "",
+        "measure_reps": int(measure_reps),
+        "measure_seconds": int(measure_seconds),
+        "measure_warmup_seconds": int(measure_warmup_seconds),
+        "early_stop_min_reps": int(early_stop_min_reps),
+        "max_set_knobs": max(1, int(max_set_knobs or DEFAULT_MAX_SET_KNOBS)),
+        # Staged-graph loop counters and the candidate/diagnosis context.
+        "experiment_history": [],
+        "rejected_history": [],
+        "workload_profile": normalize_workload_profile(None, ""),
     }
+    # Single source for the timing defaults + clamps (contracts is canonical).
+    state["measure_reps"] = get_measure_reps(state)
+    state["measure_seconds"] = get_measure_seconds(state)
+    state["measure_warmup_seconds"] = get_measure_warmup_seconds(state)
+    state["early_stop_min_reps"] = get_early_stop_min_reps(state)
 
     if os.path.isfile(db_config_path):
         try:
             cfg = load_db_config(db_config_path, db_type=db_type, db_override=db_name)
-            state["db_config"] = cfg
+            redacted = _redact_db_config(cfg)
+            state["db_config"] = redacted
+            # R3: canonical-only rewrite (mirrors db_name/dbname deleted).
             state["database"] = cfg.database
-            state["dbname"] = cfg.database
-            if production_db:
-                state["production_db_config"] = cfg
-                state["prod_db_config"] = cfg
         except Exception:
             pass
 
@@ -399,7 +478,16 @@ def _status_enum(state: dict[str, Any]) -> TuningStatus:
 
 
 def _manifest_from_state(state: dict[str, Any]) -> RunManifest:
-    """Build a :class:`RunManifest`, preferring one already in state."""
+    """Build a :class:`RunManifest`, preferring one already in state.
+
+    The construction itself lives in
+    :func:`src.knob_tuner.tools.run_artifacts.build_run_manifest` (single
+    source of truth shared with the in-graph ``finalize_node``); this
+    fallback only mirrors it when the workflow never produced a manifest
+    (e.g. a crash stub).
+    """
+    from src.knob_tuner.tools.run_artifacts import build_run_manifest
+
     raw = state.get("run_manifest")
     if isinstance(raw, RunManifest):
         return raw
@@ -408,40 +496,7 @@ def _manifest_from_state(state: dict[str, Any]) -> RunManifest:
             return RunManifest.model_validate(raw)
         except Exception:
             pass
-
-    profile = coerce_profile(state.get("sysbench_profile"))
-    status = _status_enum(state)
-    target = state.get("target", "") or ""
-    attestation = state.get("validation_attestation")
-    if isinstance(attestation, dict):
-        verified_knobs = attestation.get("verified_knobs", []) or []
-    else:
-        verified_knobs = []
-
-    attempts = state.get("validation_attempts") or []
-    attempt_count = len(attempts) or int(state.get("validation_attempt_count", 0) or 0)
-
-    return RunManifest(
-        run_id=state.get("run_id", "") or "",
-        timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        status=status,
-        resource_budget=state.get("resource_budget") or {},
-        db_engine=state.get("db_type", "") or "",
-        db_version=str(state.get("db_version") or ""),
-        db_image=state.get("db_image", "") or "",
-        application_target=target,
-        application_code_hash=application_code_hash(target),
-        knob_plan_hash=state.get("knob_plan_hash", "") or "",
-        sysbench_profile_hash=state.get("sysbench_profile_hash")
-        or profile.profile_hash(),
-        seed=profile.seed,
-        client_threads=profile.threads,
-        attempt_count=attempt_count,
-        applied_knobs=state.get("applied_knobs") or [],
-        verified_knobs=verified_knobs,
-        errors=list(state.get("staging_issues") or []),
-        final_status=status.value,
-    )
+    return build_run_manifest(state)
 
 
 def _write_output_result(output_path: str, state: dict[str, Any]) -> None:
@@ -461,10 +516,11 @@ def _write_output_result(output_path: str, state: dict[str, Any]) -> None:
         "run_id": state.get("run_id"),
         "run_dir": state.get("run_dir"),
         "db_type": state.get("db_type"),
-        "db_name": state.get("db_name"),
+        # R3: result.json keeps the external "db_name" field name, sourced
+        # from the canonical state key (mirrors deleted).
+        "db_name": state.get("database"),
         "resource_budget": state.get("resource_budget"),
         "apply_mode": state.get("apply_mode"),
-        "production_db": state.get("production_db", False),
         "dry_run": state.get("dry_run", False),
         "staging_validated": state.get("staging_validated", False),
         "status": _derive_status(state),
@@ -489,6 +545,30 @@ def _write_output_result(output_path: str, state: dict[str, Any]) -> None:
         json.dump(result_data, f, indent=2, default=str)
 
 
+def _refresh_latest_pointer(
+    results_dir: str,
+    run_dir: str,
+    log_file: str | None = None,
+    verbose: bool = False,
+) -> None:
+    """Best-effort refresh of ``<results_dir>/latest`` -> ``run_dir``.
+
+    Never raises: platforms without symlink support (or a pre-existing
+    ``latest`` that cannot be replaced) only yield a logged warning.
+    """
+    link = os.path.join(results_dir, "latest")
+    try:
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(run_dir, link)
+    except OSError as exc:
+        _log_event(
+            f"Could not refresh latest pointer {link}: {exc}",
+            log_file=log_file,
+            verbose=verbose,
+        )
+
+
 async def run_pipeline(
     target: str,
     model: str = DEFAULT_MODEL,
@@ -496,68 +576,81 @@ async def run_pipeline(
     cpu_cores_arg: Any = None,
     memory_arg: Any = None,
     db_config: str = "db.config",
-    production_db: bool = False,
     log_file: str = "logs/knob_tuner.log",
-    knob_path: str = "out/knob_tuner",
-    output_path: str | None = None,
     dry_run: bool = False,
     verbose: bool = False,
-    cleanup_orphans: bool = True,
     db_name: str = "",
     buffer_time: float = 0.0,
-    apply_mode: str = "dynamic",
+    apply_mode: str = "live",
     results_dir: str = "results/dco",
-    sysbench_profile: Any = None,
     extra_initial_state: dict[str, Any] | None = None,
+    screen_total_rows: int = 0,
+    screen_max_rows: int = 5_000_000,
+    screening_benchmark: str = "sysbench",
+    measure_reps: int = DEFAULT_MEASURE_REPS,
+    measure_seconds: int = DEFAULT_MEASURE_SECONDS,
+    measure_warmup_seconds: int = DEFAULT_MEASURE_WARMUP_SECONDS,
+    early_stop_min_reps: int = DEFAULT_EARLY_STOP_MIN_REPS,
+    max_set_knobs: int = DEFAULT_MAX_SET_KNOBS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> dict[str, Any]:
     """Execute the knob tuner pipeline using the ADK Runner and session service."""
-    register_cleanup_handlers()
-
     # 1. Resource contract FIRST: fail before any side effect.
     budget = _parse_budget(cpu_cores_arg, memory_arg)
-    profile = _load_profile(sysbench_profile)
+    # Sysbench profile always defaults (pareto rand_type); durability always
+    # strict; unconfirmed plans are never applied; orphans always cleaned up.
+    profile = SysbenchProfile()
 
     target_abs = os.path.abspath(target)
     db_config_abs = os.path.abspath(db_config)
-    knob_path_abs = os.path.abspath(knob_path)
     log_file_abs = os.path.abspath(log_file)
     results_dir_abs = os.path.abspath(results_dir)
 
     os.makedirs(os.path.dirname(log_file_abs), exist_ok=True)
-    os.makedirs(knob_path_abs, exist_ok=True)
     os.makedirs(results_dir_abs, exist_ok=True)
 
     # 2. Run-scoped artifacts.
     run_id = new_run_id()
     run_dir = create_run_dir(results_dir_abs, run_id)
+    # Knob artifacts live inside the run directory (single source of truth).
+    knob_path_abs = os.path.join(run_dir, "knobs")
+    os.makedirs(knob_path_abs, exist_ok=True)
 
-    if cleanup_orphans:
-        try:
-            orphans = cleanup_orphan_containers()
-            if orphans:
-                _log_event(
-                    f"Cleaned up {len(orphans)} stale orphan container(s): {', '.join(orphans)}",
-                    log_file=log_file_abs,
-                    verbose=verbose,
-                )
-        except Exception as exc:
-            _log_event(f"Orphan cleanup warning: {exc}", log_file=log_file_abs, verbose=verbose)
+    try:
+        orphans = cleanup_orphan_containers()
+        if orphans:
+            # cleanup_orphan_containers returns an int count; tolerate a list too.
+            count = orphans if isinstance(orphans, int) else len(orphans)
+            _log_event(
+                f"Cleaned up {count} stale orphan container(s)",
+                log_file=log_file_abs,
+                verbose=verbose,
+            )
+    except Exception as exc:
+        _log_event(f"Orphan cleanup warning: {exc}", log_file=log_file_abs, verbose=verbose)
 
     initial_state = build_initial_state(
         target=target_abs,
         db_type=db_type,
         budget=budget,
         db_config_path=db_config_abs,
-        production_db=production_db,
         log_file=log_file_abs,
         knob_path=knob_path_abs,
-        output_path=os.path.abspath(output_path) if output_path else None,
         dry_run=dry_run,
         db_name=db_name,
         profile=profile,
         run_id=run_id,
         run_dir=run_dir,
         apply_mode=apply_mode,
+        screen_total_rows=screen_total_rows,
+        screen_max_rows=screen_max_rows,
+        screening_benchmark=screening_benchmark,
+        measure_reps=measure_reps,
+        measure_seconds=measure_seconds,
+        measure_warmup_seconds=measure_warmup_seconds,
+        early_stop_min_reps=early_stop_min_reps,
+        max_set_knobs=max_set_knobs,
+        max_attempts=max_attempts,
     )
 
     initial_state["verbose"] = verbose
@@ -585,6 +678,11 @@ async def run_pipeline(
         except Exception as exc:
             _log_event(f"Intent analyzer warning: {exc}", log_file=log_file_abs, verbose=verbose)
 
+    # The staged graph reads a merged workload_profile (never the raw keys).
+    initial_state["workload_profile"] = normalize_workload_profile(
+        initial_state.get("workload_info"), ""
+    )
+
     session_service = InMemorySessionService()
     sid = uuid.uuid4().hex[:12]
     app_name = "knob_tuner"
@@ -609,7 +707,6 @@ async def run_pipeline(
     agent = create_root_agent(model=resilient_model, buffer_time=buffer_time)
     runner = Runner(agent=agent, app_name=app_name, session_service=session_service)
 
-    env_name = "production" if production_db else "staging"
     user_message = (
         f"Tune database configuration knobs for the codebase at: {target_abs}\n\n"
         f"Configuration details:\n"
@@ -617,7 +714,6 @@ async def run_pipeline(
         f"- Database Name: {db_name}\n"
         f"- CPU Cores: {budget.cpu_cores}\n"
         f"- Memory: {budget.memory_gb} GB\n"
-        f"- Target Environment: {env_name}\n"
         f"- Apply Mode: {apply_mode}\n"
         f"- Run ID: {run_id}\n"
         f"- Run Directory: {run_dir}\n"
@@ -664,6 +760,35 @@ async def run_pipeline(
             verbose=verbose,
         )
         _process_cleanup()
+        # Audit stub: a crashed run must still leave manifest.json +
+        # result.json in run_dir so readers see what happened and why.
+        # Best-effort only; the original exception is always re-raised.
+        try:
+            try:
+                crashed_session = await session_service.get_session(
+                    app_name=app_name, user_id="pipeline", session_id=sid
+                )
+                stub_state = dict(crashed_session.state)
+            except Exception:
+                stub_state = dict(initial_state)
+            stub_state.pop("run_manifest", None)
+            stub_state["result_status"] = TuningStatus.FAIL.value
+            stub_state["staging_validated"] = False
+            stub_issues = list(stub_state.get("staging_issues") or [])
+            crash_note = f"pipeline crash: {exc}"
+            if crash_note not in stub_issues:
+                stub_issues.append(crash_note)
+            stub_state["staging_issues"] = stub_issues
+            stub_manifest = _manifest_from_state(stub_state)
+            write_manifest(run_dir, stub_manifest)
+            stub_state["run_manifest"] = stub_manifest.model_dump()
+            _write_output_result(os.path.join(run_dir, "result.json"), stub_state)
+        except Exception as stub_exc:
+            _log_event(
+                f"Crash-stub write warning: {stub_exc}",
+                log_file=log_file_abs,
+                verbose=verbose,
+            )
         raise
 
     session = await session_service.get_session(
@@ -677,8 +802,9 @@ async def run_pipeline(
     final_state["run_manifest"] = manifest.model_dump()
 
     _write_output_result(os.path.join(run_dir, "result.json"), final_state)
-    if output_path:
-        _write_output_result(os.path.abspath(output_path), final_state)
+    _refresh_latest_pointer(
+        results_dir_abs, run_dir, log_file=log_file_abs, verbose=verbose
+    )
 
     _log_event(
         f"Pipeline completed (status={manifest.final_status}). Artifacts written to {run_dir}",
@@ -691,7 +817,6 @@ async def run_pipeline(
 
 def main() -> None:
     """CLI main entry point."""
-    register_cleanup_handlers()
     parser = build_parser()
     args = parser.parse_args()
 
@@ -700,10 +825,9 @@ def main() -> None:
         print(f"ERROR: target directory not found: {target}", file=sys.stderr)
         sys.exit(2)
 
-    # Validate the resource contract and profile BEFORE any side effect.
+    # Validate the resource contract BEFORE any side effect.
     try:
         _parse_budget(args.cpu_cores, args.memory)
-        _load_profile(args.sysbench_profile)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(2)
@@ -717,18 +841,22 @@ def main() -> None:
                 cpu_cores_arg=args.cpu_cores,
                 memory_arg=args.memory,
                 db_config=args.db_config,
-                production_db=args.production_db,
                 log_file=args.log_file,
-                knob_path=args.knob_path,
-                output_path=args.output_path,
                 dry_run=args.dry_run,
                 verbose=args.verbose,
-                cleanup_orphans=getattr(args, "cleanup_orphans", True),
                 db_name=args.db_name,
-                buffer_time=getattr(args, "buffer_time", 0.0),
+                buffer_time=args.buffer_time,
                 apply_mode=args.apply_mode,
                 results_dir=args.results_dir,
-                sysbench_profile=args.sysbench_profile,
+                screen_total_rows=args.screen_total_rows,
+                screen_max_rows=args.screen_max_rows,
+                screening_benchmark=args.screening_benchmark,
+                measure_reps=args.measure_reps,
+                measure_seconds=args.measure_seconds,
+                measure_warmup_seconds=args.measure_warmup_seconds,
+                early_stop_min_reps=args.early_stop_min_reps,
+                max_set_knobs=args.max_set_knobs,
+                max_attempts=args.max_attempts,
             )
         )
     except Exception as exc:
@@ -758,29 +886,65 @@ def main() -> None:
             print(f"  {idx}. {issue}")
 
     live_out = _maybe_parse(result.get("live_result", {}))
+    # The manifest mirrors live_result.pending_restart_knobs (shared builder),
+    # so the live result is authoritative and the manifest is the fallback.
     restart_knobs = (
         live_out.get("pending_restart_knobs", [])
-        or result.get("prod_restart_required_knobs", [])
         or manifest.get("pending_restart_knobs", [])
     )
+    manual_sql = live_out.get("manual_sql") or []
+    if manual_sql:
+        print("\n=== Manual SQL (manual) ===")
+        for statement in manual_sql:
+            print(f"  {statement}")
+        print("Apply these during your maintenance window, then restart the database.")
+
     print("\n=== Next Steps ===")
+    # Phase 1.6: report what actually happened to restart-required knobs —
+    # persisted live, skipped under live mode, emitted as manual SQL, or
+    # never applied — instead of unconditionally claiming persistence.
+    live_status = str(live_out.get("status", "") or "").upper()
+    live_reason = str(live_out.get("reason", "") or "")
+    applied_knobs = (
+        live_out.get("applied_knobs") or result.get("applied_knobs") or []
+    )
+    persisted_static = live_out.get("persisted_static_knobs") or []
     if restart_knobs:
         knob_names = [
             str(k.get("name") or k.get("knob") or k) if isinstance(k, dict) else str(k)
             for k in restart_knobs
         ]
         knob_names_str = ", ".join(filter(None, knob_names[:3]))
-        print("[!] Static configuration parameters have been persisted (e.g. postgresql.auto.conf).")
-        print(f"To activate these parameters ({knob_names_str}), restart the database during your next scheduled maintenance window:")
-        print("  - Docker:  docker restart <container_name>")
-        print("  - Systemd: sudo systemctl restart postgresql (or mysql)")
+        if persisted_static:
+            print("[!] Static configuration parameters have been persisted (e.g. postgresql.auto.conf).")
+            print(f"To activate these parameters ({knob_names_str}), restart the database during your next scheduled maintenance window:")
+            print("  - Docker:  docker restart <container_name>")
+            print("  - Systemd: sudo systemctl restart postgresql (or mysql)")
+        elif manual_sql:
+            print("[!] Static configuration parameters were NOT applied live; manual SQL was emitted above.")
+            print(f"Apply these during your maintenance window, then restart the database to activate ({knob_names_str}):")
+            print("  - Docker:  docker restart <container_name>")
+            print("  - Systemd: sudo systemctl restart postgresql (or mysql)")
+        elif applied_knobs:
+            print("[!] Static configuration parameters were skipped under live apply mode (not persisted).")
+            print(f"To apply ({knob_names_str}), re-run with --apply-mode manual, then restart the database during your next scheduled maintenance window:")
+            print("  - Docker:  docker restart <container_name>")
+            print("  - Systemd: sudo systemctl restart postgresql (or mysql)")
+        else:
+            detail = f"live apply status is {live_status}" if live_status else "live apply did not run"
+            if live_reason:
+                detail += f": {live_reason}"
+            print(f"[!] Static configuration parameters were NOT persisted ({detail}).")
+            print("No restart is required (nothing was applied).")
     else:
         print("No database restart is required.")
 
-    if args.dry_run or final_status == TuningStatus.PASS.value:
-        sys.exit(0)
+    # Phase 1.6: the exit code follows the real status. A failed validation
+    # is a failure even in dry-run mode (dry-run only skips mutations).
     if final_status == TuningStatus.FAIL.value:
         sys.exit(1)
+    if final_status == TuningStatus.PASS.value or args.dry_run:
+        sys.exit(0)
     sys.exit(3)
 
 

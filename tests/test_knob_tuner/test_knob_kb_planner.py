@@ -1,7 +1,5 @@
 """Unit tests for the knowledge-base planner tool."""
 
-import os
-import pytest
 from pydantic import BaseModel
 
 from src.knob_tuner.tools.kb_planner import (
@@ -11,7 +9,6 @@ from src.knob_tuner.tools.kb_planner import (
     _to_text,
     plan_knob_tuning,
     get_knob_strategies,
-    KB_PATH,
 )
 
 
@@ -270,4 +267,15 @@ def test_get_knob_strategies_fallback_keys():
     assert isinstance(res, str)
     assert "PG_CHECKER_REMEDIATION_AND_FAILURE_RECOVERY" in res
     assert tc.state.get("knob_strategies") == res
+
+
+def test_get_knob_strategies_surfaces_execution_memory_for_hint():
+    tc = MockToolContext({
+        "db_type": "postgres",
+        "workload_hint": "Analytical reporting: a heavy GROUP BY and hash aggregate spills to disk",
+        "memory_gb": 2.0,
+        "cpu_cores": 2,
+    })
+    res = get_knob_strategies(tc)
+    assert "PG_PER_QUERY_EXECUTION_MEMORY" in res
 

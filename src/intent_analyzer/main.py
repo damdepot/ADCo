@@ -17,6 +17,7 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
+from src.code_rewriter._common import _maybe_parse
 from src.intent_analyzer.agent import create_intent_analyzer_agent
 from src.intent_analyzer.tools.db_engine import (
     filter_paths_by_db_type,
@@ -26,15 +27,6 @@ from src.intent_analyzer.tools.db_engine import (
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-
-
-def _maybe_parse(val: Any) -> Any:
-    if isinstance(val, str):
-        try:
-            return json.loads(val)
-        except json.JSONDecodeError:
-            pass
-    return val
 
 
 def build_parser() -> argparse.ArgumentParser:

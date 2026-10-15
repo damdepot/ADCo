@@ -35,9 +35,11 @@ from src.code_rewriter.sub_agents.optimizer.agent import create_optimizer_agent
 from src.code_rewriter.sub_agents.verifier.agent import create_verifier_agent
 from src.code_rewriter.tools import copy_to_sandbox, get_optimization_strategies
 from src.code_rewriter.tools.pipeline_analysis import verify_contract_target
+from src.code_rewriter.tools.query_constant import SINGLE_QUERY_PATTERN, target_constant
 from src.code_rewriter.tools.transformation_risk import analyze_transformation
 
 MAX_ATTEMPTS_PER_TARGET = 5
+MAX_ATTEMPTS_SINGLE_QUERY = 2
 
 _STRATEGY_ERROR_CODES = {"STRATEGY_NOT_APPLIED", "MISSING_REWRITE", "INVALID_REWRITE"}
 
@@ -64,11 +66,6 @@ def _issue_signature(verdict: Any) -> tuple:
         if isinstance(v, dict)
     ]
     return tuple(sorted(issues, key=lambda item: tuple(str(part) for part in item)))
-
-
-def attempts_exhausted(attempts: int) -> bool:
-    """Return True once *attempts* reaches the per-target retry budget."""
-    return attempts >= MAX_ATTEMPTS_PER_TARGET
 
 
 def _function_unchanged(
@@ -98,6 +95,37 @@ def _function_unchanged(
     if not original_fn or not sandbox_fn:
         return False
     return original_fn == sandbox_fn
+
+
+def _target_unchanged(
+    target_dir: str, sandbox_dir: str, rel_file: str, function: str, pattern: str
+) -> bool:
+    """Constant-aware variant of ``_function_unchanged``.
+
+    A SINGLE_QUERY rewrite edits a ``QUERY_<n>`` class constant while leaving the
+    function body byte-identical, so function-source comparison would wrongly
+    report "no change". For SINGLE_QUERY, compare the referenced constant's
+    ``(exists, value)`` instead: unchanged or absent means no progress.
+    """
+    if (pattern or "").upper() != SINGLE_QUERY_PATTERN:
+        return _function_unchanged(target_dir, sandbox_dir, rel_file, function)
+    if not target_dir or not sandbox_dir or not rel_file or not function:
+        return False
+    try:
+        original_source = Path(os.path.join(target_dir, rel_file)).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        sandbox_source = Path(os.path.join(sandbox_dir, rel_file)).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except Exception:
+        return False
+    try:
+        _, original_exists, original_value = target_constant(original_source, function)
+        _, sandbox_exists, sandbox_value = target_constant(sandbox_source, function)
+    except Exception:
+        return False
+    return (original_exists, original_value) == (sandbox_exists, sandbox_value)
 
 
 def copy_node(ctx: Context, node_input: Any = None) -> Event:
@@ -164,6 +192,12 @@ def make_orchestrate(
         for contract in contracts:
             target = contract.get("target") or {}
             qfn = target.get("qualified_function") or target.get("function") or ""
+            pattern = contract.get("pattern") or ""
+            budget = (
+                MAX_ATTEMPTS_SINGLE_QUERY
+                if pattern.upper() == SINGLE_QUERY_PATTERN
+                else max_attempts
+            )
             sandbox = ctx.state.get("sandbox", "")
             rel_file = target.get("file", "")
             target_path = os.path.join(sandbox, rel_file) if sandbox and rel_file else ""
@@ -175,7 +209,7 @@ def make_orchestrate(
             failure: Any = None
             verdict: Any = None
 
-            for attempt in range(1, max_attempts + 1):
+            for attempt in range(1, budget + 1):
                 # Best-as-base: repair the best artifact so far rather than the
                 # last (possibly worse) one. Only from the second attempt on.
                 if attempt > 1 and best_bytes is not None and target_path:
@@ -203,8 +237,8 @@ def make_orchestrate(
                 )
                 if (
                     rel_file
-                    and _function_unchanged(
-                        ctx.state.get("target", ""), sandbox, rel_file, qfn
+                    and _target_unchanged(
+                        ctx.state.get("target", ""), sandbox, rel_file, qfn, pattern
                     )
                     and count_optimizer_attempts(ctx.state, rel_file, qfn)
                     == attempts_before
@@ -309,8 +343,8 @@ def make_orchestrate(
                 status = "PASS"
             else:
                 risk_rejected = qfn in (ctx.state.get("risk_rejections") or [])
-                unchanged = _function_unchanged(
-                    ctx.state.get("target", ""), sandbox, rel_file, qfn
+                unchanged = _target_unchanged(
+                    ctx.state.get("target", ""), sandbox, rel_file, qfn, pattern
                 )
                 if unchanged:
                     # The original function is preserved: either a HIGH-risk
@@ -354,7 +388,10 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
     n_total = len(results)
     n_pass = sum(1 for r in results if r.get("status") == "PASS")
     n_restricted = sum(1 for r in results if r.get("status") == "RESTRICTED")
-    all_ok = n_total > 0 and all(r.get("status") in ("PASS", "RESTRICTED") for r in results)
+    # Zero contracts is an accepted no-op: some datasets (e.g. the stats
+    # query-layer app) have no rewritable per-function pattern, so the
+    # rewriter must pass through unchanged rather than fail the pipeline.
+    all_ok = all(r.get("status") in ("PASS", "RESTRICTED") for r in results)
 
     errors = [
         v
@@ -383,7 +420,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         "transformed_targets": n_pass,
         "restricted_targets": n_restricted,
         "missing_targets": n_total - n_pass - n_restricted,
-        "rewrite_coverage": (n_pass / n_total) if n_total else 0.0,
+        "rewrite_coverage": (n_pass / n_total) if n_total else 1.0,
         "target_coverage": [
             {
                 "file": r.get("file", ""),

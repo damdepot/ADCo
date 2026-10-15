@@ -6,6 +6,8 @@ import pytest
 from src.knob_tuner.tools.db_connector import (
     DBConfig,
     _is_safe_query,
+    analyze_database,
+    checkpoint_database,
     get_connection,
     load_db_config,
     run_safe_query,
@@ -401,3 +403,56 @@ def test_run_safe_query_no_description(mock_db_config_pg, mock_db_conn):
 def test_run_safe_query_rejects_unsafe(mock_db_config_pg):
     with pytest.raises(ValueError, match="Unsafe query rejected"):
         run_safe_query(mock_db_config_pg, "DROP TABLE users;")
+
+
+def test_analyze_database_postgres_executes(mock_db_config_pg, mock_db_conn):
+    conn, cursor = mock_db_conn
+    with patch("src.knob_tuner.tools.db_connector.get_connection", return_value=conn):
+        assert analyze_database(mock_db_config_pg) is True
+    cursor.execute.assert_called_once_with("ANALYZE;")
+    cursor.close.assert_called_once()
+    conn.close.assert_called_once()
+
+
+def test_analyze_database_mysql_skips(mock_db_config_mysql):
+    with patch("src.knob_tuner.tools.db_connector.get_connection") as mock_conn:
+        assert analyze_database(mock_db_config_mysql) is False
+    mock_conn.assert_not_called()
+
+
+def test_analyze_database_never_raises(mock_db_config_pg):
+    with patch(
+        "src.knob_tuner.tools.db_connector.get_connection",
+        side_effect=RuntimeError("no db"),
+    ):
+        assert analyze_database(mock_db_config_pg) is False
+
+
+def test_checkpoint_database_postgres_executes(mock_db_config_pg, mock_db_conn):
+    conn, cursor = mock_db_conn
+    with patch("src.knob_tuner.tools.db_connector.get_connection", return_value=conn):
+        assert checkpoint_database(mock_db_config_pg) is True
+    cursor.execute.assert_called_once_with("CHECKPOINT;")
+    cursor.close.assert_called_once()
+    conn.close.assert_called_once()
+
+
+def test_checkpoint_database_mysql_skips(mock_db_config_mysql):
+    with patch("src.knob_tuner.tools.db_connector.get_connection") as mock_conn:
+        assert checkpoint_database(mock_db_config_mysql) is False
+    mock_conn.assert_not_called()
+
+
+def test_checkpoint_database_never_raises_on_connect(mock_db_config_pg):
+    with patch(
+        "src.knob_tuner.tools.db_connector.get_connection",
+        side_effect=RuntimeError("no db"),
+    ):
+        assert checkpoint_database(mock_db_config_pg) is False
+
+
+def test_checkpoint_database_never_raises_on_execute(mock_db_config_pg, mock_db_conn):
+    conn, cursor = mock_db_conn
+    cursor.execute.side_effect = RuntimeError("boom")
+    with patch("src.knob_tuner.tools.db_connector.get_connection", return_value=conn):
+        assert checkpoint_database(mock_db_config_pg) is False

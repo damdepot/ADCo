@@ -133,36 +133,6 @@ def unregister_active_container(container_name: str) -> None:
         ACTIVE_CONTAINERS.discard(container_name.strip())
 
 
-def get_active_containers() -> set[str]:
-    """Return a copy of currently tracked active container names."""
-    return set(ACTIVE_CONTAINERS)
-
-
-def is_docker_available() -> tuple[bool, str]:
-    """Check if Docker daemon is running and responsive.
-
-    Returns:
-        Tuple of (is_available: bool, message: str).
-    """
-    try:
-        proc = subprocess.run(
-            ["docker", "info"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if proc.returncode == 0:
-            return True, "Docker daemon is running and responsive."
-        err_msg = proc.stderr.strip() or proc.stdout.strip()
-        return False, f"Docker daemon is not running: {err_msg}"
-    except subprocess.TimeoutExpired:
-        return False, "Docker info check timed out after 10s"
-    except FileNotFoundError:
-        return False, "docker command not found in PATH"
-    except Exception as e:
-        return False, f"Unexpected error checking Docker availability: {e}"
-
-
 def get_container_host_port(container_name: str, internal_port: int = 5432, timeout: int = 15) -> int:
     """Get the mapped host port for a container's internal port.
 
@@ -201,6 +171,75 @@ def get_container_host_port(container_name: str, internal_port: int = 5432, time
     raise RuntimeError(
         f"Failed to parse mapped host port from docker port output: '{proc.stdout.strip()}'"
     )
+
+
+def commit_staging_db(container_name: str, image_name: str, timeout: int = 120) -> tuple[bool, str]:
+    """Commit a running staging DB container into a snapshot image.
+
+    Args:
+        container_name: Name or ID of the prepared Docker container.
+        image_name: Image tag to create from the container snapshot.
+        timeout: Maximum seconds to wait for the docker commit command.
+
+    Returns:
+        Tuple of (success: bool, message: str). Never raises.
+    """
+    if not container_name or not container_name.strip():
+        return False, "Container name cannot be empty"
+    if not image_name or not image_name.strip():
+        return False, "Image name cannot be empty"
+
+    container_name = container_name.strip()
+    image_name = image_name.strip()
+    try:
+        proc = subprocess.run(
+            ["docker", "commit", container_name, image_name],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode == 0:
+            return True, f"Snapshot image '{image_name}' created from container '{container_name}'"
+        err_msg = proc.stderr.strip() or proc.stdout.strip()
+        return False, f"Failed to commit container '{container_name}': {err_msg}"
+    except subprocess.TimeoutExpired:
+        return False, f"Timed out committing container '{container_name}' after {timeout}s"
+    except FileNotFoundError:
+        return False, "docker command not found in PATH"
+    except Exception as e:
+        return False, f"Unexpected error committing container '{container_name}': {e}"
+
+
+def cleanup_snapshot_image(image_name: str) -> tuple[bool, str]:
+    """Force-remove a snapshot image created from a staging DB container.
+
+    Args:
+        image_name: Image tag to delete.
+
+    Returns:
+        Tuple of (success: bool, message: str). Never raises.
+    """
+    if not image_name or not image_name.strip():
+        return False, "Image name cannot be empty"
+
+    image_name = image_name.strip()
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "rm", "-f", image_name],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if proc.returncode == 0:
+            return True, f"Snapshot image '{image_name}' removed"
+        err_msg = proc.stderr.strip() or proc.stdout.strip()
+        return False, f"Failed to remove snapshot image '{image_name}': {err_msg}"
+    except subprocess.TimeoutExpired:
+        return False, f"Timed out removing snapshot image '{image_name}'"
+    except FileNotFoundError:
+        return False, "docker command not found in PATH"
+    except Exception as e:
+        return False, f"Unexpected error removing snapshot image '{image_name}': {e}"
 
 
 def stop_staging_db(container_name: str, timeout: int = 15) -> tuple[bool, str]:
@@ -358,6 +397,7 @@ def start_staging_db(
     budget: ResourceBudget | None = None,
     database: str = "testdb",
     timeout: int = 60,
+    base_image: str | None = None,
 ) -> tuple[str, DBConfig]:
     """Start an ephemeral Docker container for staging database benchmarking.
 
@@ -368,6 +408,8 @@ def start_staging_db(
             no hidden default.
         database: Database name to create and initialize.
         timeout: Maximum seconds to wait for database readiness.
+        base_image: Optional pre-built snapshot image to boot from instead of
+            resolving an image from db_type/db_version.
 
     Returns:
         Tuple of (container_name: str, config: DBConfig).
@@ -391,7 +433,10 @@ def start_staging_db(
     if budget is None:
         raise ValueError("ResourceBudget is required to start the staging database")
 
-    image = resolve_docker_image(engine, db_version)
+    if base_image and base_image.strip():
+        image = base_image.strip()
+    else:
+        image = resolve_docker_image(engine, db_version)
     container_id_suffix = uuid.uuid4().hex[:8]
     container_name = f"adco-staging-{engine}-{container_id_suffix}"
 
@@ -408,6 +453,13 @@ def start_staging_db(
             f"POSTGRES_PASSWORD={password}",
             "-e",
             f"POSTGRES_DB={database}",
+            # Store the cluster outside the image's declared
+            # VOLUME /var/lib/postgresql/data. Docker excludes volume contents
+            # from `docker commit`, so keeping PGDATA on the container's writable
+            # layer is what makes the prepared-dataset snapshot actually carry
+            # the loaded data.
+            "-e",
+            "PGDATA=/pgdata",
         ]
         extra_args: list[str] = []
         readiness_cmd = [
@@ -479,7 +531,10 @@ def start_staging_db(
     if run_proc.returncode != 0:
         err_msg = run_proc.stderr.strip() or run_proc.stdout.strip()
         if "manifest unknown" in err_msg.lower() or "pull" in err_msg.lower() or "not found" in err_msg.lower():
-            fallback_image = "postgres:17" if engine == "postgres" else "mysql:8.4"
+            if base_image and base_image.strip():
+                fallback_image = resolve_docker_image(engine, db_version)
+            else:
+                fallback_image = "postgres:17" if engine == "postgres" else "mysql:8.4"
             idx = cmd.index(image)
             cmd[idx] = fallback_image
             try:
@@ -652,30 +707,44 @@ def restart_docker_db(
     except Exception as e:
         return False, f"Unexpected error restarting container '{container_name}': {e}"
 
-    # Build the readiness probe command based on db_type
+    # Build the readiness probes based on db_type. A bare liveness check can
+    # report ready while the instance is still starting up, so for Postgres a
+    # real query over the local socket is also required. ponytail: MySQL keeps
+    # the liveness probe because a credentialed query would couple this generic
+    # helper to staging credentials; add one if MySQL restart races show up.
     if db_type == "mysql":
-        probe_cmd = [
-            "docker", "exec", container_name,
-            "mysqladmin", "ping", "-uroot", "--silent",
+        probe_cmds = [
+            [
+                "docker", "exec", container_name,
+                "mysqladmin", "ping", "-uroot", "--silent",
+            ],
         ]
     else:
         # Default to postgres
-        probe_cmd = [
-            "docker", "exec", container_name,
-            "pg_isready", "-U", "postgres", "-h", "127.0.0.1",
+        probe_cmds = [
+            [
+                "docker", "exec", container_name,
+                "pg_isready", "-U", "postgres", "-h", "127.0.0.1",
+            ],
+            [
+                "docker", "exec", container_name,
+                "psql", "-U", "postgres", "-tAc", "SELECT 1",
+            ],
         ]
 
     # Poll until the database is ready or readiness_timeout elapses
     elapsed = 0
     while elapsed < readiness_timeout:
         try:
-            result = subprocess.run(
-                probe_cmd,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0:
+            if all(
+                subprocess.run(
+                    probe,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).returncode == 0
+                for probe in probe_cmds
+            ):
                 return (
                     True,
                     f"Docker container '{container_name}' restarted and ready",
@@ -699,6 +768,7 @@ def recreate_docker_db(
     database: str = "testdb",
     budget: ResourceBudget | None = None,
     timeout: int = 60,
+    base_image: str | None = None,
 ) -> tuple[bool, str, object]:
     """Stop, remove, and recreate a staging Docker container, returning the new config.
 
@@ -714,6 +784,8 @@ def recreate_docker_db(
         budget: Explicit resource budget for the new container. Required; there
             is no hidden default.
         timeout: Maximum seconds to wait for the new container to become ready.
+        base_image: Optional pre-built snapshot image to boot from instead of
+            resolving an image from db_type/db_version.
 
     Returns:
         Tuple of (success: bool, new_container_name_or_error: str, new_cfg_or_None).
@@ -730,6 +802,7 @@ def recreate_docker_db(
             database=database,
             budget=budget,
             timeout=timeout,
+            base_image=base_image,
         )
         return True, new_container_name, new_cfg
     except Exception as e:

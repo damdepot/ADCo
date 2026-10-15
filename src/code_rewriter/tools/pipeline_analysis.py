@@ -8,7 +8,8 @@ from ..models.rewrite_models import RewriteContract, RewriteTarget
 from .rewrite_contract import build_rewrite_contract
 from .contract_verifier import verify_contract, VerificationResult, TargetStatus, VerificationCheck, VerificationViolation
 from .dependency_graph import build_dependency_graph, slice_dependency_graph, format_dependency_slice_markdown
-from .._common import find_function_node
+from .query_constant import SINGLE_QUERY_PATTERN, referenced_query_constant
+from .._common import find_function_node, extract_function_source_by_name
 
 EXCLUDED_SETUP_FUNCTION_PATTERNS = {
     "_execute_ddl", "execute_ddl", "load_schema", "init_schema", 
@@ -40,11 +41,18 @@ def _pick_strategy(
     return selected_strategy_names[0]
 
 
+def _pick_single_query_strategy(selected_strategy_names: list[str] | None) -> str:
+    """Pick the first non-batch/loop/combining strategy for SINGLE_QUERY targets."""
+    if selected_strategy_names:
+        for name in selected_strategy_names:
+            if not any(hint in name.upper() for hint in _LOOP_STRATEGY_HINTS):
+                return name
+    return "PREDICATE_PUSHDOWN"
+
+
 def build_contracts_from_intent(
     target_dir: str, 
     intent_output: dict, 
-    strategy: str = "COMBINING_QUERIES", 
-    pattern: str = "N_PLUS_ONE_QUERY",
     selected_strategy_names: list[str] | None = None,
 ) -> tuple[dict[str, FileAnalysis], list[RewriteContract]]:
     targets = intent_output.get("optimization_targets", [])
@@ -111,24 +119,89 @@ def build_contracts_from_intent(
             qualified_function=fn.qualified_name,
             source_location=fn.source_location,
         )
-        contract_pattern = pattern if has_loop else "SEQUENTIAL_CHAIN"
-        contract_strategy = _pick_strategy(selected_strategy_names, has_loop, strategy)
+        contract_pattern = "N_PLUS_ONE_QUERY" if has_loop else "SEQUENTIAL_CHAIN"
+        contract_strategy = _pick_strategy(selected_strategy_names, has_loop, "COMBINING_QUERIES")
         contract = build_rewrite_contract(
             analysis=file_analysis,
             target=target,
             pattern=contract_pattern,
             strategy=contract_strategy,
         )
-        contract.targets = [RewriteTarget(
+        contract.targets = [target]
+        contract.allowed_regions = [fn.qualified_name or fn.name]
+        contracts.append(contract)
+
+    if not discovered:
+        contracts.extend(
+            _build_single_query_contracts(
+                analyses,
+                target_dir,
+                selected_strategy_names,
+            )
+        )
+
+    return analyses, contracts
+
+
+def _build_single_query_contracts(
+    analyses: dict[str, FileAnalysis],
+    target_dir: str,
+    selected_strategy_names: list[str] | None,
+) -> list[RewriteContract]:
+    """Fallback discovery: one QUERY_<n>-backed SQL statement per function."""
+    strategy = _pick_single_query_strategy(selected_strategy_names)
+
+    qualifiers: list[tuple[str, FunctionAnalysis]] = []
+    for rel_path, analysis in analyses.items():
+        abs_path = os.path.join(target_dir, rel_path)
+        try:
+            with open(abs_path, "r", encoding="utf-8") as f:
+                source = f.read()
+        except Exception:
+            continue
+
+        funcs_to_check = list(analysis.functions)
+        for cls in analysis.classes:
+            funcs_to_check.extend(cls.methods)
+
+        for fn in funcs_to_check:
+            if is_ddl_or_setup_func(fn) or fn.name == "main":
+                continue
+            if not any(
+                op.operation_type in ("EXECUTE", "EXECUTEMANY")
+                for op in fn.database_operations
+            ):
+                continue
+            fn_source = extract_function_source_by_name(
+                source, fn.qualified_name or fn.name
+            )
+            if referenced_query_constant(fn_source) is None:
+                continue
+            qualifiers.append((rel_path, fn))
+
+    contracts: list[RewriteContract] = []
+    for rel_path, fn in qualifiers:
+        analysis = analyses.get(rel_path)
+        if analysis is None:
+            continue
+        target = RewriteTarget(
             file=rel_path,
             function=fn.name,
             qualified_function=fn.qualified_name,
             source_location=fn.source_location,
-        )]
+        )
+        contract = build_rewrite_contract(
+            analysis=analysis,
+            target=target,
+            pattern=SINGLE_QUERY_PATTERN,
+            strategy=strategy,
+        )
+        contract.targets = [target]
         contract.allowed_regions = [fn.qualified_name or fn.name]
         contracts.append(contract)
-                
-    return analyses, contracts
+
+    return contracts
+
 
 def verify_all_contracts(
     target_dir: str, 
@@ -261,7 +334,7 @@ def verify_all_contracts(
         "DB_OPERATION_REMOVED", "INVALID_REWRITE", "BREAKING_DEPENDENCY",
         "MISSING_REWRITE", "STRATEGY_NOT_APPLIED", "UNTRANSFORMED_FUNCTION", "UNTRANSFORMED_TARGET",
         "MULTI_STATEMENT_EXECUTE", "DUPLICATE_WHERE", "UNKNOWN_QUERY_KEY",
-        "IMPLICIT_CROSS_JOIN"
+        "IMPLICIT_CROSS_JOIN", "QUERY_CONSTANT_NOT_PLAIN_STRING"
     }
     has_critical = any(v.severity == "ERROR" and v.code in critical_codes for v in all_violations)
 

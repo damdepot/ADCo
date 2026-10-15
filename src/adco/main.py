@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import sys
+import traceback
 from typing import Any
 
 from dotenv import load_dotenv
@@ -22,6 +23,18 @@ from src.knob_tuner.main import (
     _derive_status as _tuner_status,
     _parse_budget,
     run_pipeline as tuner_pipeline,
+)
+from src.knob_tuner.contracts import (
+    DEFAULT_EARLY_STOP_MIN_REPS,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_SET_KNOBS,
+    DEFAULT_MEASURE_REPS,
+    DEFAULT_MEASURE_SECONDS,
+    DEFAULT_MEASURE_WARMUP_SECONDS,
+    get_early_stop_min_reps,
+    get_measure_reps,
+    get_measure_seconds,
+    get_measure_warmup_seconds,
 )
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
@@ -102,29 +115,93 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--apply-mode",
-        choices=["none", "dynamic", "persist-static"],
-        default="dynamic",
+        choices=["none", "live", "manual"],
+        default="live",
         help=(
-            "How validated knobs are applied live: 'dynamic' applies reloadable "
-            "knobs; 'persist-static' also persists restart-required knobs for a "
-            "manual restart (default: dynamic)"
+            "How validated knobs are applied: 'live' applies reloadable knobs "
+            "now and persists restart-required knobs for the next restart "
+            "(never auto-restarts); 'manual' emits SQL only and never mutates "
+            "(default: live; legacy spellings dynamic, safe-auto, "
+            "persist-static, maintenance-assisted still accepted)"
         ),
     )
     p.add_argument(
-        "--knob-path",
-        default="out/adco/knobs",
-        help="Directory to save generated knob configuration files",
+        "--screen-total-rows",
+        type=int,
+        default=0,
+        help=(
+            "Total sysbench rows for the screening dataset; 0 (default) derives it "
+            "from the target database's row count"
+        ),
     )
     p.add_argument(
-        "--tuner-output",
-        default="out/adco/knob_result.json",
-        help="Path to write knob tuner result output",
+        "--screen-max-rows",
+        type=int,
+        default=5_000_000,
+        help=(
+            "Upper bound on the derived screening dataset size (default: 5000000). "
+            "Raise it when the target's working set exceeds the instance memory, "
+            "otherwise the proxy dataset stays cache-resident and the gate cannot "
+            "detect memory-knob improvements."
+        ),
     )
     p.add_argument(
-        "--production-db",
-        action="store_true",
-        default=False,
-        help="Target production environment database instead of staging",
+        "--measure-reps",
+        type=int,
+        default=DEFAULT_MEASURE_REPS,
+        help=(
+            "Measurement reps per arm in single-fidelity mode: one "
+            "shared baseline plus one arm per plan, each with this many runs "
+            f"(default: {DEFAULT_MEASURE_REPS})"
+        ),
+    )
+    p.add_argument(
+        "--measure-seconds",
+        type=int,
+        default=DEFAULT_MEASURE_SECONDS,
+        help=f"Measured seconds per repetition (default: {DEFAULT_MEASURE_SECONDS})",
+    )
+    p.add_argument(
+        "--measure-warmup-seconds",
+        type=int,
+        default=DEFAULT_MEASURE_WARMUP_SECONDS,
+        help=(
+            "Warmup seconds per measurement arm "
+            f"(default: {DEFAULT_MEASURE_WARMUP_SECONDS})"
+        ),
+    )
+    p.add_argument(
+        "--early-stop-min-reps",
+        type=int,
+        default=DEFAULT_EARLY_STOP_MIN_REPS,
+        help=(
+            "Minimum reps before an arm may stop early for futility "
+            f"(default: {DEFAULT_EARLY_STOP_MIN_REPS})"
+        ),
+    )
+    p.add_argument(
+        "--max-set-knobs",
+        type=int,
+        default=20,
+        help=(
+            "Maximum distinct knobs per experiment; larger sets are rejected "
+            "without spending a benchmark run (default: 20)"
+        ),
+    )
+    p.add_argument(
+        "--screening-benchmark",
+        choices=["sysbench", "pgbench"],
+        default="sysbench",
+        help=(
+            "Measurement used by the screening gate: 'sysbench' OLTP (default) or "
+            "'pgbench' sort/hash analytical workload"
+        ),
+    )
+    p.add_argument(
+        "--max-attempts",
+        type=int,
+        default=10,
+        help="Maximum tuner screening attempts before the loop stops (default: 10)",
     )
     p.add_argument(
         "--dry-run",
@@ -155,13 +232,19 @@ async def run_pipeline(
     db_config: str = "db.config",
     cpu_cores_arg: Any = "auto",
     memory_arg: Any = "auto",
-    knob_path: str = "out/adco/knobs",
-    tuner_output: str = "out/adco/knob_result.json",
-    production_db: bool = False,
     dry_run: bool = False,
     verbose: bool = False,
     buffer_time: float = 0.0,
-    apply_mode: str = "dynamic",
+    apply_mode: str = "live",
+    screen_total_rows: int = 0,
+    screen_max_rows: int = 5_000_000,
+    screening_benchmark: str = "sysbench",
+    measure_reps: int = DEFAULT_MEASURE_REPS,
+    measure_seconds: int = DEFAULT_MEASURE_SECONDS,
+    measure_warmup_seconds: int = DEFAULT_MEASURE_WARMUP_SECONDS,
+    early_stop_min_reps: int = DEFAULT_EARLY_STOP_MIN_REPS,
+    max_set_knobs: int = DEFAULT_MAX_SET_KNOBS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> dict[str, Any]:
     target_abs = os.path.abspath(target)
 
@@ -255,6 +338,24 @@ async def run_pipeline(
         tuner_extra_state: dict[str, Any] = {}
         if workload_info:
             tuner_extra_state["workload_info"] = workload_info
+        if screen_total_rows > 0:
+            tuner_extra_state["screen_total_rows"] = screen_total_rows
+        tuner_extra_state["screen_max_rows"] = screen_max_rows
+        tuner_extra_state["screening_benchmark"] = screening_benchmark
+        # Single source for timing defaults + clamps (contracts is canonical):
+        # these extra-state keys override build_initial_state, so normalize here.
+        timing = {
+            "measure_reps": measure_reps,
+            "measure_seconds": measure_seconds,
+            "measure_warmup_seconds": measure_warmup_seconds,
+            "early_stop_min_reps": early_stop_min_reps,
+        }
+        tuner_extra_state["measure_reps"] = get_measure_reps(timing)
+        tuner_extra_state["measure_seconds"] = get_measure_seconds(timing)
+        tuner_extra_state["measure_warmup_seconds"] = get_measure_warmup_seconds(timing)
+        tuner_extra_state["early_stop_min_reps"] = get_early_stop_min_reps(timing)
+        tuner_extra_state["max_set_knobs"] = max_set_knobs
+        tuner_extra_state["max_attempts"] = max_attempts
 
         tuner_state = await tuner_pipeline(
             target=sandbox,
@@ -263,10 +364,7 @@ async def run_pipeline(
             cpu_cores_arg=cpu_cores_arg,
             memory_arg=memory_arg,
             db_config=db_config,
-            production_db=production_db,
             log_file=log_file,
-            knob_path=knob_path,
-            output_path=tuner_output,
             dry_run=dry_run,
             verbose=verbose,
             db_name=db_name,
@@ -297,7 +395,10 @@ async def run_pipeline(
             open(rewriter_output).read() if os.path.exists(rewriter_output) else "{}"
         ),
         "knob_tuner": _maybe_parse(
-            open(tuner_output).read() if os.path.exists(tuner_output) else "{}"
+            open(os.path.join(tuner_run_dir, "result.json")).read()
+            if tuner_run_dir
+            and os.path.exists(os.path.join(tuner_run_dir, "result.json"))
+            else "{}"
         ),
     }
 
@@ -357,17 +458,24 @@ def main() -> None:
                 db_config=args.db_config,
                 cpu_cores_arg=args.cpu_cores,
                 memory_arg=args.memory,
-                knob_path=args.knob_path,
-                tuner_output=args.tuner_output,
-                production_db=args.production_db,
                 dry_run=args.dry_run,
                 verbose=args.verbose,
                 buffer_time=getattr(args, "buffer_time", 0.0),
                 apply_mode=args.apply_mode,
+                screen_total_rows=getattr(args, "screen_total_rows", 0),
+                screen_max_rows=getattr(args, "screen_max_rows", 5_000_000),
+                screening_benchmark=getattr(args, "screening_benchmark", "sysbench"),
+                measure_reps=args.measure_reps,
+                measure_seconds=args.measure_seconds,
+                measure_warmup_seconds=args.measure_warmup_seconds,
+                early_stop_min_reps=args.early_stop_min_reps,
+                max_set_knobs=getattr(args, "max_set_knobs", 20),
+                max_attempts=getattr(args, "max_attempts", 10),
             )
         )
     except Exception as exc:
         print(f"\n=== ADCo Pipeline FAILED ===\nError: {exc}", file=sys.stderr)
+        traceback.print_exc()
         sys.exit(1)
 
     print("\n=== ADCo Pipeline COMPLETED ===")

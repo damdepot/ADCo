@@ -8,11 +8,10 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from src.code_rewriter.main import (
-    _log_event,
-    _maybe_parse,
     _write_output_result,
     run_pipeline,
 )
+from src.code_rewriter._common import _maybe_parse, log_event as _log_event
 
 
 def test_maybe_parse():
@@ -72,8 +71,8 @@ def test_write_output_result(tmp_path):
 
 
 @patch("src.code_rewriter.main.Runner")
-@patch("src.code_rewriter.main.create_root_agent")
-def test_run_pipeline(mock_create_root_agent, mock_runner_class, tmp_path):
+@patch("src.code_rewriter.main.create_rewriter_workflow")
+def test_run_pipeline(mock_create_rewriter_workflow, mock_runner_class, tmp_path):
     log_file = tmp_path / "log.txt"
     out_file = tmp_path / "out.json"
     intent = {"optimization_targets": []}

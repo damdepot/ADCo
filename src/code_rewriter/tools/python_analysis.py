@@ -18,7 +18,7 @@ import builtins
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .sql_analysis import _FUNCTION_NODES, _FunctionAnalyzer, _iter_functions
+from .sql_analysis import _FUNCTION_NODES, _FunctionAnalyzer, _iter_analyzed, _iter_functions
 from .sql_resolver import SENTINEL, collect_module_dicts, resolve
 from .._common import target_names
 
@@ -166,18 +166,11 @@ def percent_format_arity_violations(source: str) -> List[dict]:
 
     Each violation is ``{"function", "line", "template", "expected", "actual"}``.
     """
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return []
-    module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()
-    for name, node in _iter_functions(tree):
-        analyzer = _ModFormatAnalyzer(name, module_dicts)
-        analyzer.analyze(node.body)
+    for name, analyzer in _iter_analyzed(source, _ModFormatAnalyzer):
         for binop, local_vars in analyzer.mod_nodes:
-            template = _raw_string(binop.left, local_vars, module_dicts)
+            template = _raw_string(binop.left, local_vars, analyzer.module_dicts)
             if not isinstance(template, str):
                 continue
             positional, named = _scan_conversions(template)
@@ -187,7 +180,7 @@ def percent_format_arity_violations(source: str) -> List[dict]:
             # interpolated fragments resolve to (they are often dynamic).
             if isinstance(binop.left, ast.JoinedStr) and (positional or named):
                 if binop.right is not None:
-                    supplied = _supplied_args(binop.right, local_vars, module_dicts) or (0, 0)
+                    supplied = _supplied_args(binop.right, local_vars, analyzer.module_dicts) or (0, 0)
                     _record_percent_violation(
                         violations,
                         seen,
@@ -200,7 +193,7 @@ def percent_format_arity_violations(source: str) -> List[dict]:
                 continue
             if SENTINEL in template:
                 continue
-            supplied = _supplied_args(binop.right, local_vars, module_dicts)
+            supplied = _supplied_args(binop.right, local_vars, analyzer.module_dicts)
             if supplied is None:
                 continue
             if named:

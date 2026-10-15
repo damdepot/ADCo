@@ -231,6 +231,65 @@ def get_connection(cfg: DBConfig) -> Any:
         )
 
 
+_POSTGRES_DDL_SUPPORTED = ("postgres", "postgresql")
+
+
+def _execute_pg_ddl(cfg: DBConfig, sql: str) -> bool:
+    """Best-effort PostgreSQL DDL execution; never raises.
+
+    Returns True only when the statement executed. An unsupported engine, a
+    connection failure, or an execution error returns False.
+    """
+    if cfg.db_type.lower() not in _POSTGRES_DDL_SUPPORTED:
+        return False
+    try:
+        conn = get_connection(cfg)
+    except Exception:
+        return False
+    try:
+        if hasattr(conn, "autocommit"):
+            try:
+                conn.autocommit = True
+            except Exception:
+                pass
+        cursor = conn.cursor()
+        try:
+            cursor.execute(sql)
+            if hasattr(conn, "commit") and not getattr(conn, "autocommit", False):
+                conn.commit()
+            return True
+        finally:
+            cursor.close()
+    except Exception:
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def analyze_database(cfg: DBConfig) -> bool:
+    """Best-effort ``ANALYZE`` to refresh planner statistics (PostgreSQL only).
+
+    A fresh bulk load leaves ``pg_class.reltuples`` stale, which under-sizes the
+    screening dataset. This refreshes statistics before row estimates are read.
+    Returns True only when the statement executed; never raises.
+    """
+    return _execute_pg_ddl(cfg, "ANALYZE;")
+
+
+def checkpoint_database(cfg: DBConfig) -> bool:
+    """Best-effort ``CHECKPOINT`` to flush dirty pages (PostgreSQL only).
+
+    A bulk load leaves a large volume of dirty buffers that a background
+    checkpoint would otherwise flush inside the measurement window, causing a
+    long stall. This forces the checkpoint before timing starts. Returns True
+    only when the statement executed; never raises.
+    """
+    return _execute_pg_ddl(cfg, "CHECKPOINT;")
+
+
 def run_safe_query(
     cfg: DBConfig, sql: str, params: tuple | None = None
 ) -> list[dict[str, Any]]:

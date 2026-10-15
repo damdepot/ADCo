@@ -4,6 +4,7 @@ import difflib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,46 @@ _NETWORK_ERRORS = re.compile(
     r"ConnectionError|NetworkError|getaddrinfo|Name or service not known|"
     r"Connection timed out|Temporary failure in name resolution"
 )
+
+_SHELL_METACHARACTERS = frozenset(";|&$`<>(){}\n\r\x00")
+_MAX_ENTRY_LENGTH = 1024
+_MAX_ARGS_LENGTH = 4096
+
+
+def _resolve_entry_path(sandbox: str, entry: str) -> str | None:
+    """Resolve *entry* to an existing file confined to *sandbox*.
+
+    Returns the absolute path when it is safe to execute, or ``None`` when the
+    entry is empty, oversized, contains shell metacharacters, escapes the
+    sandbox, or does not reference an existing file.
+    """
+    if not sandbox or not entry or len(entry) > _MAX_ENTRY_LENGTH:
+        return None
+    if any(ch in _SHELL_METACHARACTERS for ch in entry):
+        return None
+    sandbox_real = os.path.realpath(sandbox)
+    candidate = os.path.realpath(os.path.join(sandbox_real, entry))
+    if candidate != sandbox_real and not candidate.startswith(sandbox_real + os.sep):
+        return None
+    if not os.path.isfile(candidate):
+        return None
+    return candidate
+
+
+def _split_application_args(args: str) -> list[str] | None:
+    """Split *args* into an argv tail without involving a shell.
+
+    Returns an empty list for empty input, or ``None`` when the argument string
+    is oversized or cannot be parsed.
+    """
+    if not args:
+        return []
+    if len(args) > _MAX_ARGS_LENGTH:
+        return None
+    try:
+        return shlex.split(args)
+    except ValueError:
+        return None
 
 
 def _classify_failure(stderr: str, stdout: str) -> str | None:
@@ -189,7 +230,16 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
     if not entry:
         return "ERROR: no entry point"
 
-    cmd = f"{sys.executable} {entry} {args}".strip()
+    entry_path = _resolve_entry_path(sandbox, entry)
+    if not entry_path:
+        return f"ERROR: unsafe or missing entry point: {entry!r}"
+
+    arg_tokens = _split_application_args(args)
+    if arg_tokens is None:
+        return "ERROR: invalid application arguments"
+
+    argv = [sys.executable, entry_path, *arg_tokens]
+    cmd = shlex.join(argv)
     env = {
         **os.environ,
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -197,7 +247,7 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
     }
     try:
         proc = subprocess.Popen(
-            cmd, shell=True,
+            argv, shell=False,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=sandbox, env=env,
         )

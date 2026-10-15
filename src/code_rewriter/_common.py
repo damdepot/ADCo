@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import datetime
 import json
 import re
 
@@ -33,6 +34,20 @@ def make_buffer_callback(buffer_time: float = 0.0):
     async def buffer_callback(callback_context=None, llm_request=None, **kwargs):
         await asyncio.sleep(buffer_time)
     return buffer_callback
+
+
+def log_event(msg: str, log_file: str | None = None, verbose: bool = False) -> None:
+    """Write log entry to file and optionally stdout."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted_msg = f"[{timestamp}] {msg}"
+    if verbose:
+        print(formatted_msg)
+    if log_file:
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(formatted_msg + "\n")
+        except Exception:
+            pass
 
 
 def format_intent_lines(

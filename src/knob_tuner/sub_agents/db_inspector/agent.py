@@ -1,7 +1,6 @@
 """db_inspector sub-agent — inspects live DB schema, parameters, and synthesizes with workload."""
 
 import asyncio
-from typing import Union
 
 from google.adk.agents import LlmAgent
 from google.adk.models import BaseLlm
@@ -19,7 +18,7 @@ def make_buffer_callback(buffer_time: float = 0.0):
     return buffer_callback
 
 
-def create_db_inspector_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lite", buffer_time: float = 0.0) -> LlmAgent:
+def create_db_inspector_agent(model: str | BaseLlm = "gemini-3.5-flash-lite", buffer_time: float = 0.0) -> LlmAgent:
     """Create and return the db_inspector LlmAgent."""
     return LlmAgent(
         name="db_inspector",
@@ -30,7 +29,6 @@ def create_db_inspector_agent(model: Union[str, BaseLlm] = "gemini-3.5-flash-lit
         tools=[
             tools.check_schema,
             tools.extract_knobs,
-            tools.write_knobs_file,
         ],
         output_schema=DbInspectorOutput,
         output_key="db_inspector_output",

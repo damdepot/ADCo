@@ -27,7 +27,7 @@ def test_copy_entire_copies_files_to_sandbox(temp_sandbox_root):
         os.makedirs(os.path.join(source, "lib"))
         Path(os.path.join(source, "lib", "helpers.py")).write_text("def foo(): pass")
 
-        dest = copy_entire(source, sandbox_id="test_copier_1")
+        dest = copy_entire(source)
 
         assert os.path.isdir(dest)
         assert os.path.isfile(os.path.join(dest, "app.py"))
@@ -56,12 +56,54 @@ def test_copy_entire_excludes_pycache_and_git(temp_sandbox_root):
         os.makedirs(os.path.join(source, "sandbox"))
         Path(os.path.join(source, "sandbox", "secret.py")).write_text("secret")
 
-        dest = copy_entire(source, sandbox_id="test_copier_exclude")
+        dest = copy_entire(source)
 
         assert os.path.isfile(os.path.join(dest, "main.py"))
         assert not os.path.exists(os.path.join(dest, "__pycache__"))
         assert not os.path.exists(os.path.join(dest, ".git"))
         assert not os.path.exists(os.path.join(dest, "sandbox"))
+
+
+def test_copy_entire_refuses_to_delete_unmanaged_directory(temp_sandbox_root):
+    with tempfile.TemporaryDirectory() as source:
+        Path(os.path.join(source, "app.py")).write_text("print('hello')")
+        with tempfile.TemporaryDirectory() as parent:
+            dest = os.path.join(parent, "existing")
+            os.makedirs(dest)
+            Path(os.path.join(dest, "keep.txt")).write_text("precious")
+
+            with pytest.raises(copier_mod.SandboxSafetyError):
+                copy_entire(source, dest_override=dest)
+
+            assert os.path.isfile(os.path.join(dest, "keep.txt"))
+
+
+def test_copy_entire_replaces_managed_sandbox(temp_sandbox_root):
+    with tempfile.TemporaryDirectory() as source:
+        Path(os.path.join(source, "app.py")).write_text("one")
+        with tempfile.TemporaryDirectory() as parent:
+            dest = os.path.join(parent, "sandbox")
+            copy_entire(source, dest_override=dest)
+            Path(os.path.join(dest, "stale.py")).write_text("stale")
+
+            again = copy_entire(source, dest_override=dest)
+
+            assert again == os.path.abspath(dest)
+            assert os.path.isfile(os.path.join(dest, "app.py"))
+            assert not os.path.exists(os.path.join(dest, "stale.py"))
+
+
+def test_copy_entire_allows_precreated_empty_directory(temp_sandbox_root):
+    with tempfile.TemporaryDirectory() as source:
+        Path(os.path.join(source, "app.py")).write_text("one")
+        with tempfile.TemporaryDirectory() as parent:
+            dest = os.path.join(parent, "sandbox")
+            os.makedirs(dest)
+
+            result = copy_entire(source, dest_override=dest)
+
+            assert result == os.path.abspath(dest)
+            assert os.path.isfile(os.path.join(dest, "app.py"))
 
 
 def test_rewrite_imports_from_pkg_sub_util(temp_sandbox_root):
@@ -106,7 +148,7 @@ def test_rewrite_imports_import_pkg_sub_worker_as_worker(temp_sandbox_root):
         test_file = os.path.join(dest, "worker_test.py")
         Path(test_file).write_text("import pkg.sub.worker as worker\n")
 
-        count = rewrite_imports(dest, source_root)
+        _count = rewrite_imports(dest, source_root)
         rewritten = Path(test_file).read_text()
         assert "import worker as worker" in rewritten
         assert "pkg.sub.worker" not in rewritten
@@ -129,7 +171,7 @@ def test_rewrite_imports_dunder_import(temp_sandbox_root):
         test_file = os.path.join(dest, "dynamic_test.py")
         Path(test_file).write_text("__import__('pkg.sub.drivers.X')\n")
 
-        count = rewrite_imports(dest, source_root)
+        _count = rewrite_imports(dest, source_root)
         rewritten = Path(test_file).read_text()
         assert "__import__('drivers.X')" in rewritten
         assert "pkg.sub.drivers" not in rewritten
@@ -153,7 +195,7 @@ def test_rewrite_imports_from_pkg_sub_import_constants(temp_sandbox_root):
         test_file = os.path.join(dest, "constants_test.py")
         Path(test_file).write_text("from pkg.sub import constants\n")
 
-        count = rewrite_imports(dest, source_root)
+        _count = rewrite_imports(dest, source_root)
         rewritten = Path(test_file).read_text()
         assert "import constants" in rewritten
         assert "from pkg.sub import" not in rewritten

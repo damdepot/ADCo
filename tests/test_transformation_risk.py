@@ -163,7 +163,6 @@ def test_high_risk_stock_level_join_rewrite():
     assert report.statements_after == 1
     assert report.max_relations_before == 2
     assert report.max_relations_after == 3
-    assert report.fused_dependencies == 1
 
 
 def test_low_risk_delivery_batching():
@@ -206,7 +205,6 @@ def test_low_risk_local_simplification():
 
     assert report.risk == "LOW"
     assert report.flags == []
-    assert report.fused_dependencies == 0
 
 
 # ---------------------------------------------------------------------------

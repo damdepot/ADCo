@@ -1,13 +1,12 @@
 """Unit tests for db_tools module."""
 
-from unittest.mock import MagicMock, patch
-import pytest
+from unittest.mock import patch
 from src.knob_tuner.contracts import ApplyMode, KnobScope
 from src.knob_tuner.tools.db_connector import DBConfig
 from src.knob_tuner.tools.db_tools import (
     apply_knobs,
+    is_noop_value,
     snapshot_settings,
-    test_database as run_test_database,
     verify_active_knobs,
     _parse_time_to_ms,
     _parse_enumvals,
@@ -56,6 +55,22 @@ def test_apply_knobs_dry_run_mysql(mock_db_config_mysql):
     assert results[0]["sql"] == "SET GLOBAL innodb_buffer_pool_size = 1073741824;"
     assert results[1]["sql"] == "SET GLOBAL max_connections = 200;"
     assert results[2]["sql"] == "SET GLOBAL autocommit = 1;"
+
+
+def test_apply_knobs_escapes_malicious_value_postgres(mock_db_config_pg):
+    knobs = [{"name": "work_mem", "value": "1'; DROP TABLE users; --"}]
+    results = apply_knobs(knobs, mock_db_config_pg, dry_run=True)
+    assert results[0]["sql"] == (
+        "ALTER SYSTEM SET work_mem = '1''; DROP TABLE users; --';"
+    )
+
+
+def test_apply_knobs_escapes_malicious_value_mysql(mock_db_config_mysql):
+    knobs = [{"name": "work_mem", "value": "1'; DROP TABLE users; --"}]
+    results = apply_knobs(knobs, mock_db_config_mysql, dry_run=True)
+    assert results[0]["sql"] == (
+        "SET GLOBAL work_mem = '1''; DROP TABLE users; --';"
+    )
 
 
 def test_apply_knobs_empty_list(mock_db_config_pg):
@@ -140,7 +155,7 @@ def test_apply_knobs_mode_none_skips_all_no_connection(mock_db_config_pg):
         assert result["error"] is None
 
 
-def test_apply_knobs_mode_dynamic_excludes_static_and_rejects_internal(
+def test_apply_knobs_mode_live_applies_static_and_rejects_internal(
     mock_db_config_pg, mock_db_conn
 ):
     conn, cursor = mock_db_conn
@@ -150,19 +165,22 @@ def test_apply_knobs_mode_dynamic_excludes_static_and_rejects_internal(
         {"name": "max_worker_processes", "value": 8, "scope": "internal"},
     ]
     with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
-        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.DYNAMIC)
+        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.LIVE)
 
+    # LIVE applies the full plan: reloadable knobs go live now, restart-required
+    # (postmaster) knobs are persisted for the next restart; internal rejected.
     assert len(results) == 3
     assert results[0]["status"] == "applied"
-    assert results[1]["status"] == "skipped"
+    assert results[1]["status"] == "applied"
+    assert results[1]["sql"] == "ALTER SYSTEM SET shared_buffers = '1GB';"
     assert results[2]["status"] == "failed"
     assert results[2]["error"] == "internal knob rejected: max_worker_processes"
     assert results[2]["sql"] == ""
-    # One ALTER for work_mem + one pg_reload_conf()
-    assert cursor.execute.call_count == 2
+    # Two ALTERs + one pg_reload_conf()
+    assert cursor.execute.call_count == 3
 
 
-def test_apply_knobs_mode_persist_static_applies_full_plan_and_reloads(
+def test_apply_knobs_mode_manual_applies_full_plan_and_reloads(
     mock_db_config_pg, mock_db_conn
 ):
     conn, cursor = mock_db_conn
@@ -172,7 +190,7 @@ def test_apply_knobs_mode_persist_static_applies_full_plan_and_reloads(
         {"name": "max_worker_processes", "value": 8, "scope": "internal"},
     ]
     with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
-        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.PERSIST_STATIC)
+        results = apply_knobs(knobs, mock_db_config_pg, mode=ApplyMode.MANUAL)
 
     # Reloadable knobs go live; restart-required knobs are persisted (pending a
     # manual restart); internal knobs are rejected.
@@ -232,51 +250,6 @@ def test_snapshot_settings_empty_names(mock_db_config_pg):
     with patch("src.knob_tuner.tools.db_tools.run_safe_query") as mock_query:
         assert snapshot_settings(mock_db_config_pg, []) == {}
     mock_query.assert_not_called()
-
-
-def test_test_database_success(mock_db_config_pg, mock_db_conn):
-    conn, cursor = mock_db_conn
-    # Returns for:
-    # 1. SELECT 1 -> (1,)
-    # 2. SELECT table_name -> [('users',), ('posts',)]
-    # 3. SELECT val -> ('health_test',)
-    cursor.fetchone.side_effect = [(1,), ("health_test",)]
-    cursor.fetchall.return_value = [("users",), ("posts",)]
-
-    with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
-        res = run_test_database(mock_db_config_pg)
-        assert res["status"] == "ok"
-        assert res["checks"]["connectivity"] is True
-        assert res["checks"]["ping"] is True
-        assert res["checks"]["table_scan"] is True
-        assert res["checks"]["crud"] is True
-        assert res["details"]["tables_found"] == ["users", "posts"]
-        assert res["details"]["crud_result"] == "passed"
-        assert res["error"] is None
-
-
-def test_test_database_connectivity_failure(mock_db_config_pg):
-    with patch("src.knob_tuner.tools.db_tools.get_connection", side_effect=Exception("Connection refused")):
-        res = run_test_database(mock_db_config_pg)
-        assert res["status"] == "error"
-        assert res["checks"]["connectivity"] is False
-        assert res["error"] == "Connection refused"
-
-
-def test_test_database_crud_failure_and_cleanup(mock_db_config_pg, mock_db_conn):
-    conn, cursor = mock_db_conn
-    # Ping succeeds, schema scan succeeds, CRUD select returns unexpected value
-    cursor.fetchone.side_effect = [(1,), ("wrong_value",)]
-    cursor.fetchall.return_value = [{"table_name": "t1"}]
-
-    with patch("src.knob_tuner.tools.db_tools.get_connection", return_value=conn):
-        res = run_test_database(mock_db_config_pg)
-        assert res["status"] == "error"
-        assert res["checks"]["connectivity"] is True
-        assert res["checks"]["ping"] is True
-        assert res["checks"]["table_scan"] is True
-        assert res["checks"]["crud"] is False
-        assert "CRUD test failed" in res["error"]
 
 
 def test_parse_time_to_ms():
@@ -454,3 +427,50 @@ def test_verify_active_knobs_mysql(mock_db_config_mysql, mock_db_conn):
         assert res["all_verified"] is True
         for knob in res["knobs"]:
             assert knob["status"] == "VERIFIED"
+
+
+def test_is_noop_value_equivalent_memory_units():
+    entry = {"current_value": "524288", "unit": "8kB", "vartype": "integer"}
+    assert is_noop_value(entry, "4GB") is True
+    assert is_noop_value(entry, "4096MB") is True
+    assert is_noop_value(entry, "524288") is True
+
+
+def test_is_noop_value_rejects_genuine_change():
+    entry = {"current_value": "524288", "unit": "8kB", "vartype": "integer"}
+    assert is_noop_value(entry, "8GB") is False
+
+
+def test_is_noop_value_reads_setting_alias():
+    entry = {"setting": "4", "vartype": "integer"}
+    assert is_noop_value(entry, 4) is True
+    assert is_noop_value(entry, 5) is False
+
+
+def test_is_noop_value_missing_current_returns_false():
+    assert is_noop_value({}, "4GB") is False
+    assert is_noop_value({"current_value": ""}, "4GB") is False
+
+
+def test_is_noop_value_unknown_unit_falls_back_conservatively():
+    entry = {"current_value": "4", "unit": "furlongs", "vartype": ""}
+    assert is_noop_value(entry, "4") is True
+    assert is_noop_value(entry, "4xyz") is False
+
+
+def test_is_noop_value_bool_and_enum_equivalence():
+    assert is_noop_value({"current_value": "on", "vartype": "bool"}, "true") is True
+    assert (
+        is_noop_value(
+            {"current_value": "off", "vartype": "bool"},
+            "on",
+        )
+        is False
+    )
+    enum_entry = {
+        "current_value": "lz4",
+        "vartype": "enum",
+        "enumvals": ["off", "pglz", "lz4"],
+    }
+    assert is_noop_value(enum_entry, "lz4") is True
+    assert is_noop_value(enum_entry, "on") is False

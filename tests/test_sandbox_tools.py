@@ -1,6 +1,7 @@
 """Tests for rewriter sub-agent tools and schemas (no live agents)."""
 
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -734,6 +735,67 @@ def test_run_application_no_entry_point():
     assert "ERROR" in result
 
 
+def test_run_application_passes_argv_without_shell(monkeypatch):
+    import src.code_rewriter.sub_agents.verifier.tools as verifier_tools
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            captured["argv"] = args[0]
+            captured["kwargs"] = kwargs
+
+        def wait(self, timeout=None):
+            return 0
+
+        def communicate(self, timeout=None):
+            return "ok", ""
+
+    monkeypatch.setattr(verifier_tools.subprocess, "Popen", FakeProc)
+
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "app.py")).write_text("print('hi')\n")
+        tc = MockToolContext({
+            "sandbox": sandbox,
+            "file_selector_output": {"entry_point": "app.py"},
+        })
+
+        result = run_application("--flag value", tc)
+
+    assert result.startswith("STARTED_OK")
+    assert isinstance(captured["argv"], list)
+    assert captured["argv"][0] == sys.executable
+    assert os.path.basename(captured["argv"][1]) == "app.py"
+    assert captured["argv"][2:] == ["--flag", "value"]
+    assert captured["kwargs"].get("shell") is not True
+
+
+@pytest.mark.parametrize(
+    "evil_entry",
+    ["app.py; rm -rf /", "app.py$(whoami)", "app.py`id`", "../outside.py"],
+)
+def test_run_application_rejects_unsafe_entry(monkeypatch, evil_entry):
+    import src.code_rewriter.sub_agents.verifier.tools as verifier_tools
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("Popen must not be called for an unsafe entry")
+
+    monkeypatch.setattr(verifier_tools.subprocess, "Popen", _boom)
+
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "app.py")).write_text("print('hi')\n")
+        tc = MockToolContext({
+            "sandbox": sandbox,
+            "file_selector_output": {"entry_point": evil_entry},
+        })
+
+        result = run_application("$(touch /tmp/pwned)", tc)
+
+    assert result.startswith("ERROR")
+
+
 def test_run_application_classified_as_db_error():
     with tempfile.TemporaryDirectory() as sandbox:
         entry = "app.py"
@@ -1025,6 +1087,22 @@ def test_copy_to_sandbox_writes_sandbox_to_state():
         assert "OK" in result
         assert os.path.isdir(tc.state["sandbox"])
         assert os.path.isfile(os.path.join(tc.state["sandbox"], "app.py"))
+
+
+def test_copy_to_sandbox_refuses_unmanaged_sandbox_dir():
+    with tempfile.TemporaryDirectory() as root:
+        Path(os.path.join(root, "app.py")).write_text("print('hi')\n")
+        with tempfile.TemporaryDirectory() as parent:
+            sandbox_dir = os.path.join(parent, "existing")
+            os.makedirs(sandbox_dir)
+            Path(os.path.join(sandbox_dir, "keep.txt")).write_text("precious")
+            tc = MockToolContext({"target": root, "sandbox_dir": sandbox_dir})
+
+            result = copy_to_sandbox(tc)
+
+            assert result.startswith("ERROR")
+            assert os.path.isfile(os.path.join(sandbox_dir, "keep.txt"))
+            assert not tc.state.get("sandbox")
 
 
 def test_get_optimization_strategies_reads_structured_intent():

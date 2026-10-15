@@ -6,6 +6,15 @@ from typing import Any
 from src.knob_tuner.contracts import ApplyMode, KnobScope
 
 from .db_connector import DBConfig, get_connection, run_safe_query
+from .knob_scope import requires_restart
+from .knobs import coerce_apply_mode
+
+
+def _sql_string_literal(value: Any) -> str:
+    """Escape a value for use inside a single-quoted SQL string literal."""
+    text = str(value)
+    text = text.replace("\\", "\\\\").replace("'", "''")
+    return f"'{text}'"
 
 
 def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any, restart_required: bool = False) -> str:
@@ -31,7 +40,7 @@ def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any, restart_requ
         elif val_str.lower() in ("on", "off", "true", "false") or val_str.isdigit():
             return f"ALTER SYSTEM SET {knob_name} = {val_str};"
         else:
-            return f"ALTER SYSTEM SET {knob_name} = '{val_str}';"
+            return f"ALTER SYSTEM SET {knob_name} = {_sql_string_literal(val_str)};"
 
     elif db_type_norm == "mysql":
         # For MySQL, SET GLOBAL <knob> = <value>; or SET PERSIST_ONLY <knob> = <value>;
@@ -41,7 +50,7 @@ def _format_knob_sql(db_type: str, knob_name: str, knob_value: Any, restart_requ
         elif val_str.lower() in ("on", "off", "true", "false") or val_str.isdigit():
             return f"{cmd} {knob_name} = {val_str};"
         else:
-            return f"{cmd} {knob_name} = '{val_str}';"
+            return f"{cmd} {knob_name} = {_sql_string_literal(val_str)};"
 
     else:
         raise ValueError(f"Unsupported db_type for knob application: '{db_type}'")
@@ -74,19 +83,23 @@ def resolve_knob_scope(item: dict[str, Any]) -> KnobScope:
 
 
 def _knob_requires_restart(item: dict[str, Any], scope: KnobScope) -> bool:
-    """Whether the knob needs a restart (explicit flag or POSTMASTER scope)."""
-    return bool(item.get("restart_required")) or scope == KnobScope.POSTMASTER
+    """Whether the knob needs a restart (Phase 4.7: single helper)."""
+    return requires_restart(item, scope=scope)
 
 
 def _applies_in_mode(scope: KnobScope, mode: ApplyMode) -> bool:
-    """Return True when ``scope`` should be applied under ``mode``."""
+    """Return True when ``scope`` should be applied under ``mode``.
+
+    LIVE applies the full plan: reloadable knobs activate immediately while
+    restart-required (postmaster/static) knobs are persisted and only activate
+    on the operator's next restart. MANUAL executes nothing (it emits SQL
+    only). INTERNAL knobs are never applied under any mode.
+    """
     if scope == KnobScope.INTERNAL:
         return False
-    if mode == ApplyMode.DYNAMIC:
-        return scope not in (KnobScope.POSTMASTER, KnobScope.INTERNAL)
-    if mode == ApplyMode.PERSIST_STATIC:
-        # Apply the full plan: reloadable knobs go live, restart-required knobs
-        # are persisted and only activated by the operator's manual restart.
+    if mode == ApplyMode.LIVE:
+        return scope != KnobScope.INTERNAL
+    if mode == ApplyMode.MANUAL:
         return True
     return False
 
@@ -95,7 +108,7 @@ def apply_knobs(
     knobs: list[dict[str, Any]],
     cfg: DBConfig,
     dry_run: bool = False,
-    mode: ApplyMode = ApplyMode.DYNAMIC,
+    mode: ApplyMode = ApplyMode.LIVE,
 ) -> list[dict[str, Any]]:
     """Apply database configuration knobs to the target database.
 
@@ -105,7 +118,7 @@ def apply_knobs(
                'restart_required'.
         cfg: DBConfig object.
         dry_run: If True, only plan the SQL queries without executing them.
-        mode: Apply semantics (NONE/DYNAMIC/PERSIST_STATIC).
+        mode: Apply semantics (NONE/LIVE/MANUAL).
 
     Returns:
         List of dictionaries with ``knob``, ``value``, ``status``, ``sql`` and
@@ -114,11 +127,7 @@ def apply_knobs(
     if not knobs:
         return []
 
-    if not isinstance(mode, ApplyMode):
-        try:
-            mode = ApplyMode(str(mode).strip().lower())
-        except ValueError:
-            mode = ApplyMode.DYNAMIC
+    mode = coerce_apply_mode(mode)
 
     # NONE never touches the database and emits no SQL.
     if mode == ApplyMode.NONE:
@@ -247,7 +256,7 @@ def apply_knobs(
             # until the operator's manual restart.
             if (
                 cfg.db_type.lower() in ("postgres", "postgresql")
-                and mode in (ApplyMode.DYNAMIC, ApplyMode.PERSIST_STATIC)
+                and mode in (ApplyMode.LIVE, ApplyMode.MANUAL)
             ):
                 try:
                     cursor.execute("SELECT pg_reload_conf();")
@@ -330,131 +339,6 @@ def snapshot_settings(cfg: DBConfig, names: list[str]) -> dict[str, str]:
         return {}
     except Exception:
         return {}
-
-
-def test_database(cfg: DBConfig) -> dict[str, Any]:
-    """Perform health and connectivity validation tests on the database (Option A).
-
-    Checks:
-    1. Connectivity & Ping (SELECT 1)
-    2. Table scan (information_schema query)
-    3. Basic CRUD lifecycle test on a temporary test table
-
-    Args:
-        cfg: DBConfig object.
-
-    Returns:
-        Dictionary summarizing check results, status ('ok' | 'error'), and details.
-    """
-    report: dict[str, Any] = {
-        "status": "error",
-        "checks": {
-            "connectivity": False,
-            "ping": False,
-            "table_scan": False,
-            "crud": False,
-        },
-        "details": {
-            "tables_found": [],
-            "crud_result": "not_run",
-        },
-        "error": None,
-    }
-
-    test_table = "_adco_health_check"
-
-    conn = None
-    try:
-        # 1. Connectivity Check
-        conn = get_connection(cfg)
-        report["checks"]["connectivity"] = True
-
-        cursor = conn.cursor()
-        try:
-            # 1b. Ping Check
-            cursor.execute("SELECT 1 AS ping;")
-            row = cursor.fetchone()
-            if row is not None:
-                report["checks"]["ping"] = True
-
-            # 2. Table Scan Check
-            schema_sql = (
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'performance_schema', 'sys', 'mysql') "
-                "LIMIT 5;"
-            )
-            cursor.execute(schema_sql)
-            tables = cursor.fetchall()
-            found_tables = []
-            for t in tables:
-                if isinstance(t, dict):
-                    found_tables.append(t.get("table_name") or t.get("TABLE_NAME"))
-                elif isinstance(t, (tuple, list)):
-                    found_tables.append(t[0])
-                else:
-                    found_tables.append(str(t))
-            report["checks"]["table_scan"] = True
-            report["details"]["tables_found"] = found_tables
-
-            # 3. CRUD Lifecycle Test
-            cursor.execute(
-                f"CREATE TABLE IF NOT EXISTS {test_table} (id INT PRIMARY KEY, val VARCHAR(64));"
-            )
-            cursor.execute(
-                f"INSERT INTO {test_table} (id, val) VALUES (999, 'health_test');"
-            )
-            cursor.execute(f"SELECT val FROM {test_table} WHERE id = 999;")
-            fetched = cursor.fetchone()
-            val_match = False
-            if fetched:
-                if isinstance(fetched, dict):
-                    val_match = fetched.get("val") == "health_test"
-                elif isinstance(fetched, (tuple, list)):
-                    val_match = fetched[0] == "health_test"
-
-            if not val_match:
-                raise RuntimeError("CRUD test failed: inserted value did not match")
-
-            cursor.execute(
-                f"UPDATE {test_table} SET val = 'health_updated' WHERE id = 999;"
-            )
-            cursor.execute(f"DELETE FROM {test_table} WHERE id = 999;")
-            cursor.execute(f"DROP TABLE IF EXISTS {test_table};")
-            if hasattr(conn, "commit"):
-                conn.commit()
-
-            report["checks"]["crud"] = True
-            report["details"]["crud_result"] = "passed"
-            report["status"] = "ok"
-
-        except Exception as e:
-            report["error"] = str(e)
-            # Try to cleanup test table if created
-            try:
-                cursor.execute(f"DROP TABLE IF EXISTS {test_table};")
-                if hasattr(conn, "commit"):
-                    conn.commit()
-            except Exception:
-                pass
-        finally:
-            cursor.close()
-
-    except Exception as e:
-        report["error"] = str(e)
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    return report
-
-
-test_database.__test__ = False  # type: ignore[attr-defined]
-
-
-test_database.__test__ = False  # type: ignore[attr-defined]
 
 
 _PG_MEMORY_UNITS = {"b", "kb", "mb", "gb", "tb", "8kb", "16kb", "32kb", "64kb"}
@@ -608,6 +492,40 @@ def _values_are_equivalent(expected_val: Any, actual_val: Any, unit: str = "", v
 
 
 
+_NOOP_CURRENT_KEYS = ("current_value", "setting")
+
+
+def is_noop_value(entry: dict[str, Any], value: Any) -> bool:
+    """True when ``value`` is value-equivalent to the knob's current effective value.
+
+    ``entry`` is a knob-inventory record: the current setting is read from
+    ``current_value`` (falling back to ``setting``) and the ``unit``,
+    ``vartype`` and ``enumvals`` enrichment fields drive the comparison, so
+    ``"4GB"``, ``"4096MB"`` and page counts such as ``"524288"`` (with an
+    ``8kB`` unit) all compare equal. Returns ``False`` whenever the current
+    value is missing or the values cannot be parsed, so an unprovable no-op
+    never blocks a recommendation.
+    """
+    current: Any = None
+    for key in _NOOP_CURRENT_KEYS:
+        candidate = entry.get(key)
+        if candidate not in (None, ""):
+            current = candidate
+            break
+    if current is None:
+        return False
+    try:
+        return _values_are_equivalent(
+            value,
+            current,
+            unit=str(entry.get("unit") or ""),
+            vartype=str(entry.get("vartype") or ""),
+            enumvals=entry.get("enumvals"),
+        )
+    except Exception:
+        return False
+
+
 # ponytail: PostgreSQL knobs whose value "-1" means "auto". pg_settings.setting
 # reports the resolved value, so an exact string compare would always mismatch.
 _AUTO_KNOBS = {"wal_buffers"}
@@ -728,7 +646,8 @@ def verify_active_knobs(cfg: DBConfig, expected_knobs: list[dict[str, Any]]) -> 
                 if isinstance(row, dict):
                     k = row.get("VARIABLE_NAME") or row.get("Variable_name")
                     v = row.get("VARIABLE_VALUE") or row.get("Value")
-                    if k: settings_map[k.lower()] = v
+                    if k:
+                        settings_map[k.lower()] = v
                 else:
                     settings_map[str(row[0]).lower()] = row[1]
                     

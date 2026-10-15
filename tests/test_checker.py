@@ -1,10 +1,8 @@
 """Tests for checker tools and schemas (no live LLM)."""
 
-import os
 import tempfile
 from pathlib import Path
 
-import pytest
 
 from src.code_checker.models import CheckerIssue, CheckerOutput
 from src.code_checker.tools import find_modified_files, read_file, read_original_file, list_sandbox

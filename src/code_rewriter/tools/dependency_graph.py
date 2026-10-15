@@ -342,7 +342,6 @@ def slice_dependency_graph(
     visited: set[str] = {actual_target_id}
     sliced_nodes: Dict[str, DependencyNode] = {actual_target_id: target_node}
     sliced_edges: List[DependencyEdge] = []
-    is_truncated = False
 
     while queue:
         curr_id, curr_depth = queue.popleft()
@@ -360,7 +359,6 @@ def slice_dependency_graph(
                 if next_id in graph.nodes:
                     if next_id not in visited:
                         if len(sliced_nodes) >= max_nodes:
-                            is_truncated = True
                             break
                         visited.add(next_id)
                         sliced_nodes[next_id] = graph.nodes[next_id]
@@ -375,7 +373,6 @@ def slice_dependency_graph(
 
     # Gather database operations
     db_ops: List[Dict[str, Any]] = []
-    referenced_queries: Dict[str, str] = {}
     for node in sliced_nodes.values():
         if node.kind == NodeKind.DATABASE_OPERATION:
             op_dict = {
@@ -392,9 +389,6 @@ def slice_dependency_graph(
                 "code_snippet": node.code_snippet,
             }
             db_ops.append(op_dict)
-            referenced_sql = node.metadata.get("sql_template") or node.metadata.get("sql")
-            if referenced_sql:
-                referenced_queries[node.id] = referenced_sql
 
     # Gather state attributes
     state_attributes: List[str] = []
@@ -429,13 +423,10 @@ def slice_dependency_graph(
         target_id=actual_target_id,
         target_node=target_node,
         sliced_nodes=sliced_nodes,
-        sliced_edges=sliced_edges,
         class_context=class_context,
         database_operations=db_ops,
         state_attributes=state_attributes,
         relevant_imports=relevant_imports,
-        referenced_queries=referenced_queries,
-        is_truncated=is_truncated,
     )
 
 

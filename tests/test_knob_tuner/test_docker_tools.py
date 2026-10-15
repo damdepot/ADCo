@@ -9,7 +9,9 @@ from src.knob_tuner.contracts import ResourceBudget
 from src.knob_tuner.tools.db_connector import DBConfig
 from src.knob_tuner.tools.docker_tools import (
     cleanup_orphan_containers,
-    is_docker_available,
+    cleanup_snapshot_image,
+    commit_staging_db,
+    recreate_docker_db,
     resolve_docker_image,
     start_staging_db,
     stop_staging_db,
@@ -24,71 +26,6 @@ def budget(cpu_cores: int = 2, memory_gb: float = 2) -> ResourceBudget:
 
 
 VERIFY_OK = (True, "resources verified")
-
-
-# =====================================================================
-# is_docker_available tests
-# =====================================================================
-
-
-def test_is_docker_available_success():
-    mock_res = MagicMock(returncode=0, stdout="Server Version: 24.0.7\n", stderr="")
-    with patch("subprocess.run", return_value=mock_res) as mock_run:
-        ok, msg = is_docker_available()
-        assert ok is True
-        assert "running and responsive" in msg
-        mock_run.assert_called_once_with(
-            ["docker", "info"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-
-def test_is_docker_available_failure_with_stderr():
-    mock_res = MagicMock(
-        returncode=1,
-        stdout="",
-        stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
-    )
-    with patch("subprocess.run", return_value=mock_res):
-        ok, msg = is_docker_available()
-        assert ok is False
-        assert "Docker daemon is not running" in msg
-        assert "Cannot connect to the Docker daemon" in msg
-
-
-def test_is_docker_available_failure_with_stdout():
-    mock_res = MagicMock(
-        returncode=1,
-        stdout="Docker daemon error",
-        stderr="",
-    )
-    with patch("subprocess.run", return_value=mock_res):
-        ok, msg = is_docker_available()
-        assert ok is False
-        assert "Docker daemon is not running: Docker daemon error" in msg
-
-
-def test_is_docker_available_not_found():
-    with patch("subprocess.run", side_effect=FileNotFoundError):
-        ok, msg = is_docker_available()
-        assert ok is False
-        assert "docker command not found in PATH" in msg
-
-
-def test_is_docker_available_timeout():
-    with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="docker info", timeout=10)):
-        ok, msg = is_docker_available()
-        assert ok is False
-        assert "timed out after 10s" in msg
-
-
-def test_is_docker_available_unexpected_exception():
-    with patch("subprocess.run", side_effect=PermissionError("Permission denied")):
-        ok, msg = is_docker_available()
-        assert ok is False
-        assert "Unexpected error checking Docker availability: Permission denied" in msg
 
 
 # =====================================================================
@@ -859,5 +796,114 @@ def test_verify_container_resources_subprocess_exception():
         ok, msg = verify_container_resources("my-container", b)
         assert ok is False
         assert "Docker daemon died" in msg
+
+
+# =====================================================================
+# commit_staging_db tests
+# =====================================================================
+
+
+def test_commit_staging_db_success():
+    mock_res = MagicMock(returncode=0, stdout="sha256:abc\n", stderr="")
+    with patch("subprocess.run", return_value=mock_res) as mock_run:
+        ok, msg = commit_staging_db("prepared-container", "adco-snapshot:pg17", timeout=90)
+        assert ok is True
+        assert "Snapshot image 'adco-snapshot:pg17' created from container 'prepared-container'" in msg
+        mock_run.assert_called_once_with(
+            ["docker", "commit", "prepared-container", "adco-snapshot:pg17"],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+
+
+def test_commit_staging_db_failure():
+    mock_res = MagicMock(returncode=1, stdout="", stderr="Error: No such container")
+    with patch("subprocess.run", return_value=mock_res):
+        ok, msg = commit_staging_db("prepared-container", "adco-snapshot:pg17")
+        assert ok is False
+        assert "Failed to commit container 'prepared-container'" in msg
+        assert "No such container" in msg
+
+
+def test_commit_staging_db_empty_container_name():
+    ok, msg = commit_staging_db("   ", "adco-snapshot:pg17")
+    assert ok is False
+    assert "Container name cannot be empty" in msg
+
+
+# =====================================================================
+# cleanup_snapshot_image tests
+# =====================================================================
+
+
+def test_cleanup_snapshot_image_success():
+    mock_res = MagicMock(returncode=0, stdout="Untagged: adco-snapshot:pg17\n", stderr="")
+    with patch("subprocess.run", return_value=mock_res) as mock_run:
+        ok, msg = cleanup_snapshot_image("adco-snapshot:pg17")
+        assert ok is True
+        assert "Snapshot image 'adco-snapshot:pg17' removed" in msg
+        mock_run.assert_called_once_with(
+            ["docker", "image", "rm", "-f", "adco-snapshot:pg17"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+
+def test_cleanup_snapshot_image_failure():
+    mock_res = MagicMock(returncode=1, stdout="", stderr="Error: No such image")
+    with patch("subprocess.run", return_value=mock_res):
+        ok, msg = cleanup_snapshot_image("adco-snapshot:pg17")
+        assert ok is False
+        assert "Failed to remove snapshot image 'adco-snapshot:pg17'" in msg
+        assert "No such image" in msg
+
+
+def test_cleanup_snapshot_image_empty():
+    ok, msg = cleanup_snapshot_image("   ")
+    assert ok is False
+    assert "Image name cannot be empty" in msg
+
+
+# =====================================================================
+# start_staging_db / recreate_docker_db with base_image tests
+# =====================================================================
+
+
+def test_start_staging_db_uses_base_image():
+    run_res = MagicMock(returncode=0, stdout="cid\n", stderr="")
+    port_res = MagicMock(returncode=0, stdout="127.0.0.1:54321\n", stderr="")
+    exec_res = MagicMock(returncode=0, stdout="accepting connections\n", stderr="")
+
+    with patch("subprocess.run", side_effect=[run_res, port_res, MagicMock(returncode=0, stdout="10.0.0.2\n"), exec_res]) as mock_run, \
+         patch("src.knob_tuner.tools.docker_tools.verify_container_resources", return_value=VERIFY_OK), \
+         patch("src.knob_tuner.tools.docker_tools.run_safe_query", return_value=[{"1": 1}]):
+
+        cname, cfg = start_staging_db(
+            db_type="postgres",
+            budget=budget(),
+            base_image="adco-snapshot:prepared",
+        )
+
+        assert cname.startswith("adco-staging-postgres-")
+        run_cmd = mock_run.call_args_list[0][0][0]
+        assert "adco-snapshot:prepared" in run_cmd
+        assert "postgres:17" not in run_cmd
+
+
+def test_recreate_docker_db_passes_base_image():
+    new_cfg = DBConfig(host="10.0.0.1", port=5555, user="u", password="p", database="d", db_type="postgres", env="staging")
+    with patch("src.knob_tuner.tools.docker_tools.stop_staging_db") as _mock_stop, \
+         patch("src.knob_tuner.tools.docker_tools.start_staging_db", return_value=("new-container", new_cfg)) as mock_start:
+        ok, cname, cfg = recreate_docker_db(
+            "old-container",
+            budget=budget(),
+            base_image="adco-snapshot:prepared",
+        )
+        assert ok is True
+        assert cname == "new-container"
+        assert cfg == new_cfg
+        assert mock_start.call_args.kwargs["base_image"] == "adco-snapshot:prepared"
 
 

@@ -11,7 +11,6 @@ from src.code_rewriter.workflow import (
     MAX_ATTEMPTS_PER_TARGET,
     _attempt_score,
     _issue_signature,
-    attempts_exhausted,
     finalize,
     make_orchestrate,
     prepare,
@@ -34,13 +33,6 @@ def test_verifier_output_category_enum_rejects_unknown():
 def test_verifier_output_accepts_prompt_enum():
     out = VerifierOutput(status="FAIL", category="strategy_not_applied")
     assert out.category == "strategy_not_applied"
-
-
-def test_attempts_exhausted():
-    assert attempts_exhausted(MAX_ATTEMPTS_PER_TARGET) is True
-    assert attempts_exhausted(MAX_ATTEMPTS_PER_TARGET + 1) is True
-    assert attempts_exhausted(MAX_ATTEMPTS_PER_TARGET - 1) is False
-    assert attempts_exhausted(0) is False
 
 
 def test_prepare_seeds_state():
@@ -105,14 +97,15 @@ def test_finalize_passes_when_all_targets_pass():
     assert delta["deterministic_verification"]["transformed_targets"] == 1
 
 
-def test_finalize_fails_when_no_targets():
-    """An empty run must not vacuously PASS: zero targets is a FAIL."""
+def test_finalize_passes_when_no_targets():
+    """An empty run is a no-op PASS: datasets with no rewritable pattern pass through."""
     ctx = _FakeContext({"target_results": []})
     event = finalize(ctx)
     delta = event.actions.state_delta
-    assert delta["deterministic_verification"]["status"] == "FAIL"
-    assert delta["verifier_output"]["status"] == "FAIL"
+    assert delta["deterministic_verification"]["status"] == "PASS"
+    assert delta["verifier_output"]["status"] == "PASS"
     assert delta["deterministic_verification"]["expected_targets"] == 0
+    assert delta["deterministic_verification"]["rewrite_coverage"] == 1.0
 
 
 def test_finalize_surfaces_warnings_without_failing():

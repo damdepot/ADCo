@@ -34,6 +34,7 @@ from .python_analysis import (
     undefined_name_violations,
     slow_executemany_violations,
 )
+from .query_constant import SINGLE_QUERY_PATTERN, target_constant
 
 def _extract_function_ast_map(source: Optional[str]) -> Dict[str, ast.AST]:
     if not source:
@@ -59,6 +60,10 @@ def _is_n1(contract: RewriteContract) -> bool:
     pattern_upper = (contract.pattern or "").upper()
     strategy_upper = (contract.strategy or "").upper()
     return "N+1" in pattern_upper or "N_PLUS_ONE" in pattern_upper or "N_PLUS_ONE" in strategy_upper or "BATCH" in strategy_upper or "COMBINING" in strategy_upper
+
+def is_single_query(contract: RewriteContract) -> bool:
+    """True when the contract targets a SINGLE_QUERY (constant-only) rewrite."""
+    return (contract.pattern or "").upper() == SINGLE_QUERY_PATTERN
 
 _BATCH_SQL_RE = re.compile(r"\bIN\s*\(|=\s*ANY\s*\(|=\s*ALL\s*\(", re.IGNORECASE)
 _LOOP_QUERY_OPS = {"EXECUTE", "EXECUTEMANY"}
@@ -733,18 +738,85 @@ def check_rewrite_coverage(
                 ))
             continue
             
+        # SINGLE_QUERY rewrites edit the class-level QUERY_<n> constant, so the
+        # target function AST stays byte-identical: inspect the constant instead.
+        sq_wants = is_single_query(contract) and orig_source is not None and opt_source is not None
+        sq_orig_value: Optional[str] = None
+        sq_name: Optional[str] = None
+        sq_exists = False
+        sq_value: Optional[str] = None
+        if sq_wants:
+            _sq_orig_name, _sq_orig_exists, sq_orig_value = target_constant(orig_source, fn_key)
+            sq_name, sq_exists, sq_value = target_constant(opt_source, fn_key)
+
+        # Decompile-safety: a referenced constant that is no longer a plain string
+        # is silently dropped from the benchmark, so flag it as an ERROR.
+        if is_single_query(contract) and sq_name and sq_exists and sq_value is None:
+            violations.append(VerificationViolation(
+                code="QUERY_CONSTANT_NOT_PLAIN_STRING",
+                severity="ERROR",
+                message=(
+                    f"Target '{fn_key}' in '{t.file}' references '{sq_name}', but it is no "
+                    "longer a plain string constant. The decompiler only extracts plain-string "
+                    "QUERY_<n> constants and silently drops the rest; assign a string literal."
+                ),
+            ))
+
         # Check if AST is unchanged
         if orig_node is not None and opt_node is not None and ast.dump(orig_node) == ast.dump(opt_node):
-            target_coverage.append(TargetStatus(
+            unchanged = TargetStatus(
                 file=t.file,
                 function=fn_key,
                 status="MISSING_REWRITE",
                 details=f"Expected optimization target '{fn_key}' in '{t.file}' remains structurally unchanged"
-            ))
-            violations.append(VerificationViolation(
+            )
+            unchanged_violation = VerificationViolation(
                 code="MISSING_REWRITE",
                 severity="ERROR",
                 message=f"Expected optimization target '{fn_key}' in '{t.file}' remains structurally unchanged"
+            )
+
+            if not (is_single_query(contract) and sq_wants):
+                target_coverage.append(unchanged)
+                violations.append(unchanged_violation)
+                continue
+
+            # SINGLE_QUERY: a changed referenced constant is the rewrite.
+            if sq_name is not None and sq_exists and sq_value is not None and sq_value != sq_orig_value:
+                target_coverage.append(TargetStatus(
+                    file=t.file,
+                    function=fn_key,
+                    status="TRANSFORMED",
+                    details=(
+                        f"SINGLE_QUERY target '{fn_key}' in '{t.file}': constant '{sq_name}' "
+                        "value changed (function body unchanged by design)."
+                    )
+                ))
+                continue
+
+            if sq_name is None or not sq_exists:
+                detail = (
+                    f"SINGLE_QUERY target '{fn_key}' in '{t.file}' no longer references a "
+                    "plain-string QUERY_<n> constant in the optimized code"
+                )
+                message = (
+                    f"SINGLE_QUERY target '{fn_key}' in '{t.file}': the referenced QUERY_<n> "
+                    "constant is missing from the optimized code"
+                )
+            elif sq_value is None:
+                detail = message = (
+                    f"SINGLE_QUERY target '{fn_key}' in '{t.file}': constant '{sq_name}' is no "
+                    "longer a plain string (QUERY_CONSTANT_NOT_PLAIN_STRING)"
+                )
+            else:
+                target_coverage.append(unchanged)
+                violations.append(unchanged_violation)
+                continue
+            target_coverage.append(TargetStatus(
+                file=t.file, function=fn_key, status="MISSING_REWRITE", details=detail
+            ))
+            violations.append(VerificationViolation(
+                code="MISSING_REWRITE", severity="ERROR", message=message
             ))
             continue
 

@@ -55,10 +55,7 @@ class DependencySlice(BaseModel):
     target_id: str
     target_node: DependencyNode
     sliced_nodes: Dict[str, DependencyNode] = Field(default_factory=dict)
-    sliced_edges: List[DependencyEdge] = Field(default_factory=list)
     class_context: Optional[DependencyNode] = None
     database_operations: List[Dict[str, Any]] = Field(default_factory=list)
     state_attributes: List[str] = Field(default_factory=list)
     relevant_imports: List[str] = Field(default_factory=list)
-    referenced_queries: Dict[str, str] = Field(default_factory=dict)
-    is_truncated: bool = False

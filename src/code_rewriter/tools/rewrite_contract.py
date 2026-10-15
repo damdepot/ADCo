@@ -1,5 +1,3 @@
-from typing import Optional
-
 from ..models.ast_models import FileAnalysis
 from ..models.rewrite_models import RewriteContract, RewriteTarget
 
@@ -8,9 +6,6 @@ def build_rewrite_contract(
     target: RewriteTarget,
     pattern: str,
     strategy: str,
-    must_preserve: Optional[list[str]] = None,
-    must_not_change: Optional[list[str]] = None,
-    rewrite_id: Optional[str] = None,
 ) -> RewriteContract:
     """
     Build a RewriteContract based on the provided analysis and target.
@@ -47,12 +42,10 @@ def build_rewrite_contract(
             target.source_location = source_location
 
     import uuid
-    _id = rewrite_id if rewrite_id is not None else str(uuid.uuid4())
-    
-    if must_preserve is None:
-        must_preserve = ["return_type", "function_signature", "transaction_semantics", "exception_behavior"]
-    if must_not_change is None:
-        must_not_change = ["Database schema", "External API contracts"]
+    _id = str(uuid.uuid4())
+
+    must_preserve = ["return_type", "function_signature", "transaction_semantics", "exception_behavior"]
+    must_not_change = ["Database schema", "External API contracts"]
 
     return RewriteContract(
         rewrite_id=_id,

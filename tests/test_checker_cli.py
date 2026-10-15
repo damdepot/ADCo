@@ -1,18 +1,15 @@
-import argparse
 import json
-import os
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
 from src.code_checker.main import (
     build_parser,
-    _log_event,
-    _maybe_parse,
     _write_output_result,
     run_checker,
     main,
 )
+from src.code_rewriter._common import _maybe_parse, log_event as _log_event
 
 def test_maybe_parse():
     # Test valid JSON string

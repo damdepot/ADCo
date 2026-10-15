@@ -4,59 +4,53 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS="${ROOT}/benchmarks/scripts"
 
-CMDRunTPCC="${SCRIPTS}/tpcc.sh"
+source "${SCRIPTS}/bench_lib.sh"
+
 CMDRunACo="${SCRIPTS}/aco.sh"
 CMDRunDCo="${SCRIPTS}/dco.sh"
 CMDRunADCo="${SCRIPTS}/adco.sh"
-CMDDocker="${SCRIPTS}/docker.sh"
-
-db_container="adcoexp-db"
-db_service="pgdb"
 
 dir_name="tpcc"
 db_type="postgres"
 db_name="tpcc"
 
-# ── Per-run resource contract ──
-# Fixed at 2 CPU / 8 GB for easy runs; override via the environment if needed.
-CPU_CORES="${CPU_CORES:-2}"
-MEMORY_GB="${MEMORY_GB:-8}"
-
 RESULTS_DIR="${ROOT}/results/tpcc"
 mkdir -p "${RESULTS_DIR}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 
-echo "----------------->> Refreshing Docker <<-----------------"
-"$CMDDocker" Down "${db_container}"
-"$CMDDocker" Up "${db_container}" "${db_service}"
-"$CMDDocker" WaitFor "${db_container}"
+run_aco_tool() {
+    "${CMDRunACo}" "${dir_name}" "${db_type}" "${db_name}"
+}
 
+run_dco_tool() {
+    if ! "${CMDRunDCo}" "${dir_name}" "${db_type}" "${db_name}" "${CPU_CORES}" "${MEMORY_GB}"; then
+        echo "ERROR: DCo tuning failed; skipping post-DCo TPCC measurement and CSV." >&2
+        return 1
+    fi
+}
+
+run_adco_tool() {
+    if ! "${CMDRunADCo}" "${dir_name}" "${db_type}" "${db_name}" "${CPU_CORES}" "${MEMORY_GB}"; then
+        echo "ERROR: ADCo tuning failed; skipping post-ADCo TPCC measurement and CSV." >&2
+        return 1
+    fi
+}
+
+# ── Shared baseline, measured once via the symmetric protocol (no tool) ──
 echo "----------------->> Baseline <<-----------------"
-"$CMDRunTPCC" baseline "baseline_${RUN_ID}.csv"
+bench_arm "baseline" "baseline"
 
+# ── ACo (rewrite-only; same symmetric protocol) ──
 echo "----------------->> ACo <<-----------------"
-"$CMDRunACo" "${dir_name}" "${db_type}" "${db_name}"
-"$CMDRunTPCC" tpcc_aco "aco_${RUN_ID}.csv"
+bench_arm "aco" "tpcc_aco" run_aco_tool
 
+# ── DCo (tunes knobs; optimized arm runs the original app) ──
 echo "----------------->> DCo <<-----------------"
-if ! "$CMDRunDCo" "${dir_name}" "${db_type}" "${db_name}" "${CPU_CORES}" "${MEMORY_GB}"; then
-    echo "ERROR: DCo tuning failed; skipping post-DCo TPCC measurement and CSV." >&2
-    exit 1
-fi
-"$CMDDocker" Restart "${db_container}"
-"$CMDDocker" WaitFor "${db_container}"
-"$CMDRunTPCC" baseline "dco_${RUN_ID}.csv"
+bench_arm "dco" "baseline" run_dco_tool
 
-echo "----------------->> Refreshing Docker <<-----------------"
-"$CMDDocker" Down "${db_container}"
-"$CMDDocker" Up "${db_container}" "${db_service}"
-"$CMDDocker" WaitFor "${db_container}"
-
+# ── ADCo (rewrites the app and tunes knobs) ──
 echo "----------------->> ADCo <<-----------------"
-if ! "$CMDRunADCo" "${dir_name}" "${db_type}" "${db_name}" "${CPU_CORES}" "${MEMORY_GB}"; then
-    echo "ERROR: ADCo tuning failed; aborting." >&2
-    exit 1
-fi
-"$CMDDocker" Restart "${db_container}"
-"$CMDDocker" WaitFor "${db_container}"
-"$CMDRunTPCC" tpcc_adco "adco_${RUN_ID}.csv"
+bench_arm "adco" "tpcc_adco" run_adco_tool
+
+echo "----------------->> Comparison <<-----------------"
+"${ROOT}/benchmarks/run_comparison.sh" "${RUN_ID}"
