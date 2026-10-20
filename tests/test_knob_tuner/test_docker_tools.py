@@ -804,26 +804,39 @@ def test_verify_container_resources_subprocess_exception():
 
 
 def test_commit_staging_db_success():
-    mock_res = MagicMock(returncode=0, stdout="sha256:abc\n", stderr="")
-    with patch("subprocess.run", return_value=mock_res) as mock_run:
+    side_effects = [MagicMock(returncode=0, stdout="", stderr="") for _ in range(5)]
+    with patch("subprocess.run", side_effect=side_effects) as mock_run:
         ok, msg = commit_staging_db("prepared-container", "adco-snapshot:pg17", timeout=90)
         assert ok is True
         assert "Snapshot image 'adco-snapshot:pg17' created from container 'prepared-container'" in msg
-        mock_run.assert_called_once_with(
-            ["docker", "commit", "prepared-container", "adco-snapshot:pg17"],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        cmds = [c.args[0] for c in mock_run.call_args_list]
+        assert cmds[0] == ["docker", "stop", "-t", "60", "prepared-container"]
+        assert cmds[1] == ["docker", "commit", "prepared-container", "adco-snapshot:pg17"]
+        assert mock_run.call_args_list[1].kwargs["timeout"] == 90
+        assert cmds[2] == ["docker", "start", "prepared-container"]
+        # postgres readiness probes (same style as restart_docker_db)
+        assert cmds[3][:3] == ["docker", "exec", "prepared-container"]
+        assert "pg_isready" in cmds[3]
+        assert cmds[4][:3] == ["docker", "exec", "prepared-container"]
+        assert "psql" in cmds[4]
 
 
 def test_commit_staging_db_failure():
-    mock_res = MagicMock(returncode=1, stdout="", stderr="Error: No such container")
-    with patch("subprocess.run", return_value=mock_res):
+    stop_ok = MagicMock(returncode=0, stdout="", stderr="")
+    commit_fail = MagicMock(returncode=1, stdout="", stderr="Error: No such container")
+    start_ok = MagicMock(returncode=0, stdout="", stderr="")
+    ready_ok = MagicMock(returncode=0, stdout="", stderr="")
+    with patch(
+        "subprocess.run",
+        side_effect=[stop_ok, commit_fail, start_ok, ready_ok, ready_ok],
+    ) as mock_run:
         ok, msg = commit_staging_db("prepared-container", "adco-snapshot:pg17")
         assert ok is False
         assert "Failed to commit container 'prepared-container'" in msg
         assert "No such container" in msg
+        # container must be restarted even on commit failure
+        cmds = [c.args[0] for c in mock_run.call_args_list]
+        assert ["docker", "start", "prepared-container"] in cmds
 
 
 def test_commit_staging_db_empty_container_name():

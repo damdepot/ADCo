@@ -1399,7 +1399,7 @@ def test_snapshot_miss_commits_clean_dataset_then_recreates_arms(
             on_prepared()
         return next(measurements)
 
-    def fake_commit(container, image_name):
+    def fake_commit(container, image_name, db_type="postgres"):
         committed["image"] = image_name
         return True, "ok"
 

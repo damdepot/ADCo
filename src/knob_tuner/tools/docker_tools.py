@@ -173,16 +173,52 @@ def get_container_host_port(container_name: str, internal_port: int = 5432, time
     )
 
 
-def commit_staging_db(container_name: str, image_name: str, timeout: int = 120) -> tuple[bool, str]:
-    """Commit a running staging DB container into a snapshot image.
+def _resolve_staging_timeout(explicit: int | None, default: int) -> int:
+    """Resolve an effective staging timeout: explicit arg wins, else env, else default.
+
+    Returns `explicit` when set and valid (>0), else the int value of env
+    ``STAGING_READY_TIMEOUT`` when set and valid (>0), else `default`.
+    Never raises; garbage env values fall back to `default`.
+    """
+    if explicit is not None:
+        try:
+            if int(explicit) > 0:  # type: ignore[arg-type]
+                return int(explicit)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            pass
+    try:
+        raw = os.environ.get("STAGING_READY_TIMEOUT", "")
+        if raw is not None and str(raw).strip() and int(str(raw).strip()) > 0:
+            return int(str(raw).strip())
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return default
+
+
+def commit_staging_db(
+    container_name: str,
+    image_name: str,
+    timeout: int = 120,
+    db_type: str = "postgres",
+    ready_timeout: int | None = None,
+) -> tuple[bool, str]:
+    """Commit a staging DB container into a snapshot image via clean stop/commit/start.
+
+    The container is stopped first so the committed image holds cleanly
+    checkpointed data (no unclean pg_control forcing a slow fsync recovery
+    walk on boot), then started again with a readiness poll so the caller
+    can keep measuring on the same container.
 
     Args:
         container_name: Name or ID of the prepared Docker container.
         image_name: Image tag to create from the container snapshot.
         timeout: Maximum seconds to wait for the docker commit command.
+        db_type: Database engine ('postgres' or 'mysql') for the readiness probe.
+        ready_timeout: Maximum seconds to wait for readiness after restart.
 
     Returns:
-        Tuple of (success: bool, message: str). Never raises.
+        Tuple of (success: bool, message: str). Never raises; on any failure
+        a `docker start` is attempted so the caller can continue measuring.
     """
     if not container_name or not container_name.strip():
         return False, "Container name cannot be empty"
@@ -191,6 +227,66 @@ def commit_staging_db(container_name: str, image_name: str, timeout: int = 120) 
 
     container_name = container_name.strip()
     image_name = image_name.strip()
+    ready_timeout = _resolve_staging_timeout(ready_timeout, 120)
+
+    if (db_type or "postgres").strip().lower() == "mysql":
+        probe_cmds = [
+            [
+                "docker", "exec", container_name,
+                "mysqladmin", "ping", "-uroot", "--silent",
+            ],
+        ]
+    else:
+        probe_cmds = [
+            [
+                "docker", "exec", container_name,
+                "pg_isready", "-U", "postgres", "-h", "127.0.0.1",
+            ],
+            [
+                "docker", "exec", container_name,
+                "psql", "-U", "postgres", "-tAc", "SELECT 1",
+            ],
+        ]
+
+    def _start_and_wait() -> bool:
+        try:
+            subprocess.run(
+                ["docker", "start", container_name],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception:
+            pass
+        elapsed = 0
+        while elapsed < ready_timeout:
+            try:
+                if all(
+                    subprocess.run(
+                        probe,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    ).returncode == 0
+                    for probe in probe_cmds
+                ):
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+            elapsed += 1
+        return False
+
+    try:
+        subprocess.run(
+            ["docker", "stop", "-t", "60", container_name],
+            capture_output=True,
+            text=True,
+            timeout=75,
+        )
+    except Exception:
+        pass
+
     try:
         proc = subprocess.run(
             ["docker", "commit", container_name, image_name],
@@ -198,16 +294,28 @@ def commit_staging_db(container_name: str, image_name: str, timeout: int = 120) 
             text=True,
             timeout=timeout,
         )
-        if proc.returncode == 0:
-            return True, f"Snapshot image '{image_name}' created from container '{container_name}'"
-        err_msg = proc.stderr.strip() or proc.stdout.strip()
-        return False, f"Failed to commit container '{container_name}': {err_msg}"
     except subprocess.TimeoutExpired:
+        _start_and_wait()
         return False, f"Timed out committing container '{container_name}' after {timeout}s"
     except FileNotFoundError:
+        _start_and_wait()
         return False, "docker command not found in PATH"
     except Exception as e:
+        _start_and_wait()
         return False, f"Unexpected error committing container '{container_name}': {e}"
+
+    if proc.returncode != 0:
+        _start_and_wait()
+        err_msg = proc.stderr.strip() or proc.stdout.strip()
+        return False, f"Failed to commit container '{container_name}': {err_msg}"
+
+    if _start_and_wait():
+        return True, f"Snapshot image '{image_name}' created from container '{container_name}'"
+    return (
+        False,
+        f"Container '{container_name}' committed to '{image_name}' but did not "
+        f"become ready within {ready_timeout}s",
+    )
 
 
 def cleanup_snapshot_image(image_name: str) -> tuple[bool, str]:
@@ -396,7 +504,7 @@ def start_staging_db(
     db_version: str | None = None,
     budget: ResourceBudget | None = None,
     database: str = "testdb",
-    timeout: int = 60,
+    timeout: int | None = None,
     base_image: str | None = None,
 ) -> tuple[str, DBConfig]:
     """Start an ephemeral Docker container for staging database benchmarking.
@@ -408,6 +516,7 @@ def start_staging_db(
             no hidden default.
         database: Database name to create and initialize.
         timeout: Maximum seconds to wait for database readiness.
+            Defaults to env ``STAGING_READY_TIMEOUT`` when valid, else 60.
         base_image: Optional pre-built snapshot image to boot from instead of
             resolving an image from db_type/db_version.
 
@@ -432,6 +541,8 @@ def start_staging_db(
 
     if budget is None:
         raise ValueError("ResourceBudget is required to start the staging database")
+
+    timeout = _resolve_staging_timeout(timeout, 60)
 
     if base_image and base_image.strip():
         image = base_image.strip()
@@ -669,19 +780,21 @@ def start_staging_db(
 
 def restart_docker_db(
     container_name: str,
-    timeout: int = 60,
+    timeout: int | None = None,
     db_type: str = "postgres",
-    readiness_timeout: int = 60,
+    readiness_timeout: int | None = None,
 ) -> tuple[bool, str]:
     """Restart a database running inside a Docker container.
 
     Args:
         container_name: Docker container name or ID.
         timeout: Maximum seconds to wait for the docker restart command.
+            Defaults to env ``STAGING_READY_TIMEOUT`` when valid, else 60.
         db_type: Type of database ('postgres' or 'mysql') used to select
             the readiness probe command.
         readiness_timeout: Maximum seconds to wait for the database inside
             the container to accept connections after restart.
+            Defaults to env ``STAGING_READY_TIMEOUT`` when valid, else 60.
 
     Returns:
         Tuple of (success: bool, message: str).
@@ -690,6 +803,8 @@ def restart_docker_db(
         return False, "Container name cannot be empty"
 
     container_name = container_name.strip()
+    timeout = _resolve_staging_timeout(timeout, 60)
+    readiness_timeout = _resolve_staging_timeout(readiness_timeout, 60)
     try:
         proc = subprocess.run(
             ["docker", "restart", container_name],
@@ -767,7 +882,7 @@ def recreate_docker_db(
     db_version: str | None = None,
     database: str = "testdb",
     budget: ResourceBudget | None = None,
-    timeout: int = 60,
+    timeout: int | None = None,
     base_image: str | None = None,
 ) -> tuple[bool, str, object]:
     """Stop, remove, and recreate a staging Docker container, returning the new config.
@@ -784,6 +899,7 @@ def recreate_docker_db(
         budget: Explicit resource budget for the new container. Required; there
             is no hidden default.
         timeout: Maximum seconds to wait for the new container to become ready.
+            Defaults to env ``STAGING_READY_TIMEOUT`` when valid, else 60.
         base_image: Optional pre-built snapshot image to boot from instead of
             resolving an image from db_type/db_version.
 
@@ -793,6 +909,7 @@ def recreate_docker_db(
     if budget is None:
         raise ValueError("ResourceBudget is required to recreate the staging database")
 
+    timeout = _resolve_staging_timeout(timeout, 60)
     stop_staging_db(container_name)
 
     try:

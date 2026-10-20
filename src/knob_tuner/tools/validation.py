@@ -660,7 +660,7 @@ def _measure_shared_baseline(
             )
 
             def _on_prepared() -> None:
-                ok, message = commit_staging_db(baseline_container, image_name)
+                ok, message = commit_staging_db(baseline_container, image_name, db_type=db_type)
                 if ok:
                     snapshot.register(snapshot_key, image_name)
                     emit(f"snapshot ready: {image_name}")
@@ -995,7 +995,7 @@ def validate_plan(
                 baseline_container = container
 
                 def baseline_on_prepared() -> None:
-                    ok, message = commit_staging_db(baseline_container, image_name)
+                    ok, message = commit_staging_db(baseline_container, image_name, db_type=db_type)
                     if ok:
                         snapshot.register(snapshot_key, image_name)
                         emit(f"snapshot ready: {image_name}")
