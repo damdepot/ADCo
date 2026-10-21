@@ -561,8 +561,9 @@ def _compile_candidate_inner(
                 design_name=exp_name,
             )
 
+        units = {name.lower(): str(entry.get("unit", "")) for name, entry in inventory.items()}
         clamped = clamp_memory_knobs(
-            [dict(v) for v in valid_knobs], memory_gb
+            [dict(v) for v in valid_knobs], memory_gb, units=units
         )
         plan = build_plan(clamped, dict(context_map or {}))
         if not plan.knobs:

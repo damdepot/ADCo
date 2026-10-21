@@ -21,28 +21,59 @@ _INNODB_MEM_KNOBS_MAX_PCT = {
 _MAX_CONNECTIONS_RAM_MB_PER_CONN = 5
 
 
-def _parse_mem_value_to_bytes(value: str | float) -> float | None:
+_PG_NATIVE_UNIT_MULTIPLIERS = {
+    "b": 1,
+    "kb": 1024,
+    "mb": 1024**2,
+    "gb": 1024**3,
+    "tb": 1024**4,
+    "8kb": 8192,
+    "16kb": 16384,
+    "32kb": 32768,
+    "64kb": 65536,
+}
+
+
+def _parse_mem_value_to_bytes(value: str | float, unit: str | None = None) -> float | None:
     if isinstance(value, (int, float)):
-        return float(value)
-    s = str(value).strip().lower()
+        try:
+            num = float(value)
+        except (ValueError, TypeError):
+            return None
+        try:
+            mult = _PG_NATIVE_UNIT_MULTIPLIERS.get(str(unit or "").strip().lower())
+        except Exception:
+            mult = None
+        return num * mult if mult is not None else num
+    try:
+        s = str(value).strip().lower()
+    except Exception:
+        return None
     m = re.match(r"^([\d\.]+)\s*([a-z]*)$", s)
     if not m:
         return None
-    num_str, unit = m.groups()
+    num_str, val_unit = m.groups()
     try:
         num = float(num_str)
     except ValueError:
         return None
 
-    if unit in ("", "b", "bytes"):
+    if val_unit in ("", "b", "bytes"):
+        if not val_unit:
+            try:
+                mult = _PG_NATIVE_UNIT_MULTIPLIERS.get(str(unit or "").strip().lower())
+            except Exception:
+                mult = None
+            if mult is not None:
+                return num * mult
         return num
-    elif unit in ("k", "kb"):
+    elif val_unit in ("k", "kb"):
         return num * 1024
-    elif unit in ("m", "mb"):
+    elif val_unit in ("m", "mb"):
         return num * 1024**2
-    elif unit in ("g", "gb"):
+    elif val_unit in ("g", "gb"):
         return num * 1024**3
-    elif unit in ("t", "tb"):
+    elif val_unit in ("t", "tb"):
         return num * 1024**4
     return None
 
@@ -65,17 +96,29 @@ def _bytes_to_pg_string(b: float) -> str:
     return str(b_int)
 
 
-def parse_mem_value_to_bytes(value: Any) -> float | None:
+def parse_mem_value_to_bytes(value: Any, unit: str | None = None) -> float | None:
     """Public alias for the memory-value parser."""
     if isinstance(value, (str, int, float)):
-        return _parse_mem_value_to_bytes(value)
+        return _parse_mem_value_to_bytes(value, unit)
     return None
+
+
+def _has_unit_suffix(value: Any) -> bool:
+    try:
+        if isinstance(value, (int, float)):
+            return False
+        s = str(value).strip().lower()
+    except Exception:
+        return False
+    m = re.match(r"^([\d\.]+)\s*([a-z]*)$", s)
+    return bool(m) and bool(m.group(2))
 
 
 def _clamp_memory_knobs(
     recs: list[dict],
     memory_gb: float,
     max_connections_override: int | None = None,
+    units: dict[str, str] | None = None,
 ) -> list[dict]:
     memory_bytes = memory_gb * 1024**3
     max_pg = {k: v * memory_bytes for k, v in _PG_MEM_KNOBS_MAX_PCT.items()}
@@ -121,13 +164,19 @@ def _clamp_memory_knobs(
                 pass
         elif kname in max_pg or kname in max_innodb:
             limit = max_pg.get(kname) or max_innodb.get(kname)
-            parsed = _parse_mem_value_to_bytes(orig_val)
+            pg_unit = (units or {}).get(kname, "") if units else ""
+            parsed = _parse_mem_value_to_bytes(orig_val, pg_unit)
             if parsed is not None and parsed > limit:
                 new_r[val_key] = _bytes_to_pg_string(limit)
+            elif parsed is not None and not _has_unit_suffix(orig_val):
+                new_r[val_key] = _bytes_to_pg_string(parsed)
         elif kname == "work_mem" and work_mem_limit is not None:
-            parsed = _parse_mem_value_to_bytes(orig_val)
+            pg_unit = (units or {}).get(kname, "") if units else ""
+            parsed = _parse_mem_value_to_bytes(orig_val, pg_unit)
             if parsed is not None and parsed > work_mem_limit:
                 new_r[val_key] = _bytes_to_pg_string(work_mem_limit)
+            elif parsed is not None and not _has_unit_suffix(orig_val):
+                new_r[val_key] = _bytes_to_pg_string(parsed)
         out.append(new_r)
     return out
 
@@ -136,6 +185,7 @@ def clamp_memory_knobs(
     recs: list[dict],
     memory_gb: float,
     max_connections_override: int | None = None,
+    units: dict[str, str] | None = None,
 ) -> list[dict]:
     """Public alias for :func:`_clamp_memory_knobs`."""
-    return _clamp_memory_knobs(recs, memory_gb, max_connections_override)
+    return _clamp_memory_knobs(recs, memory_gb, max_connections_override, units)

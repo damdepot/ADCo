@@ -163,6 +163,30 @@ def test_memory_guard_pg_40pct_rule():
     assert parse_mem_value_to_bytes(clamped[0]["value"]) <= limit
 
 
+def test_memory_guard_unitless_8kb_pages_clamped_and_suffixed():
+    recs = [{"name": "shared_buffers", "value": "2097152"}]
+    clamped = _clamp_memory_knobs(recs, 8.0, units={"shared_buffers": "8kB"})
+    assert parse_mem_value_to_bytes(clamped[0]["value"]) <= 0.40 * 8.0 * 1024**3
+    assert clamped[0]["value"] == "3GB"
+
+
+def test_memory_guard_unitless_kb_normalized():
+    recs = [
+        {"name": "max_connections", "value": "100"},
+        {"name": "work_mem", "value": "16384"},
+    ]
+    clamped = _clamp_memory_knobs(recs, 8.0, units={"work_mem": "kB"})
+    assert clamped[1]["value"] == "16MB"
+
+
+def test_memory_guard_unitless_unknown_unit_keeps_old_behavior():
+    assert parse_mem_value_to_bytes("2097152", "bogus") == 2097152.0
+    assert parse_mem_value_to_bytes("2097152", "") == 2097152.0
+    recs = [{"name": "shared_buffers", "value": "2097152"}]
+    clamped = _clamp_memory_knobs(recs, 8.0, units={"shared_buffers": "bogus"})
+    assert clamped[0]["value"] == "2MB"
+
+
 def test_compile_sources_memory_from_resource_budget():
     # 1GB budget -> 40% cap = 0.4GB; 100GB must be clamped down.
     ctx = FakeCtx(_inv_state(resource_budget={"cpu_cores": 2, "memory_gb": 1.0}))

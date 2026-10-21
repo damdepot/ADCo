@@ -53,6 +53,7 @@ When a diagnosis is present, apply its enum exactly:
 ## Guardrails
 - Never throttle max_parallel_workers, max_parallel_workers_per_gather, or max_worker_processes below defaults (8 / 2 / 8).
 - Never shrink effective_cache_size below default (4GB on 2GB+ RAM); baseline 75% RAM.
+- Memory knob values must carry explicit units (e.g. '2GB', '512MB'); bare numbers are read in the knob's native unit (8kB pages for shared_buffers/effective_cache_size).
 - Keep autovacuum_vacuum_scale_factor >= 0.10 and autovacuum_vacuum_cost_limit <= 400.
 - wal_buffers `-1` or >= 16MB; max_wal_size >= 4GB; checkpoint_completion_target = 0.9.
 - OLAP/sort-heavy: size work_mem so the sort/hash fits (hash_mem_multiplier = 2.0); keep work_mem * multiplier * concurrency within budget.
