@@ -23,3 +23,4 @@ class RewriteContract(BaseModel):
     allowed_regions: list[str] = Field(default_factory=list, description="Regions of the target that are allowed to be modified")
     must_preserve: list[str] = Field(default_factory=list, description="Features or behaviors that must be preserved after the rewrite")
     must_not_change: list[str] = Field(default_factory=list, description="Features or behaviors that must explicitly not be changed")
+    rewrite_required: bool = Field(default=True, description="True when the contract requires an actual rewrite (loop DB ops / SINGLE_QUERY). Loop-free targets that may legitimately stay unchanged must set this to False explicitly.")

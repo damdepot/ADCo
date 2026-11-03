@@ -183,9 +183,13 @@ def _coverage_feedback(tool_context: ToolContext) -> str:
         contracts,
         tool_context.state.get("modified_files", []),
     )
+    required = result.expected_targets
+    missing = result.missing_targets
+    transformed_required = max(required - missing, 0)
+    no_op = sum(1 for tc in result.target_coverage if tc.status == "NO_OP")
     return (
-        f"\nCoverage: transformed {result.transformed_targets}/{result.expected_targets}, "
-        f"missing {result.missing_targets}, coverage={result.rewrite_coverage:.0%}"
+        f"\nCoverage: {result.rewrite_coverage:.0%} of required targets "
+        f"(transformed {transformed_required}, missing {missing}, no-op {no_op})"
     )
 
 

@@ -544,12 +544,16 @@ def test_make_orchestrate_restricted_when_high_risk_blocked(tmp_path):
     assert "[RESTRICTED] repo.py::get_users" in vo["detail"]
 
 
-def test_make_orchestrate_unchanged_target_becomes_restricted(tmp_path):
-    """An unchanged target with no new attempt is RESTRICTED, not FAIL."""
+def test_make_orchestrate_unchanged_target_becomes_fail(tmp_path):
+    """An unchanged target with no risk rejection is a FAIL, not RESTRICTED.
+
+    RESTRICTED is reserved for HIGH-risk-rejected targets whose original is
+    provably intact; a target that simply was not rewritten is a failed rewrite.
+    """
     _, events = _restricted_run(tmp_path, None)
     results = events[-1].actions.state_delta["target_results"]
-    assert results[0]["status"] == "RESTRICTED"
-    assert results[0]["verification"]["status"] == "RESTRICTED"
+    assert results[0]["status"] == "FAIL"
+    assert results[0]["verification"]["status"] == "FAIL"
 
 
 def test_make_orchestrate_records_no_attempt_when_optimizer_writes_nothing(tmp_path):
@@ -564,16 +568,23 @@ def test_make_orchestrate_records_no_attempt_when_optimizer_writes_nothing(tmp_p
     )
 
 
-def test_make_orchestrate_restricted_no_rewrite_is_finalize_pass(tmp_path):
-    """An unchanged target restricted by the orchestrator finalizes as a PASS."""
+def test_make_orchestrate_unrewritten_no_risk_is_finalize_fail(tmp_path):
+    """An unrewritten target that was not risk-blocked finalizes as a FAIL.
+
+    Nothing was transformed and nothing was restricted, so the run has zero
+    required coverage and must not be reported as a pass.
+    """
     ctx, events = _restricted_run(tmp_path, None)
     results = events[-1].actions.state_delta["target_results"]
     ctx.state["target_results"] = results
 
     event = finalize(ctx)
     det = event.actions.state_delta["deterministic_verification"]
-    assert det["status"] == "PASS"
-    assert det["restricted_targets"] == 1
+    assert det["status"] == "FAIL"
+    assert det["transformed_targets"] == 0
+    assert det["restricted_targets"] == 0
+    assert det["missing_targets"] == 1
+    assert det["rewrite_coverage"] == 0.0
 
 
 def test_make_orchestrate_rejected_but_modified_stays_fail(tmp_path):

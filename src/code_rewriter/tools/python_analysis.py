@@ -24,7 +24,6 @@ from .._common import target_names
 
 _FORMAT_RE = re.compile(r"%(?:\(([A-Za-z_]\w*)\))?[-#0 +]*\d*(?:\.\d+)?[diouxXeEfFgGcrsa]")
 _DYNAMIC_SCOPE_CALLS = {"globals", "locals", "eval", "exec"}
-_FAST_PATH_NAMES = {"execute_batch", "execute_values"}
 _BULK_PREFIXES = ("INSERT", "UPDATE", "DELETE")
 _ALLOWED_DUNDERS = {
     "__file__",
@@ -416,17 +415,6 @@ def _imports_psycopg2(tree: ast.Module) -> bool:
     return False
 
 
-def _references_fast_path(tree: ast.Module) -> bool:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id in _FAST_PATH_NAMES:
-            return True
-        if isinstance(node, ast.Attribute) and node.attr in _FAST_PATH_NAMES:
-            return True
-        if isinstance(node, ast.alias) and node.name in _FAST_PATH_NAMES:
-            return True
-    return False
-
-
 def _walk_scoped(node: ast.AST):
     if isinstance(node, _FUNCTION_NODES):
         return
@@ -446,8 +434,8 @@ def slow_executemany_violations(source: str) -> List[dict]:
         return []
     if not _imports_psycopg2(tree):
         return []
-    if _references_fast_path(tree):
-        return []
+    # No file-level fast-path exemption: a sibling function using execute_batch
+    # must not hide new executemany sites elsewhere in the file.
     module_dicts = collect_module_dicts(tree)
     violations: List[dict] = []
     seen = set()

@@ -68,6 +68,16 @@ def _issue_signature(verdict: Any) -> tuple:
     return tuple(sorted(issues, key=lambda item: tuple(str(part) for part in item)))
 
 
+def _verdict_noop(verdict: Any) -> bool:
+    """True when the verifier found nothing to rewrite (loop-free target)."""
+    if not isinstance(verdict, dict):
+        return False
+    coverage = verdict.get("target_coverage") or []
+    return bool(coverage) and all(
+        isinstance(tc, dict) and tc.get("status") == "NO_OP" for tc in coverage
+    )
+
+
 def _function_unchanged(
     target_dir: str, sandbox_dir: str, rel_file: str, function: str
 ) -> bool:
@@ -340,29 +350,29 @@ def make_orchestrate(
                         pass
 
             if passed:
-                status = "PASS"
+                status = "NO_OP" if _verdict_noop(verdict) else "PASS"
             else:
                 risk_rejected = qfn in (ctx.state.get("risk_rejections") or [])
                 unchanged = _target_unchanged(
                     ctx.state.get("target", ""), sandbox, rel_file, qfn, pattern
                 )
-                if unchanged:
-                    # The original function is preserved: either a HIGH-risk
-                    # rewrite was blocked, or the optimizer never produced a valid
-                    # rewrite. Both are acceptable (RESTRICTED) outcomes rather
-                    # than pipeline failures.
+                if risk_rejected and unchanged:
+                    # A HIGH-risk rewrite was blocked and the original function
+                    # survives intact: an acceptable RESTRICTED outcome.
                     status = "RESTRICTED"
                     verdict = {
                         "status": "RESTRICTED",
                         "summary": (
                             "HIGH-risk transformation blocked; original function preserved."
-                            if risk_rejected
-                            else "No valid rewrite produced; original function preserved."
                         ),
                         "violations": [],
                         "target_coverage": [],
                     }
+                elif _verdict_noop(verdict):
+                    # Loop-free target with nothing to batch: not a failure.
+                    status = "NO_OP"
                 else:
+                    # Keep the real verdict so finalize surfaces its violations.
                     status = "FAIL"
 
             results.append(
@@ -388,10 +398,13 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
     n_total = len(results)
     n_pass = sum(1 for r in results if r.get("status") == "PASS")
     n_restricted = sum(1 for r in results if r.get("status") == "RESTRICTED")
-    # Zero contracts is an accepted no-op: some datasets (e.g. the stats
-    # query-layer app) have no rewritable per-function pattern, so the
-    # rewriter must pass through unchanged rather than fail the pipeline.
-    all_ok = all(r.get("status") in ("PASS", "RESTRICTED") for r in results)
+    n_noop = sum(1 for r in results if r.get("status") == "NO_OP")
+    # Zero contracts (or only loop-free targets) is an accepted no-op: some
+    # datasets (e.g. the stats query-layer app) have no rewritable per-function
+    # pattern, so the rewriter must pass through unchanged rather than fail the
+    # pipeline. Coverage is measured against required targets only.
+    required = n_total - n_noop - n_restricted
+    all_ok = all(r.get("status") in ("PASS", "NO_OP", "RESTRICTED") for r in results)
 
     errors = [
         v
@@ -406,7 +419,9 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         if v.get("severity") == "WARNING"
     ]
 
-    summary = f"{n_pass}/{n_total} target functions transformed."
+    summary = f"{n_pass}/{required} required target functions transformed."
+    if n_noop:
+        summary += f" {n_noop} no-op (no rewritable pattern)."
     if n_restricted:
         summary += (
             f" {n_restricted} restricted (HIGH-risk transformation blocked; "
@@ -416,11 +431,12 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
     det = {
         "status": "PASS" if all_ok else "FAIL",
         "summary": summary,
-        "expected_targets": n_total,
+        "expected_targets": required,
         "transformed_targets": n_pass,
         "restricted_targets": n_restricted,
-        "missing_targets": n_total - n_pass - n_restricted,
-        "rewrite_coverage": (n_pass / n_total) if n_total else 1.0,
+        "noop_targets": n_noop,
+        "missing_targets": required - n_pass,
+        "rewrite_coverage": (n_pass / required) if required else 1.0,
         "target_coverage": [
             {
                 "file": r.get("file", ""),
@@ -428,6 +444,8 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
                 "status": (
                     "TRANSFORMED"
                     if r.get("status") == "PASS"
+                    else "NO_OP"
+                    if r.get("status") == "NO_OP"
                     else "RESTRICTED"
                     if r.get("status") == "RESTRICTED"
                     else "MISSING_REWRITE"
@@ -435,6 +453,8 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
                 "details": (
                     "HIGH-risk transformation blocked; original function preserved."
                     if r.get("status") == "RESTRICTED"
+                    else "No rewritable pattern (loop-free); original preserved by design."
+                    if r.get("status") == "NO_OP"
                     else (r.get("verification") or {}).get("summary", "")
                     if r.get("status") != "PASS"
                     else "Target function transformed."
@@ -480,7 +500,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
             "detail": "; ".join(
                 f"{r.get('file')}::{r.get('function')}"
                 for r in results
-                if r.get("status") not in ("PASS", "RESTRICTED")
+                if r.get("status") not in ("PASS", "NO_OP", "RESTRICTED")
             ),
             "suggestion": llm.get("suggestion", "")
             or (

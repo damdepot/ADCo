@@ -7,9 +7,11 @@ intent analyzer always runs first, so the rewriter has no standalone CLI.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import uuid
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -28,6 +30,25 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 
+def _sandbox_digest(sandbox: str | None, modified_files: list[str]) -> dict[str, str]:
+    """Hash sandbox files (relative path -> sha256) so a verdict can be re-checked."""
+    if not sandbox or not os.path.isdir(sandbox):
+        return {}
+    root = Path(sandbox)
+    if modified_files:
+        rel_paths = [Path(str(f)) for f in modified_files]
+    else:
+        rel_paths = [p.relative_to(root) for p in sorted(root.rglob("*.py"))]
+
+    digest: dict[str, str] = {}
+    for rel in sorted(rel_paths, key=lambda p: p.as_posix()):
+        try:
+            digest[rel.as_posix()] = hashlib.sha256((root / rel).read_bytes()).hexdigest()
+        except OSError:
+            continue
+    return digest
+
+
 def _write_output_result(output_path: str, state: dict[str, Any], model: str = "") -> None:
     """Serialize and write the rewrite outcome to the output path."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -39,6 +60,15 @@ def _write_output_result(output_path: str, state: dict[str, Any], model: str = "
         "sandbox": state.get("sandbox"),
         "status": _maybe_parse(state.get("verifier_output")).get("status", "FAIL"),
         "modified_files": state.get("modified_files", []),
+        "rewrite_contracts": state.get("rewrite_contracts", []),
+        "sandbox_digest": _sandbox_digest(
+            state.get("sandbox"), state.get("modified_files", []) or []
+        ),
+        "verdict_basis": {
+            "coverage_basis": "required_targets",
+            "sandbox": state.get("sandbox"),
+            "model": model,
+        },
         "outputs": {
             "scan_result": _maybe_parse(state.get("scan_result", state.get("intent_output", {}))),
             "file_selector_output": _maybe_parse(state.get("file_selector_output", {})),

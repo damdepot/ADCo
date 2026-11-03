@@ -601,6 +601,65 @@ def get_stock(self, rows):
     )
 
 
+def test_verify_rejects_executemany_despite_fast_path_in_another_function():
+    """The fast path in a sibling function must not exempt the whole file."""
+    orig = """
+import psycopg2
+from psycopg2.extras import execute_batch
+
+def get_stock(self, rows):
+    return None
+
+def load_rows(self, row):
+    execute_batch(self.cursor, "INSERT INTO LOAD (a) VALUES (%s)", [row])
+    return None
+"""
+    opt = """
+import psycopg2
+from psycopg2.extras import execute_batch
+
+def get_stock(self, rows):
+    self.cursor.executemany("INSERT INTO STOCK (a, b) VALUES (%s, %s)", rows)
+    return None
+
+def load_rows(self, row):
+    execute_batch(self.cursor, "INSERT INTO LOAD (a) VALUES (%s)", [row])
+    return None
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert result.status == "FAIL"
+    assert any(
+        v.code == "SLOW_EXECUTEMANY" and v.severity == "ERROR"
+        for v in result.violations
+    )
+
+
+def test_preexisting_executemany_not_reported_as_new():
+    orig = """
+import psycopg2
+
+def get_stock(self, rows):
+    return None
+
+def load_rows(self, row):
+    self.cursor.executemany("INSERT INTO LOAD (a) VALUES (%s)", [row])
+    return None
+"""
+    opt = """
+import psycopg2
+
+def get_stock(self, rows):
+    self.cursor.execute("SELECT a FROM STOCK WHERE a = ANY(%s)", (rows,))
+    return None
+
+def load_rows(self, row):
+    self.cursor.executemany("INSERT INTO LOAD (a) VALUES (%s)", [row])
+    return None
+"""
+    result = verify_contract(orig, opt, _static_check_contract())
+    assert not any(v.code == "SLOW_EXECUTEMANY" for v in result.violations)
+
+
 def test_preexisting_percent_violation_is_deduped():
     orig = """
 def get_stock(self, d_id):

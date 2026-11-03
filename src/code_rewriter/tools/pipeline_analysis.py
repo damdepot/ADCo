@@ -129,6 +129,7 @@ def build_contracts_from_intent(
         )
         contract.targets = [target]
         contract.allowed_regions = [fn.qualified_name or fn.name]
+        contract.rewrite_required = has_loop
         contracts.append(contract)
 
     if not discovered:
@@ -198,6 +199,7 @@ def _build_single_query_contracts(
         )
         contract.targets = [target]
         contract.allowed_regions = [fn.qualified_name or fn.name]
+        contract.rewrite_required = True
         contracts.append(contract)
 
     return contracts
@@ -223,17 +225,32 @@ def verify_all_contracts(
         )
         
     all_contract_targets = []
+    target_required: list[bool] = []
     for c in contracts:
         if c.targets:
-            all_contract_targets.extend(c.targets)
+            targets = c.targets
         elif c.target:
-            all_contract_targets.append(c.target)
-    expected_targets_count = len(all_contract_targets)
-    
-    if not modified_files and expected_targets_count > 0:
+            targets = [c.target]
+        else:
+            continue
+        all_contract_targets.extend(targets)
+        target_required.extend([c.rewrite_required] * len(targets))
+    # Loop-free targets (rewrite_required=False) legitimately stay unchanged, so
+    # only required targets form the coverage denominator.
+    required_targets_count = sum(1 for required in target_required if required)
+
+    if not modified_files and required_targets_count > 0:
         violations = []
         target_coverage = []
-        for t in all_contract_targets:
+        for t, required in zip(all_contract_targets, target_required):
+            if not required:
+                target_coverage.append(TargetStatus(
+                    file=t.file,
+                    function=t.qualified_function or t.function,
+                    status="NO_OP",
+                    details="No rewritable pattern (loop-free); original preserved by design.",
+                ))
+                continue
             target_coverage.append(TargetStatus(
                 file=t.file,
                 function=t.qualified_function or t.function,
@@ -252,9 +269,9 @@ def verify_all_contracts(
             checks=[VerificationCheck(name="check_rewrite_coverage", status="FAIL", details="No files modified.")],
             summary="Verification failed: no files modified.",
             target_coverage=target_coverage,
-            expected_targets=expected_targets_count,
+            expected_targets=required_targets_count,
             transformed_targets=0,
-            missing_targets=expected_targets_count,
+            missing_targets=required_targets_count,
             rewrite_coverage=0.0
         )
 
@@ -303,7 +320,7 @@ def verify_all_contracts(
         (tc.file, tc.function): tc for tc in dedup_coverage
     }
     final_coverage: list[TargetStatus] = []
-    for t in all_contract_targets:
+    for t, required in zip(all_contract_targets, target_required):
         fn = t.qualified_function or t.function
         match = covered_by_key.get((t.file, fn)) or covered_by_key.get((t.file, t.function or ""))
         if not match:
@@ -315,18 +332,36 @@ def verify_all_contracts(
                     break
         if match:
             final_coverage.append(match)
-        else:
+        elif required:
             final_coverage.append(TargetStatus(
                 file=t.file,
                 function=fn,
                 status="MISSING_REWRITE",
                 details="Target not verified (file not modified or target not covered)",
             ))
+        else:
+            final_coverage.append(TargetStatus(
+                file=t.file,
+                function=fn,
+                status="NO_OP",
+                details="No rewritable pattern (loop-free); original preserved by design.",
+            ))
 
-    expected_targets = expected_targets_count
+    expected_targets = required_targets_count
     transformed_targets = sum(1 for tc in final_coverage if tc.status == "TRANSFORMED")
-    missing_targets = sum(1 for tc in final_coverage if tc.status == "MISSING_REWRITE")
-    rewrite_coverage = round(transformed_targets / expected_targets, 3) if expected_targets > 0 else 1.0
+    # Numerator over required targets only: a loop-free target rewritten anyway
+    # must not push coverage above 1.0.
+    transformed_required = sum(
+        1
+        for tc, required in zip(final_coverage, target_required)
+        if required and tc.status == "TRANSFORMED"
+    )
+    missing_targets = sum(
+        1
+        for tc, required in zip(final_coverage, target_required)
+        if required and tc.status == "MISSING_REWRITE"
+    )
+    rewrite_coverage = round(transformed_required / expected_targets, 3) if expected_targets > 0 else 1.0
 
     critical_codes = {
         "SYNTAX_ERROR", "ORIGINAL_SYNTAX_ERROR", "TARGET_MISSING",
@@ -338,7 +373,7 @@ def verify_all_contracts(
     }
     has_critical = any(v.severity == "ERROR" and v.code in critical_codes for v in all_violations)
 
-    if has_critical or (expected_targets > 0 and (transformed_targets < expected_targets or missing_targets > 0)):
+    if has_critical or (expected_targets > 0 and (transformed_required < expected_targets or missing_targets > 0)):
         overall_status = "FAIL"
     else:
         overall_status = "PASS" if not any(v.severity == "ERROR" for v in all_violations) else "FAIL"
@@ -347,7 +382,11 @@ def verify_all_contracts(
         status=overall_status,
         violations=all_violations,
         checks=all_checks,
-        summary=f"Verification {'passed' if overall_status == 'PASS' else 'failed'} with {len(all_violations)} violations.",
+        summary=(
+            f"Verification {'passed' if overall_status == 'PASS' else 'failed'} with "
+            f"{len(all_violations)} violations; coverage basis: required_targets "
+            f"({transformed_required}/{expected_targets})."
+        ),
         target_coverage=final_coverage,
         expected_targets=expected_targets,
         transformed_targets=transformed_targets,

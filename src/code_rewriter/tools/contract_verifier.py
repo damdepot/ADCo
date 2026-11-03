@@ -764,6 +764,18 @@ def check_rewrite_coverage(
 
         # Check if AST is unchanged
         if orig_node is not None and opt_node is not None and ast.dump(orig_node) == ast.dump(opt_node):
+            # Loop-free targets legitimately have nothing to batch: report NO_OP
+            # instead of a missing rewrite so they neither inflate nor deflate
+            # required-target coverage.
+            if not contract.rewrite_required and not is_single_query(contract):
+                target_coverage.append(TargetStatus(
+                    file=t.file,
+                    function=fn_key,
+                    status="NO_OP",
+                    details="No rewritable pattern (loop-free); original preserved by design.",
+                ))
+                continue
+
             unchanged = TargetStatus(
                 file=t.file,
                 function=fn_key,
@@ -866,14 +878,21 @@ def check_rewrite_coverage(
             
     expected_targets = len(contract.targets)
     transformed_targets = sum(1 for tc in target_coverage if tc.status == "TRANSFORMED")
-    missing_targets = expected_targets - transformed_targets
-    rewrite_coverage = round(transformed_targets / expected_targets, 3) if expected_targets > 0 else 1.0
+    # Loop-free targets (rewrite_required=False) have nothing to rewrite, so they
+    # are neither required nor counted in the numerator — even if the optimizer
+    # rewrote them, coverage stays within [0.0, 1.0].
+    required_targets = expected_targets if contract.rewrite_required else 0
+    transformed_required = transformed_targets if contract.rewrite_required else 0
+    missing_targets = required_targets - transformed_required
+    rewrite_coverage = (
+        round(transformed_required / required_targets, 3) if required_targets > 0 else 1.0
+    )
     
     check_status = "PASS" if missing_targets == 0 else "FAIL"
     checks.append(VerificationCheck(
         name="check_rewrite_coverage",
         status=check_status,
-        details=f"{transformed_targets}/{expected_targets} targets transformed (coverage={rewrite_coverage})"
+        details=f"{transformed_required}/{required_targets} required targets transformed (coverage={rewrite_coverage})"
     ))
     
     overall_status = "PASS" if not violations else "FAIL"

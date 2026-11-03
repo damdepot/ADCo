@@ -166,15 +166,20 @@ def bulk_insert(cursor, rows):
     assert violations[0]["line"] is not None
 
 
-def test_slow_executemany_with_fast_path_import_not_flagged():
+def test_slow_executemany_flagged_despite_fast_path_in_sibling_function():
+    """A fast path in one function must not exempt the whole file."""
     source = '''
 import psycopg2
 from psycopg2.extras import execute_batch
 
-def bulk_insert(cursor, rows):
-    cursor.executemany("INSERT INTO t (a, b) VALUES (%s, %s)", rows)
+def do_new_order(cursor, rows):
+    execute_batch(cursor, "INSERT INTO o (a) VALUES (%s)", rows)
+
+def do_delivery(cursor, rows):
+    cursor.executemany("INSERT INTO d (a, b) VALUES (%s, %s)", rows)
 '''
-    assert slow_executemany_violations(source) == []
+    violations = slow_executemany_violations(source)
+    assert [v["function"] for v in violations] == ["do_delivery"]
 
 
 def test_executemany_sqlite_not_flagged():
