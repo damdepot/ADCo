@@ -728,11 +728,24 @@ def test_run_application_startup_failed_for_crashing_app():
 
 
 def test_run_application_no_entry_point():
-    tc = MockToolContext({"sandbox": "/tmp", "file_selector_output": {}})
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "lib.py")).write_text("def helper():\n    return 1\n")
+        tc = MockToolContext({
+            "sandbox": sandbox,
+            "modified_files": [],
+            "file_selector_output": {},
+        })
 
-    result = run_application("", tc)
+        result = run_application("", tc)
 
-    assert "ERROR" in result
+        assert result.startswith("NO_ENTRY_POINT")
+        assert "Import smoke: SKIPPED" in result
+        assert tc.state["smoke_evidence"] == {
+            "entry": "",
+            "entry_source": "none",
+            "startup": "NO_ENTRY_POINT",
+            "import": "SKIPPED",
+        }
 
 
 def test_run_application_passes_argv_without_shell(monkeypatch):
@@ -785,15 +798,51 @@ def test_run_application_rejects_unsafe_entry(monkeypatch, evil_entry):
     monkeypatch.setattr(verifier_tools.subprocess, "Popen", _boom)
 
     with tempfile.TemporaryDirectory() as sandbox:
-        Path(os.path.join(sandbox, "app.py")).write_text("print('hi')\n")
+        # No runnable candidate inside the sandbox: nothing may be launched.
+        Path(os.path.join(sandbox, "lib.py")).write_text("def helper():\n    return 1\n")
         tc = MockToolContext({
             "sandbox": sandbox,
+            "modified_files": [],
             "file_selector_output": {"entry_point": evil_entry},
         })
 
         result = run_application("$(touch /tmp/pwned)", tc)
 
-    assert result.startswith("ERROR")
+    assert result.startswith("NO_ENTRY_POINT")
+    assert tc.state["smoke_evidence"]["entry_source"] == "none"
+
+
+def test_run_application_unsafe_declared_entry_falls_back_to_discovered(monkeypatch):
+    import src.code_rewriter.sub_agents.verifier.tools as verifier_tools
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+
+        def __init__(self, *args, **kwargs):
+            captured["argv"] = args[0]
+
+        def wait(self, timeout=None):
+            return 0
+
+        def communicate(self, timeout=None):
+            return "ok", ""
+
+    monkeypatch.setattr(verifier_tools.subprocess, "Popen", FakeProc)
+
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "app.py")).write_text("print('hi')\n")
+        tc = MockToolContext({
+            "sandbox": sandbox,
+            "file_selector_output": {"entry_point": "../outside.py; rm -rf /"},
+        })
+
+        result = run_application("", tc)
+
+    assert result.startswith("STARTED_OK")
+    assert captured["argv"][1] == os.path.realpath(os.path.join(sandbox, "app.py"))
+    assert tc.state["smoke_evidence"]["entry_source"] == "discovered"
 
 
 def test_run_application_classified_as_db_error():
@@ -934,6 +983,329 @@ def test_run_application_deterministic_verification_fail_blocks_started_ok():
 
         standalone = run_contract_verification(tc)
         assert "Deterministic Verification Status: FAIL" in standalone
+
+
+TPCC_LIKE_APP = (
+    "import argparse\n"
+    "\n"
+    "def main():\n"
+    "    parser = argparse.ArgumentParser(description='tpcc')\n"
+    "    parser.add_argument('system')\n"
+    "    parser.parse_args()\n"
+    "\n"
+    "if __name__ == '__main__':\n"
+    "    main()\n"
+)
+
+
+def test_run_application_discovers_entry_with_main_guard():
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "tpcc.py")).write_text(TPCC_LIKE_APP)
+        tc = MockToolContext({
+            "sandbox": sandbox,
+            "modified_files": [],
+            "file_selector_output": {},
+        })
+
+        # No args: the app demands a positional, so the tool retries with --help.
+        result = run_application("", tc)
+
+        assert result.startswith("STARTED_OK")
+        assert "first attempt: MISSING_ARGS" in result
+        assert "retry: --help" in result
+        assert result.count("exit_code") == 2
+        assert tc.state["smoke_evidence"]["entry"] == "tpcc.py"
+        assert tc.state["smoke_evidence"]["entry_source"] == "discovered"
+        assert tc.state["smoke_evidence"]["startup"] == "STARTED_OK"
+
+
+def test_run_application_explicit_args_are_never_retried():
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "tpcc.py")).write_text(TPCC_LIKE_APP)
+        tc = MockToolContext({
+            "sandbox": sandbox,
+            "modified_files": [],
+            "file_selector_output": {"entry_point": "tpcc.py"},
+        })
+
+        result = run_application("--help", tc)
+
+        assert result.startswith("STARTED_OK")
+        assert "first attempt" not in result
+        assert result.count("exit_code") == 1
+
+
+def test_run_application_missing_args_retry_reports_retry_failure():
+    app = (
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if not args:\n"
+        "    print('usage: app.py <required>', file=sys.stderr)\n"
+        "    sys.exit(2)\n"
+        "raise NameError('boom on help')\n"
+    )
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "app.py")).write_text(app)
+        tc = MockToolContext({"sandbox": sandbox, "file_selector_output": {"entry_point": "app.py"}})
+
+        result = run_application("", tc)
+
+        assert result.startswith("STARTUP_FAILED_CODE:CODE")
+        assert "first attempt: MISSING_ARGS" in result
+        assert "retry: --help" in result
+        assert "boom on help" in result
+        assert result.count("exit_code") == 2
+        assert tc.state["smoke_evidence"]["startup"] == "STARTUP_FAILED_CODE:CODE"
+
+
+def test_run_application_starts_with_no_args_without_retry():
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "app.py")).write_text("print('hi')\n")
+        tc = MockToolContext({"sandbox": sandbox, "file_selector_output": {"entry_point": "app.py"}})
+
+        result = run_application("", tc)
+
+        assert result.startswith("STARTED_OK")
+        assert "first attempt" not in result
+        assert result.count("exit_code") == 1
+        assert tc.state["smoke_evidence"]["startup"] == "STARTED_OK"
+
+
+def test_run_application_declared_entry_wins_over_discovery():
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "app.py")).write_text("print('app')\n")
+        Path(os.path.join(sandbox, "tpcc.py")).write_text(TPCC_LIKE_APP)
+        tc = MockToolContext({
+            "sandbox": sandbox,
+            "file_selector_output": {"entry_point": "app.py"},
+        })
+
+        run_application("", tc)
+
+        assert tc.state["smoke_evidence"]["entry"] == "app.py"
+        assert tc.state["smoke_evidence"]["entry_source"] == "declared"
+
+
+def test_run_application_import_smoke_ok_for_healthy_sandbox():
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "app.py")).write_text("print('hi')\n")
+        Path(os.path.join(sandbox, "pkg")).mkdir()
+        Path(os.path.join(sandbox, "pkg", "__init__.py")).write_text("")
+        Path(os.path.join(sandbox, "pkg", "mod.py")).write_text("VALUE = 1\n")
+        tc = MockToolContext({
+            "sandbox": sandbox,
+            "modified_files": ["pkg/__init__.py", "pkg/mod.py"],
+            "file_selector_output": {"entry_point": "app.py"},
+        })
+
+        result = run_application("", tc)
+
+        assert result.startswith("STARTED_OK")
+        assert "Import smoke: OK" in result
+        assert tc.state["smoke_evidence"] == {
+            "entry": "app.py",
+            "entry_source": "declared",
+            "startup": "STARTED_OK",
+            "import": "OK",
+        }
+
+
+def test_run_application_import_smoke_failed_is_reported_without_flipping():
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "app.py")).write_text("print('hi')\n")
+        Path(os.path.join(sandbox, "pkg")).mkdir()
+        Path(os.path.join(sandbox, "pkg", "__init__.py")).write_text("")
+        Path(os.path.join(sandbox, "pkg", "mod.py")).write_text("VALUE = undefined_name\n")
+        tc = MockToolContext({
+            "sandbox": sandbox,
+            "modified_files": ["pkg/mod.py"],
+            "file_selector_output": {"entry_point": "app.py"},
+        })
+
+        result = run_application("", tc)
+
+        # The app still starts: the smoke failure is evidence, not a verdict.
+        assert result.startswith("STARTED_OK")
+        assert "Import smoke: FAILED" in result
+        assert "pkg.mod: NameError" in result
+        assert tc.state["smoke_evidence"]["import"] == "FAILED"
+        assert tc.state["smoke_evidence"]["startup"] == "STARTED_OK"
+
+
+def test_run_application_import_smoke_reported_on_no_entry_point():
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "broken.py")).write_text("X = nope\n")
+        tc = MockToolContext({
+            "sandbox": sandbox,
+            "modified_files": ["broken.py"],
+            "file_selector_output": {},
+        })
+
+        result = run_application("", tc)
+
+        assert result.startswith("NO_ENTRY_POINT")
+        assert "Import smoke: FAILED" in result
+        assert tc.state["smoke_evidence"]["entry_source"] == "none"
+        assert tc.state["smoke_evidence"]["import"] == "FAILED"
+
+
+def test_run_application_discovery_prefers_importable_main_guard():
+    with tempfile.TemporaryDirectory() as sandbox:
+        # Sorted first, but needs a third-party dep that is not installed.
+        Path(os.path.join(sandbox, "aaa.py")).write_text(
+            "import surely_missing_dependency_xyz\n"
+            "if __name__ == '__main__':\n    pass\n"
+        )
+        Path(os.path.join(sandbox, "zzz.py")).write_text("print('hi')\nif __name__ == '__main__':\n    pass\n")
+        tc = MockToolContext({"sandbox": sandbox, "modified_files": [], "file_selector_output": {}})
+
+        result = run_application("", tc)
+
+        assert result.startswith("STARTED_OK")
+        assert tc.state["smoke_evidence"]["entry"] == "zzz.py"
+        assert tc.state["smoke_evidence"]["entry_source"] == "discovered"
+
+
+def test_run_application_discovers_pyproject_script():
+    with tempfile.TemporaryDirectory() as sandbox:
+        Path(os.path.join(sandbox, "pyproject.toml")).write_text(
+            "[project]\nname = \"demo\"\n\n[project.scripts]\ndemo = \"scripts.cli:main\"\n"
+        )
+        Path(os.path.join(sandbox, "scripts")).mkdir()
+        Path(os.path.join(sandbox, "scripts", "__init__.py")).write_text("")
+        Path(os.path.join(sandbox, "scripts", "cli.py")).write_text("print('hi')\n")
+        tc = MockToolContext({"sandbox": sandbox, "modified_files": [], "file_selector_output": {}})
+
+        result = run_application("", tc)
+
+        assert result.startswith("STARTED_OK")
+        assert tc.state["smoke_evidence"]["entry"] == os.path.join("scripts", "cli.py")
+        assert tc.state["smoke_evidence"]["entry_source"] == "discovered"
+
+
+def test_discover_entry_ignores_paths_escaping_sandbox():
+    from src.code_rewriter.sub_agents.verifier.tools import _discover_entry
+
+    with tempfile.TemporaryDirectory() as parent:
+        sandbox = os.path.join(parent, "sandbox")
+        os.mkdir(sandbox)
+        Path(os.path.join(parent, "outside.py")).write_text("print('outside')\n")
+
+        assert _discover_entry(sandbox, "../outside.py") == ("", "none")
+        assert _discover_entry(sandbox, "../../etc/passwd") == ("", "none")
+
+
+_INLOOP_F1_ORIG = (
+    "def get_users(user_ids):\n"
+    "    results = []\n"
+    "    for uid in user_ids:\n"
+    "        cursor.execute('SELECT * FROM users WHERE id = %s', (uid,))\n"
+    "        results.append(cursor.fetchone())\n"
+    "    return results\n"
+)
+_INLOOP_F1_OPT = (
+    "def get_users(user_ids):\n"
+    "    cursor.execute('SELECT * FROM users WHERE id = ANY(%s)', (user_ids,))\n"
+    "    return cursor.fetchall()\n"
+)
+_INLOOP_F2_UNTOUCHED = (
+    "def get_items(item_ids):\n"
+    "    out = []\n"
+    "    for iid in item_ids:\n"
+    "        cursor.execute('SELECT * FROM items WHERE id = %s', (iid,))\n"
+    "        out.append(cursor.fetchone())\n"
+    "    return out\n"
+)
+
+
+def _inloop_contract(rewrite_id, function):
+    return {
+        "rewrite_id": rewrite_id,
+        "target": {"file": "app.py", "function": function},
+        "targets": [{"file": "app.py", "function": function}],
+        "pattern": "N+1 Query",
+        "strategy": "Replace loop with IN clause",
+        "allowed_regions": [function],
+        "must_preserve": ["return_type", "function_signature"],
+    }
+
+
+def _make_inloop_sandbox(target_dir, sandbox_dir):
+    Path(os.path.join(target_dir, "app.py")).write_text(_INLOOP_F1_ORIG + "\n\n" + _INLOOP_F2_UNTOUCHED)
+    Path(os.path.join(sandbox_dir, "app.py")).write_text(_INLOOP_F1_OPT + "\n\n" + _INLOOP_F2_UNTOUCHED)
+    return _inloop_contract("c1", "get_users"), _inloop_contract("c2", "get_items")
+
+
+def test_run_application_in_loop_verifies_only_current_contract():
+    from src.code_rewriter.models.rewrite_models import RewriteContract
+    from src.code_rewriter.sub_agents.verifier.tools import _run_contract_verification
+
+    with tempfile.TemporaryDirectory() as target_dir, tempfile.TemporaryDirectory() as sandbox_dir:
+        c1, c2 = _make_inloop_sandbox(target_dir, sandbox_dir)
+        tc = MockToolContext({
+            "target": target_dir,
+            "sandbox": sandbox_dir,
+            "modified_files": ["app.py"],
+            "file_selector_output": {"entry_point": "app.py"},
+            "rewrite_contracts": [c1, c2],
+            "current_contract": c1,
+        })
+
+        status, details = _run_contract_verification(tc)
+
+        assert (status, details) == ("PASS", None)
+        assert tc.state["deterministic_verification"]["status"] == "PASS"
+
+        result = run_application("", tc)
+
+        assert result.startswith("STARTED_OK")
+        assert "DETERMINISTIC_VERIFICATION_FAIL" not in result
+
+        # A model instance is accepted too, not just a dict.
+        tc.state["current_contract"] = RewriteContract(**c1)
+        assert _run_contract_verification(tc)[0] == "PASS"
+
+
+def test_run_application_without_current_contract_verifies_all_contracts():
+    with tempfile.TemporaryDirectory() as target_dir, tempfile.TemporaryDirectory() as sandbox_dir:
+        c1, c2 = _make_inloop_sandbox(target_dir, sandbox_dir)
+        tc = MockToolContext({
+            "target": target_dir,
+            "sandbox": sandbox_dir,
+            "modified_files": ["app.py"],
+            "file_selector_output": {"entry_point": "app.py"},
+            "rewrite_contracts": [c1, c2],
+        })
+
+        result = run_application("", tc)
+
+        assert result.startswith("STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL")
+        assert "get_items" in result
+        assert tc.state["deterministic_verification"]["status"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "bad_current",
+    [{"rewrite_id": "c1"}, "not-a-contract", 42, {"target": "not-a-dict"}],
+)
+def test_run_application_unparseable_current_contract_falls_back_to_all(bad_current):
+    from src.code_rewriter.sub_agents.verifier.tools import _run_contract_verification
+
+    with tempfile.TemporaryDirectory() as target_dir, tempfile.TemporaryDirectory() as sandbox_dir:
+        c1, c2 = _make_inloop_sandbox(target_dir, sandbox_dir)
+        tc = MockToolContext({
+            "target": target_dir,
+            "sandbox": sandbox_dir,
+            "modified_files": ["app.py"],
+            "file_selector_output": {"entry_point": "app.py"},
+            "rewrite_contracts": [c1, c2],
+            "current_contract": bad_current,
+        })
+
+        assert _run_contract_verification(tc)[0] == "FAIL"
+        result = run_application("", tc)
+
+        assert result.startswith("STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL")
 
 
 def test_get_verification_context():

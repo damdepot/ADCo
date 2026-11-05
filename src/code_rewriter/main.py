@@ -53,6 +53,25 @@ def _write_output_result(output_path: str, state: dict[str, Any], model: str = "
     """Serialize and write the rewrite outcome to the output path."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
+    det = _maybe_parse(state.get("deterministic_verification", {})) or {}
+    gaps = det.get("gaps") or []
+
+    # finalize's `det` has no `checks` key, so derive the run's checks from the
+    # per-target VerificationResult dumps; fall back to deterministic_verification
+    # when the state carries no target results.
+    checks_run = {
+        check.get("name")
+        for result in (state.get("target_results") or [])
+        for check in (((result or {}).get("verification") or {}).get("checks") or [])
+        if isinstance(check, dict) and check.get("name")
+    }
+    if not checks_run:
+        checks_run = {
+            check.get("name")
+            for check in (det.get("checks") or [])
+            if isinstance(check, dict) and check.get("name")
+        }
+
     result_data = {
         "timestamp": datetime.datetime.now().isoformat(),
         "target": state.get("target"),
@@ -68,6 +87,18 @@ def _write_output_result(output_path: str, state: dict[str, Any], model: str = "
             "coverage_basis": "required_targets",
             "sandbox": state.get("sandbox"),
             "model": model,
+            "gap_policy": state.get("gap_policy") or "warn",
+        },
+        "reliability": {
+            "verification_status": det.get("verification_status", "FULL"),
+            "gap_policy": state.get("gap_policy") or "warn",
+            "gap_count": len(gaps),
+            "gaps": gaps,
+            "checks_run": sorted(checks_run),
+            "evidence": {
+                "static": det.get("status"),
+                "smoke": state.get("smoke_evidence") or {},
+            },
         },
         "outputs": {
             "scan_result": _maybe_parse(state.get("scan_result", state.get("intent_output", {}))),

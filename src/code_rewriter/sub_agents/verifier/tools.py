@@ -1,5 +1,6 @@
 """Tools for the verifier agent — syntax check, compare original vs modified, run application."""
 
+import ast
 import difflib
 import json
 import os
@@ -7,6 +8,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from google.adk.tools import ToolContext
 
@@ -34,6 +36,17 @@ _NETWORK_ERRORS = re.compile(
 _SHELL_METACHARACTERS = frozenset(";|&$`<>(){}\n\r\x00")
 _MAX_ENTRY_LENGTH = 1024
 _MAX_ARGS_LENGTH = 4096
+
+_ENTRY_CANDIDATES = ("__main__.py", "main.py", "app.py", "manage.py", "cli.py")
+_SKIP_DIRS = frozenset({
+    ".git", ".venv", "venv", "env", "__pycache__", "node_modules",
+    "tests", "test", ".tox", ".mypy_cache", ".pytest_cache", "build", "dist",
+})
+_SKIP_FILES = frozenset({"setup.py", "conftest.py"})
+_MAX_PROBED_ENTRIES = 5
+_MAX_SMOKE_MODULES = 20
+_MAX_SMOKE_LINE = 300
+_SMOKE_TIMEOUT = 10
 
 
 def _resolve_entry_path(sandbox: str, entry: str) -> str | None:
@@ -70,6 +83,228 @@ def _split_application_args(args: str) -> list[str] | None:
         return shlex.split(args)
     except ValueError:
         return None
+
+
+def _declared_entry(state) -> str:
+    """Read ``file_selector_output.entry_point`` from session state (may be empty)."""
+    if not state:
+        return ""
+    fs_out = state.get("file_selector_output", {})
+    if hasattr(fs_out, "entry_point"):
+        return fs_out.entry_point or ""
+    if isinstance(fs_out, str):
+        try:
+            parsed = json.loads(fs_out)
+        except Exception:
+            return ""
+        return parsed.get("entry_point", "") if isinstance(parsed, dict) else ""
+    if isinstance(fs_out, dict):
+        entry = fs_out.get("entry_point", "")
+        return entry if isinstance(entry, str) else ""
+    return ""
+
+
+def _module_name(sandbox: str, rel: str) -> str:
+    """Derive a dotted import name for *rel*, walking up through ``__init__.py`` packages."""
+    rel = rel.replace(os.sep, "/").lstrip("./")
+    parts = [Path(rel).stem]
+    parent = os.path.dirname(rel)
+    while parent and os.path.isfile(os.path.join(sandbox, parent, "__init__.py")):
+        parts.insert(0, os.path.basename(parent))
+        parent = os.path.dirname(parent)
+    if len(parts) > 1 and parts[-1] == "__init__":
+        parts.pop()  # a package's __init__.py is imported as the package itself
+    return ".".join(parts)
+
+
+def _import_ok(sandbox: str, rel: str) -> bool:
+    """Cheap probe: can *rel* be imported as a module from *sandbox*?"""
+    module = _module_name(sandbox, rel)
+    if not module:
+        return False
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            cwd=sandbox, env=_sandbox_env(sandbox), capture_output=True,
+            text=True, timeout=_SMOKE_TIMEOUT, shell=False,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    """True when *node* is ``if __name__ == "__main__":``."""
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+        return False
+    if not isinstance(test.ops[0], ast.Eq):
+        return False
+
+    def _is_name(n):
+        return isinstance(n, ast.Name) and n.id == "__name__"
+
+    def _is_main(n):
+        return isinstance(n, ast.Constant) and n.value == "__main__"
+
+    left, right = test.left, test.comparators[0]
+    return (_is_name(left) and _is_main(right)) or (_is_name(right) and _is_main(left))
+
+
+def _has_main_guard(path: str) -> bool:
+    """True when *path* parses and has a top-level ``__main__`` guard. Never raises."""
+    try:
+        tree = ast.parse(Path(path).read_text(errors="replace"))
+    except Exception:
+        return False
+    return any(_is_main_guard(node) for node in tree.body)
+
+
+def _pyproject_scripts(sandbox: str) -> list[str]:
+    """Resolve ``[project.scripts]`` ``module:func`` targets to sandbox-relative .py paths."""
+    pyproject = os.path.join(sandbox, "pyproject.toml")
+    try:
+        data = tomllib.loads(Path(pyproject).read_text(errors="replace"))
+    except Exception:
+        return []
+    scripts = (data.get("project") or {}).get("scripts") or {}
+    resolved = []
+    for target in scripts.values():
+        if not isinstance(target, str):
+            continue
+        module = target.split(":", 1)[0].strip()
+        if not module:
+            continue
+        base = module.replace(".", "/")
+        for rel in (f"{base}.py", f"{base}/__init__.py"):
+            if os.path.isfile(os.path.join(sandbox, rel)):
+                resolved.append(rel)
+                break
+    return resolved
+
+
+def _discover_entry(sandbox: str, declared: str) -> tuple[str, str]:
+    """Find a runnable entry point inside *sandbox*.
+
+    Returns ``(entry_rel_path, source)`` with ``source`` in ``declared`` |
+    ``discovered`` | ``none``. Deterministic order: the *declared* entry, then
+    ``__main__.py``, ``main.py``, ``app.py``, ``manage.py``, ``cli.py``, then any
+    ``*.py`` with an ``if __name__ == "__main__":`` guard (sorted by path), then
+    ``[project.scripts]`` from ``pyproject.toml``. Never raises.
+    """
+    if not sandbox or not os.path.isdir(sandbox):
+        return "", "none"
+    if declared and _resolve_entry_path(sandbox, declared):
+        return declared, "declared"
+
+    for name in _ENTRY_CANDIDATES:
+        if _resolve_entry_path(sandbox, name):
+            return name, "discovered"
+
+    guarded: list[str] = []
+    for root, dirs, files in os.walk(sandbox):
+        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS)
+        for filename in sorted(files):
+            if not filename.endswith(".py") or filename in _SKIP_FILES:
+                continue
+            full = os.path.join(root, filename)
+            if _has_main_guard(full):
+                rel = os.path.relpath(full, sandbox)
+                if _resolve_entry_path(sandbox, rel):
+                    guarded.append(rel)
+    guarded.sort()
+    # ponytail: probe at most a few, prefer one that imports (a module with a
+    # missing third-party dep is not the runnable app entry). Bump the cap if
+    # discovery keeps picking a dead script in a repo with many __main__ files.
+    for rel in guarded[:_MAX_PROBED_ENTRIES]:
+        if _import_ok(sandbox, rel):
+            return rel, "discovered"
+    if guarded:
+        return guarded[0], "discovered"
+
+    for rel in _pyproject_scripts(sandbox):
+        if _resolve_entry_path(sandbox, rel):
+            return rel, "discovered"
+
+    return "", "none"
+
+
+def _sandbox_env(sandbox: str) -> dict[str, str]:
+    """Environment for running sandbox code without leaking bytecode or host paths."""
+    return {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": sandbox,
+    }
+
+
+def _import_smoke(sandbox: str, modified_files: list[str]) -> tuple[str, str]:
+    """Import each modified Python module; returns ``(status, details)``.
+
+    ``status`` is ``OK``, ``FAILED`` (any traceback) or ``SKIPPED`` (nothing to
+    import). Never raises.
+    """
+    py_files = [f for f in modified_files or [] if str(f).endswith(".py")]
+    if not sandbox or not os.path.isdir(sandbox) or not py_files:
+        return "SKIPPED", "no modified Python files"
+
+    failures: list[str] = []
+    env = _sandbox_env(sandbox)
+    for rel in py_files[:_MAX_SMOKE_MODULES]:
+        if not os.path.isfile(os.path.join(sandbox, rel)):
+            continue
+        module = _module_name(sandbox, rel)
+        if not module:
+            continue
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", f"import {module}"],
+                cwd=sandbox, env=env, capture_output=True, text=True,
+                timeout=_SMOKE_TIMEOUT, shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            failures.append(f"{module}: timeout after {_SMOKE_TIMEOUT}s")
+            continue
+        except Exception as e:
+            failures.append(f"{module}: {e}")
+            continue
+        if proc.returncode == 0:
+            continue
+        stderr = (proc.stderr or "").strip()
+        if "Traceback" in stderr:
+            err_lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+            signature = err_lines[-1] if err_lines else "unknown error"
+            failures.append(f"{module}: {signature[:_MAX_SMOKE_LINE]}")
+        else:
+            failures.append(f"{module}: exited {proc.returncode}")
+
+    if not failures:
+        return "OK", ", ".join(py_files[:_MAX_SMOKE_MODULES])
+    return "FAILED", "; ".join(failures)[:1000]
+
+
+def _record_smoke(state, entry: str, source: str, startup: str, import_status: str) -> None:
+    """Publish smoke evidence for the pipeline's result.json. Never raises."""
+    if state is None:
+        return
+    try:
+        state["smoke_evidence"] = {
+            "entry": entry,
+            "entry_source": source,
+            "startup": startup,
+            "import": import_status,
+        }
+    except Exception:
+        pass
+
+
+def _import_smoke_line(status: str, details: str) -> str:
+    """Render the import-smoke evidence as one output line."""
+    if status == "FAILED":
+        return f"Import smoke: FAILED ({details})"
+    return f"Import smoke: {status}"
 
 
 def _classify_failure(stderr: str, stdout: str) -> str | None:
@@ -118,8 +353,27 @@ def _format_verification_details(result) -> list[str]:
     return lines
 
 
+def _current_contract(state) -> RewriteContract | None:
+    """Parse ``state["current_contract"]`` (dict or model). Returns None if absent/invalid."""
+    raw = state.get("current_contract")
+    if not raw:
+        return None
+    if isinstance(raw, RewriteContract):
+        return raw
+    try:
+        if isinstance(raw, dict):
+            return RewriteContract(**raw)
+        return RewriteContract.model_validate(raw)
+    except Exception:
+        return None
+
+
 def _run_contract_verification(tool_context: ToolContext | None) -> tuple[str, str | None]:
     """Run deterministic contract verification if contracts exist in tool_context.state.
+
+    In IN-LOOP mode (``state["current_contract"]`` set) only that target is
+    verified — other targets are still unrewritten and must not fail the app
+    check. Otherwise every contract is verified.
 
     Returns (status, details) where status is 'PASS', 'FAIL', or 'NONE' (if no contracts).
     """
@@ -127,21 +381,27 @@ def _run_contract_verification(tool_context: ToolContext | None) -> tuple[str, s
         return "NONE", None
 
     state = tool_context.state
-    contracts_data = state.get("rewrite_contracts")
-    if not contracts_data:
-        return "NONE", None
+    target = state.get("target", "")
+    sandbox = state.get("sandbox", "")
 
-    try:
-        contracts = _deserialize_contracts(contracts_data)
-    except Exception:
-        return "NONE", None
+    current = _current_contract(state)
+    if current is not None:
+        result = verify_contract_target(target, sandbox, current)
+    else:
+        contracts_data = state.get("rewrite_contracts")
+        if not contracts_data:
+            return "NONE", None
+        try:
+            contracts = _deserialize_contracts(contracts_data)
+        except Exception:
+            return "NONE", None
+        result = verify_all_contracts(
+            target,
+            sandbox,
+            contracts,
+            state.get("modified_files", []),
+        )
 
-    result = verify_all_contracts(
-        state.get("target", ""),
-        state.get("sandbox", ""),
-        contracts,
-        state.get("modified_files", []),
-    )
     state["deterministic_verification"] = result.model_dump()
 
     if result.status == "FAIL":
@@ -173,6 +433,81 @@ def check_syntax(tool_context: ToolContext) -> str:
     return "\n".join(lines) if lines else "No Python files to syntax-check"
 
 
+def _launch_once(
+    entry_path: str,
+    entry_rel: str,
+    entry_source: str,
+    sandbox: str,
+    arg_tokens: list[str],
+    tool_context: ToolContext | None,
+) -> tuple[str, list[str]]:
+    """Launch the app once and classify the outcome.
+
+    Returns ``(first_line_status, parts)`` where ``parts[0]`` is the status block
+    (multi-line for deterministic failures) and the rest is command/exit/output
+    evidence. Deterministic verification always takes precedence.
+    """
+    argv = [sys.executable, entry_path, *arg_tokens]
+    cmd = shlex.join(argv)
+    try:
+        proc = subprocess.Popen(
+            argv, shell=False,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=sandbox, env=_sandbox_env(sandbox),
+        )
+    except Exception as e:
+        status = "STARTUP_FAILED_CODE:UNKNOWN"
+        return status, [
+            f"ERROR: failed to launch: {e}",
+            f"Command: {cmd}",
+            f"Entry: {entry_rel} ({entry_source})",
+        ]
+
+    try:
+        proc.wait(timeout=3)
+        stdout, stderr = proc.communicate()
+        parts = [
+            f"Command: {cmd}",
+            f"Entry: {entry_rel} ({entry_source})",
+            f"exit_code: {proc.returncode}",
+        ]
+        if stdout and stdout.strip():
+            parts.append(f"stdout:\n{stdout.strip()[:2000]}")
+        if stderr and stderr.strip():
+            parts.append(f"stderr:\n{stderr.strip()[:2000]}")
+        det_status, det_details = _run_contract_verification(tool_context)
+        if det_status == "FAIL":
+            status = f"STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL\n{det_details}"
+        elif proc.returncode == 0:
+            status = "STARTED_OK"
+        else:
+            category = _classify_failure(stderr or "", stdout or "")
+            status = f"STARTUP_FAILED_ENV:{category}" if category in ("MISSING_ARGS", "DB", "NETWORK") else (
+                f"STARTUP_FAILED_CODE:{category}" if category else "STARTUP_FAILED_CODE:UNKNOWN"
+            )
+        return status.splitlines()[0], [status, *parts]
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        det_status, det_details = _run_contract_verification(tool_context)
+        if det_status == "FAIL":
+            status = f"STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL\n{det_details}"
+            parts = [status, f"Command: {cmd}"]
+        else:
+            status = "STARTED_OK"
+            parts = [status, f"Command: {cmd}"]
+        parts.append(f"Entry: {entry_rel} ({entry_source})")
+        if stdout and stdout.strip():
+            parts.append(f"stdout:\n{stdout.strip()[:2000]}")
+        if stderr and stderr.strip():
+            parts.append(f"stderr:\n{stderr.strip()[:2000]}")
+        return status.splitlines()[0], parts
+
+
 def run_application(args: str = "", tool_context: ToolContext | None = None) -> str:
     """Launch the application and verify it starts without an immediate crash.
 
@@ -180,6 +515,15 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
     watched for a short window (3 seconds). It is NOT run to completion.
 
     Behavior:
+    - The entry point is taken from `file_selector_output.entry_point` when it
+      resolves; otherwise it is discovered deterministically inside the sandbox
+      (`__main__.py`, `main.py`, `app.py`, `manage.py`, `cli.py`, then files with
+      an `if __name__ == "__main__":` guard, then `[project.scripts]`).
+    - When no entry point exists at all, "NO_ENTRY_POINT" is returned instead of
+      an error. That is not a code failure — there is simply nothing to launch.
+    - Every modified Python module is import-smoked (a real `import` with the
+      sandbox on PYTHONPATH) and the result is reported as
+      `Import smoke: OK|FAILED …`, regardless of whether the app started.
     - If the process is still running after 3 seconds, it started cleanly
       without an immediate crash -> it is terminated and "STARTED_OK" is
       returned along with the command and any early stdout/stderr.
@@ -187,13 +531,17 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
       is returned along with the captured output.
     - If rewrite_contracts exist in state and fail deterministic AST
       verification, "STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL"
-      is returned instead of "STARTED_OK".
+      is returned instead of "STARTED_OK". In IN-LOOP mode (a non-empty
+      `current_contract` in state) only that contract is verified; otherwise
+      all contracts are.
     - If the process exited within 3 seconds with a non-zero returncode, the
       failure is classified into one of:
 
       * ``STARTUP_FAILED_ENV:MISSING_ARGS`` — the app needs CLI arguments
-        (usage message, argument required error).  This is NOT a code error;
-        the verifier should retry with ``--help`` or reasonable defaults.
+        (usage message, argument required error).  This is NOT a code error.
+        When the caller passed no arguments, the tool itself relaunches once
+        with ``--help`` and reports the retry's final status; the verifier must
+        not retry again.
       * ``STARTUP_FAILED_ENV:DB`` — a database server is not available
         (connection refused, unknown host, missing socket).  This is **not**
         a code error — the code is syntactically correct.
@@ -208,89 +556,68 @@ def run_application(args: str = "", tool_context: ToolContext | None = None) -> 
         no known error pattern was matched.
 
     Args:
-        args: Optional CLI arguments to pass. Start empty, then try --help,
-              then try reasonable defaults if the app requires arguments.
+        args: Optional CLI arguments to pass. Leave empty to let the tool pick
+              the arguments (it retries once with ``--help`` when the app
+              complains about missing arguments). When args are given they are
+              used verbatim and no automatic retry happens.
     """
-    sandbox = tool_context.state.get("sandbox", "") if tool_context else ""
-    entry = ""
-    if tool_context:
-        fs_out = tool_context.state.get("file_selector_output", {})
-        if hasattr(fs_out, "entry_point"):
-            entry = fs_out.entry_point or ""
-        elif isinstance(fs_out, str):
-            try:
-                parsed = json.loads(fs_out)
-                if isinstance(parsed, dict):
-                    entry = parsed.get("entry_point", "")
-            except Exception:
-                pass
-        elif isinstance(fs_out, dict):
-            entry = fs_out.get("entry_point", "")
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    sandbox = (state.get("sandbox", "") if state else "") or ""
+    modified = list(state.get("modified_files") or []) if state else []
 
-    if not entry:
-        return "ERROR: no entry point"
+    entry_rel, entry_source = _discover_entry(sandbox, _declared_entry(state))
+    import_status, import_details = _import_smoke(sandbox, modified)
+    smoke_line = _import_smoke_line(import_status, import_details)
 
-    entry_path = _resolve_entry_path(sandbox, entry)
-    if not entry_path:
-        return f"ERROR: unsafe or missing entry point: {entry!r}"
+    def _finish(startup: str, lines: list[str]) -> str:
+        _record_smoke(state, entry_rel, entry_source, startup, import_status)
+        return "\n".join(lines)
+
+    if not entry_rel:
+        return _finish("NO_ENTRY_POINT", [
+            "NO_ENTRY_POINT",
+            "No runnable entry point found in the sandbox (searched __main__.py, main.py, "
+            "app.py, manage.py, cli.py, __main__ guards, [project.scripts]).",
+            smoke_line,
+            "This is not a code defect: there is nothing to launch. Judge the change on "
+            "deterministic verification, syntax and import results.",
+        ])
 
     arg_tokens = _split_application_args(args)
     if arg_tokens is None:
-        return "ERROR: invalid application arguments"
+        return _finish("STARTUP_FAILED_CODE:UNKNOWN", [
+            "ERROR: invalid application arguments",
+            f"Entry: {entry_rel} ({entry_source})",
+            smoke_line,
+        ])
 
-    argv = [sys.executable, entry_path, *arg_tokens]
-    cmd = shlex.join(argv)
-    env = {
-        **os.environ,
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONPATH": sandbox,
-    }
-    try:
-        proc = subprocess.Popen(
-            argv, shell=False,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            cwd=sandbox, env=env,
+    entry_path = _resolve_entry_path(sandbox, entry_rel)
+    if not entry_path:
+        return _finish("NO_ENTRY_POINT", [
+            "NO_ENTRY_POINT",
+            f"Resolved entry {entry_rel!r} is unsafe or missing.",
+            smoke_line,
+        ])
+
+    status, parts = _launch_once(entry_path, entry_rel, entry_source, sandbox, arg_tokens, tool_context)
+
+    if status == "STARTUP_FAILED_ENV:MISSING_ARGS" and not arg_tokens:
+        # Deterministic single retry: the app asked for arguments, so try --help
+        # once instead of leaving it to the LLM (which does it inconsistently).
+        retry_status, retry_parts = _launch_once(
+            entry_path, entry_rel, entry_source, sandbox, ["--help"], tool_context,
         )
-    except Exception as e:
-        return f"ERROR: failed to launch: {e}"
+        parts = [
+            retry_parts[0],
+            "first attempt: MISSING_ARGS",
+            *parts[1:],
+            "retry: --help",
+            *retry_parts[1:],
+        ]
+        status = retry_status
 
-    try:
-        proc.wait(timeout=3)
-        stdout, stderr = proc.communicate()
-        parts = [f"Command: {cmd}", f"exit_code: {proc.returncode}"]
-        if stdout and stdout.strip():
-            parts.append(f"stdout:\n{stdout.strip()[:2000]}")
-        if stderr and stderr.strip():
-            parts.append(f"stderr:\n{stderr.strip()[:2000]}")
-        det_status, det_details = _run_contract_verification(tool_context)
-        if det_status == "FAIL":
-            parts.insert(0, f"STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL\n{det_details}")
-        elif proc.returncode == 0:
-            parts.insert(0, "STARTED_OK")
-        else:
-            category = _classify_failure(stderr or "", stdout or "")
-            prefix = f"STARTUP_FAILED_ENV:{category}" if category in ("MISSING_ARGS", "DB", "NETWORK") else (
-                f"STARTUP_FAILED_CODE:{category}" if category else "STARTUP_FAILED_CODE:UNKNOWN"
-            )
-            parts.insert(0, prefix)
-        return "\n".join(parts)
-    except subprocess.TimeoutExpired:
-        proc.terminate()
-        try:
-            stdout, stderr = proc.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        det_status, det_details = _run_contract_verification(tool_context)
-        if det_status == "FAIL":
-            parts = [f"STARTUP_FAILED_CODE:DETERMINISTIC_VERIFICATION_FAIL\n{det_details}", f"Command: {cmd}"]
-        else:
-            parts = ["STARTED_OK", f"Command: {cmd}"]
-        if stdout and stdout.strip():
-            parts.append(f"stdout:\n{stdout.strip()[:2000]}")
-        if stderr and stderr.strip():
-            parts.append(f"stderr:\n{stderr.strip()[:2000]}")
-        return "\n".join(parts)
+    parts.append(smoke_line)
+    return _finish(status, parts)
 
 
 def compare_original_and_modified(tool_context: ToolContext) -> str:

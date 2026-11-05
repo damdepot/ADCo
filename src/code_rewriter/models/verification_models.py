@@ -3,7 +3,20 @@ from pydantic import BaseModel, Field
 
 VerificationStatus = Literal["PASS", "FAIL"]
 ViolationSeverity = Literal["ERROR", "WARNING"]
-CheckStatus = Literal["PASS", "FAIL"]
+CheckStatus = Literal["PASS", "FAIL", "SKIPPED"]
+
+
+class VerificationGap(BaseModel):
+    """A deterministic check that could not evaluate its input.
+
+    Gaps are not violations: the rewrite may still be correct, but the check
+    silently skipped the site, so the result is only PARTIAL evidence.
+    """
+
+    check: str
+    function: str = ""
+    line: Optional[int] = None
+    reason: str
 
 class VerificationViolation(BaseModel):
     code: str
@@ -41,3 +54,10 @@ class VerificationResult(BaseModel):
     transformed_targets: int = Field(default=0, description="Successfully transformed targets")
     missing_targets: int = Field(default=0, description="Targets not yet transformed")
     rewrite_coverage: float = Field(default=1.0, description="transformed / expected, in [0.0, 1.0]")
+    gaps: list[VerificationGap] = Field(
+        default_factory=list,
+        description="Checks that could not evaluate a site (PARTIAL evidence)",
+    )
+    verification_status: Literal["FULL", "PARTIAL"] = Field(
+        default="FULL", description="PARTIAL iff any gaps were recorded"
+    )

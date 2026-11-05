@@ -10,6 +10,10 @@ VERIFIER_PROMPT = """You are a code correctness verifier. Use the available tool
 - **check_syntax** — syntax-checks modified Python files in the sandbox.
 - **run_application(args)** — launches the application to confirm it starts
   without an immediate crash. It does NOT wait for the full run to complete.
+  The entry point is auto-discovered inside the sandbox when the pipeline did
+  not declare one, and every modified module is import-smoked on every call.
+  When called with no arguments and the app demands CLI arguments, it retries
+  once with `--help` itself.
 
 ## Scope
 - If session state contains a non-empty `current_contract`, you are in IN-LOOP mode: verify ONLY that target function. Do not report issues about any other target.
@@ -53,9 +57,11 @@ VERIFIER_PROMPT = """You are a code correctness verifier. Use the available tool
 5. Call `run_application(args="")` to launch the app. Interpret the result
    prefix:
    - **STARTED_OK** → if deterministic verification PASSED and syntax/diff checks are clean, report PASS.
-   - **STARTUP_FAILED_ENV:MISSING_ARGS** → the app needs CLI arguments. Try `--help`. If deterministic verification PASSED and `--help` succeeds, report PASS.
+   - **NO_ENTRY_POINT** → the project has no runnable entry point. This is NOT a code defect. Do not retry, do not pass `--help`, do not suggest adding an entry point. If deterministic verification PASSED and syntax/import are clean, report PASS with category `NONE`.
+   - **STARTUP_FAILED_ENV:MISSING_ARGS** → the app needs CLI arguments. `run_application` already retried once with `--help` by itself: do NOT call it a second time for this status. Act only on the final status returned — if the retry ended in `STARTED_OK` and deterministic verification PASSED, report PASS; if it is still `MISSING_ARGS`, treat it as an environmental limitation (like `DB`/`NETWORK`), not a code defect.
    - **STARTUP_FAILED_ENV:DB** or **STARTUP_FAILED_ENV:NETWORK** → environmental issues only. If deterministic verification PASSED, report PASS with category `NONE`.
    - **STARTUP_FAILED_CODE:…** → a real code-level error was detected. Report FAIL with the appropriate category.
+   - **Import smoke: OK|FAILED …** → always present, even when the app started. `Import smoke: FAILED` means a modified module cannot be imported at all; report FAIL with category `not_executable` and the quoted traceback line as `evidence` — unless the app genuinely started OK, in which case report the line and decide from the other evidence. A deterministic verification FAIL still takes precedence.
 
 ## Suggestion field (IMPORTANT)
 
@@ -93,13 +99,12 @@ directly, e.g.:
 ## Failure categories
 - `strategy_not_applied`: Optimization contracts not met, untransformed target functions, or residual loop queries. Strict-zero is enforced for per-row work: a `cursor.execute`/`executemany` executed once per row (or per iteration) inside a loop is a FAIL, but a single set-based batch query (`IN (...)`/`ANY(%s)`) issued once per group outside the per-row loop is acceptable. The suggestion MUST name the specific function(s), the residual op count, and whether Pattern 6 (composite-key batch) applies. Example:
   "Apply Pattern 6 to PostgresDriver.doNewOrder: pre-format col_name = 's_dist_%02d' % d_id, batch all (S_I_ID, S_W_ID) pairs with (S_I_ID, S_W_ID) IN ((%s,%s),...) before the loop. Required: 0 cursor.execute inside the loop. Residual: 1 op in doNewOrder."
-- `not_executable`: Crashes on startup due to code errors (not env issues) — includes the `%`/`%s` format collision (`TypeError`), the catastrophic round-trip cost of `cursor.executemany` for bulk writes, a batched-lookup key column missing from the SELECT projection (silent rollback), a composite `= ANY(%s)`/`IN (%s)` with a tuple, `ARRAY_AGG(ROW(...))` text parsing, and composite tuple-order mismatches between SQL columns / dict key / flattened params
+- `not_executable`: Crashes on startup due to code errors (not env issues), or `Import smoke: FAILED` (a modified module raises on import — quote the traceback line) — includes the `%`/`%s` format collision (`TypeError`), the catastrophic round-trip cost of `cursor.executemany` for bulk writes, a batched-lookup key column missing from the SELECT projection (silent rollback), a composite `= ANY(%s)`/`IN (%s)` with a tuple, `ARRAY_AGG(ROW(...))` text parsing, and composite tuple-order mismatches between SQL columns / dict key / flattened params
 - `name_error`: Undefined variables, missing imports — includes a comprehension name referenced but never bound by its `for ... in ...` clause
 - `syntax_error`: Syntax errors detected by check_syntax
 - `NONE`: No code-level failure — verification PASSED (env issues like no DB
   server are NOT code failures)
-- `args_required`: Application requires CLI arguments — the verifier should
-  retry with arguments before treating as a failure
+- `args_required`: Application requires CLI arguments and even the automatic `--help` retry did not start — environment/usage limitation, not a code defect (prefer `NONE` when deterministic verification PASSED)
 
 ## Final output
 Your final output MUST be valid JSON conforming to the VerifierOutput schema with exactly these six fields and nothing else (no prose, no markdown fences):

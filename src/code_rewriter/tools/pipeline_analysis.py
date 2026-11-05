@@ -6,7 +6,15 @@ from .sql_resolver import collect_module_dicts, resolve, _const_str
 from ..models.ast_models import FileAnalysis, FunctionAnalysis
 from ..models.rewrite_models import RewriteContract, RewriteTarget
 from .rewrite_contract import build_rewrite_contract
-from .contract_verifier import verify_contract, VerificationResult, TargetStatus, VerificationCheck, VerificationViolation
+from .contract_verifier import (
+    verify_contract,
+    VerificationResult,
+    TargetStatus,
+    VerificationCheck,
+    VerificationViolation,
+    dedupe_gaps,
+    MAX_GAPS_PER_RUN,
+)
 from .dependency_graph import build_dependency_graph, slice_dependency_graph, format_dependency_slice_markdown
 from .query_constant import SINGLE_QUERY_PATTERN, referenced_query_constant
 from .._common import find_function_node, extract_function_source_by_name
@@ -278,6 +286,7 @@ def verify_all_contracts(
     all_violations = []
     all_checks = []
     all_target_coverage = []
+    all_gaps: list[dict] = []
     
     active_contracts = [c for c in contracts if c.target and c.target.file in modified_files]
     
@@ -292,8 +301,10 @@ def verify_all_contracts(
                 with open(opt_src, 'r', encoding='utf-8') as file:
                     opt_code = file.read()
                 
-                result = verify_contract(orig_code, opt_code, c)
+                contract_gaps: list[dict] = []
+                result = verify_contract(orig_code, opt_code, c, gaps=contract_gaps)
                 all_violations.extend(result.violations)
+                all_gaps.extend(contract_gaps)
                 for check in result.checks:
                     if not any(existing.name == check.name and existing.status == check.status for existing in all_checks):
                         all_checks.append(check)
@@ -363,6 +374,8 @@ def verify_all_contracts(
     )
     rewrite_coverage = round(transformed_required / expected_targets, 3) if expected_targets > 0 else 1.0
 
+    final_gaps = dedupe_gaps(all_gaps, MAX_GAPS_PER_RUN)
+
     critical_codes = {
         "SYNTAX_ERROR", "ORIGINAL_SYNTAX_ERROR", "TARGET_MISSING",
         "FUNCTION_SIGNATURE_CHANGED", "UNAUTHORIZED_CHANGE",
@@ -391,7 +404,9 @@ def verify_all_contracts(
         expected_targets=expected_targets,
         transformed_targets=transformed_targets,
         missing_targets=missing_targets,
-        rewrite_coverage=rewrite_coverage
+        rewrite_coverage=rewrite_coverage,
+        gaps=final_gaps,
+        verification_status="PARTIAL" if final_gaps else "FULL",
     )
 
 def verify_contract_target(

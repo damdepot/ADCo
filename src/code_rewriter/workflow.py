@@ -419,6 +419,30 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         if v.get("severity") == "WARNING"
     ]
 
+    seen_gaps: set[tuple] = set()
+    gaps: list[dict[str, Any]] = []
+    for r in results:
+        for gap in ((r.get("verification") or {}).get("gaps") or []):
+            if not isinstance(gap, dict):
+                continue
+            key = (
+                gap.get("check"),
+                gap.get("function", ""),
+                gap.get("line"),
+                gap.get("reason", ""),
+            )
+            if key in seen_gaps:
+                continue
+            seen_gaps.add(key)
+            gaps.append(gap)
+    verification_status = "PARTIAL" if gaps else "FULL"
+    gap_policy = ctx.state.get("gap_policy") or "warn"
+    gap_lines = [
+        f"[GAP] {gap.get('check')}: {gap.get('reason')}"
+        for gap in gaps
+        if gap.get("check")
+    ]
+
     summary = f"{n_pass}/{required} required target functions transformed."
     if n_noop:
         summary += f" {n_noop} no-op (no rewritable pattern)."
@@ -437,6 +461,8 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         "noop_targets": n_noop,
         "missing_targets": required - n_pass,
         "rewrite_coverage": (n_pass / required) if required else 1.0,
+        "gaps": gaps,
+        "verification_status": verification_status,
         "target_coverage": [
             {
                 "file": r.get("file", ""),
@@ -488,26 +514,56 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
         if r.get("status") == "RESTRICTED"
     ]
 
-    if not all_ok:
-        vo = {
-            "status": "FAIL",
-            "category": (
-                llm.get("category")
-                if llm.get("category") not in (None, "", "NONE")
-                else "strategy_not_applied"
-            ),
-            "reason": det["summary"],
-            "detail": "; ".join(
-                f"{r.get('file')}::{r.get('function')}"
-                for r in results
-                if r.get("status") not in ("PASS", "NO_OP", "RESTRICTED")
-            ),
-            "suggestion": llm.get("suggestion", "")
-            or (
-                "Apply the Acceptance Checklist: remove every DB call from loops "
-                "and hoist batch reads/writes."
-            ),
-        }
+    # A "fail" gap policy escalates a PARTIAL (deterministic PASS with skipped
+    # checks) into a deterministic FAIL. A real deterministic FAIL already
+    # wins, so it keeps its own verdict/category regardless of policy.
+    gap_escalates = gap_policy == "fail" and bool(gaps) and all_ok
+    if gap_escalates:
+        det["status"] = "FAIL"
+
+    if not all_ok or gap_escalates:
+        if gap_escalates:
+            affected_checks = sorted(
+                {str(gap.get("check")) for gap in gaps if gap.get("check")}
+            )
+            vo = {
+                "status": "FAIL",
+                "category": "unverified",
+                "reason": (
+                    f"{len(gaps)} verification gap(s) across "
+                    f"{len(affected_checks)} check(s) could not evaluate their "
+                    f"input: {', '.join(affected_checks)}."
+                ),
+                "detail": "; ".join(gap_lines),
+                "suggestion": llm.get("suggestion", "")
+                or (
+                    "Make the target's SQL and parameters statically resolvable, "
+                    "or provide the missing source, so every deterministic check runs."
+                ),
+            }
+        else:
+            vo = {
+                "status": "FAIL",
+                "category": (
+                    llm.get("category")
+                    if llm.get("category") not in (None, "", "NONE")
+                    else "strategy_not_applied"
+                ),
+                "reason": det["summary"],
+                "detail": "; ".join(
+                    [
+                        f"{r.get('file')}::{r.get('function')}"
+                        for r in results
+                        if r.get("status") not in ("PASS", "NO_OP", "RESTRICTED")
+                    ]
+                    + gap_lines
+                ),
+                "suggestion": llm.get("suggestion", "")
+                or (
+                    "Apply the Acceptance Checklist: remove every DB call from loops "
+                    "and hoist batch reads/writes."
+                ),
+            }
     else:
         # Deterministic verification is authoritative: every target transformed
         # (or safely restricted to its original) means PASS. The advisory LLM
@@ -519,6 +575,7 @@ def finalize(ctx: Context, node_input: Any = None) -> Event:
             f"[{w.get('code')}] {w.get('message')}" for w in warnings
         ]
         detail_parts.extend(restricted_lines)
+        detail_parts.extend(gap_lines)
         vo = {
             "status": "PASS",
             "category": "NONE",

@@ -90,6 +90,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory to write the rewritten project into (required for 'all' and 'rewrite-only' modes)",
     )
+    p.add_argument(
+        "--gap-policy",
+        choices=["warn", "fail"],
+        default="warn",
+        help=(
+            "How to treat verification gaps (checks that silently skipped their "
+            "input): 'warn' keeps the deterministic verdict and surfaces gaps in "
+            "the detail; 'fail' turns a PARTIAL result into a FAIL (default: warn)"
+        ),
+    )
     # Knob tuner
     p.add_argument(
         "--db-name",
@@ -227,6 +237,7 @@ async def run_pipeline(
     intent_output_path: str = "out/adco/intent_result.json",
     rewriter_output: str = "out/adco/rewriter_result.json",
     sandbox_dir: str | None = None,
+    gap_policy: str = "warn",
     db_name: str = "",
     db_type: str = "postgres",
     db_config: str = "db.config",
@@ -306,6 +317,7 @@ async def run_pipeline(
         rewriter_extra_state: dict[str, Any] = {
             "intent_output": intent_output,
             "intent_extractor_output": intent_output,
+            "gap_policy": gap_policy,
         }
 
         rewriter_state = await rewriter_pipeline(
@@ -453,6 +465,7 @@ def main() -> None:
                 intent_output_path=args.intent_output,
                 rewriter_output=args.rewriter_output,
                 sandbox_dir=args.sandbox_dir,
+                gap_policy=getattr(args, "gap_policy", "warn"),
                 db_name=args.db_name,
                 db_type=args.db_type,
                 db_config=args.db_config,

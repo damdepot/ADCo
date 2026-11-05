@@ -13,6 +13,7 @@ from ..models import (
     TargetStatus,
     DependencyType,
 )
+from ..models.verification_models import VerificationGap
 from .ast_analyzer import analyze_source
 from .._common import target_names
 from ..models.ast_models import FileAnalysis, FunctionAnalysis, DatabaseOperation
@@ -30,14 +31,201 @@ from .sql_analysis import (
     fragile_composite_agg_sql,
     composite_any_array_sql,
     lookup_key_not_selected_sql,
+    find_select_column_count,
+    _iter_analyzed,
+    _placeholder_count,
+    _static_params_count,
+    _sql_affine,
+    _param_list_affines,
+    _params_affine,
+    _single_symbols,
+    _resolve_symbols,
 )
 from .python_analysis import (
     _bound_names,
     percent_format_arity_violations,
     undefined_name_violations,
     slow_executemany_violations,
+    _ModFormatAnalyzer,
+    _raw_string,
+    _supplied_args,
+    _scan_conversions,
+    _index_scope_nodes,
+    _is_dynamic_scope,
+    _has_star_import,
 )
+from .sql_resolver import SENTINEL
 from .query_constant import SINGLE_QUERY_PATTERN, target_constant
+
+MAX_GAPS_PER_CONTRACT = 20
+MAX_GAPS_PER_RUN = 50
+
+_REASON_PERCENT = "template or arguments not statically resolvable"
+_REASON_DYNAMIC_SQL = "dynamic SQL or unknown parameter count"
+_REASON_SYMBOLIC = "symbolic placeholder arithmetic not resolvable"
+_REASON_ROW_INDEX = "SELECT column count not resolvable"
+
+
+def dedupe_gaps(gaps: list[dict], cap: int) -> list[dict]:
+    """Dedupe gaps by (check, function, line, reason) and cap the total."""
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for gap in gaps:
+        key = (
+            gap.get("check"),
+            gap.get("function", ""),
+            gap.get("line"),
+            gap.get("reason", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(gap)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _gap(check: str, reason: str, function: str = "", line: Optional[int] = None) -> dict:
+    return {"check": check, "function": function or "", "line": line, "reason": reason}
+
+
+def _in_regions_filter(target_regions: Optional[set[str]]):
+    regions = {r for r in (target_regions or set()) if r}
+
+    def _in_regions(function: str) -> bool:
+        if not regions:
+            return True
+        return function in regions or function.split(".")[-1] in regions
+
+    return _in_regions
+
+
+def _collect_gap_candidates(
+    optimized_source: str, target_regions: Optional[set[str]]
+) -> list[dict]:
+    """Mirror the skip paths of the deterministic checks and record gaps.
+
+    Every branch here corresponds to a ``continue`` in the detector: the check
+    saw a site but could not evaluate it, so the rewrite is only partially
+    verified. Mirrored deliberately (not shared) so detector violation
+    semantics stay untouched.
+    """
+    gaps: list[dict] = []
+    in_regions = _in_regions_filter(target_regions)
+    try:
+        tree = ast.parse(optimized_source)
+    except SyntaxError:
+        return gaps
+
+    # check_undefined_names
+    if _has_star_import(tree):
+        gaps.append(
+            _gap(
+                "check_undefined_names",
+                "star import without original source",
+            )
+        )
+    scope_index: Dict[tuple, tuple] = {}
+    _index_scope_nodes(tree, "", scope_index)
+    for node, qualified in scope_index.values():
+        if qualified and in_regions(qualified) and _is_dynamic_scope(node):
+            gaps.append(
+                _gap(
+                    "check_undefined_names",
+                    "dynamic scope (globals/locals/eval/exec)",
+                    qualified,
+                    getattr(node, "lineno", None),
+                )
+            )
+
+    # check_percent_format_arity
+    for name, analyzer in _iter_analyzed(optimized_source, _ModFormatAnalyzer):
+        if not in_regions(name):
+            continue
+        for binop, local_vars in analyzer.mod_nodes:
+            template = _raw_string(binop.left, local_vars, analyzer.module_dicts)
+            if not isinstance(template, str):
+                gaps.append(
+                    _gap("check_percent_format_arity", _REASON_PERCENT, name, binop.lineno)
+                )
+                continue
+            positional, named = _scan_conversions(template)
+            # An f-string carrying a conversion is a flagged violation, not a gap.
+            if isinstance(binop.left, ast.JoinedStr) and (positional or named):
+                continue
+            if SENTINEL in template:
+                gaps.append(
+                    _gap("check_percent_format_arity", _REASON_PERCENT, name, binop.lineno)
+                )
+                continue
+            if _supplied_args(binop.right, local_vars, analyzer.module_dicts) is None:
+                gaps.append(
+                    _gap("check_percent_format_arity", _REASON_PERCENT, name, binop.lineno)
+                )
+
+    # check_placeholder_param_mismatch / check_dynamic_placeholder_arity / check_row_indices
+    for name, analyzer in _iter_analyzed(optimized_source):
+        if not in_regions(name):
+            continue
+        param_affines = _param_list_affines(analyzer.function_node)
+        for sql, line, sql_node, params_node, method in analyzer.execute_calls:
+            if method != "execute":
+                continue
+            dynamic = (
+                not isinstance(sql, str)
+                or SENTINEL in sql
+                or not analyzer.is_exact(sql_node)
+            )
+            unknown_params = False
+            if not dynamic:
+                positional, named = _placeholder_count(sql)
+                if named:
+                    unknown_params = not isinstance(params_node, ast.Dict)
+                else:
+                    unknown_params = _static_params_count(params_node) is None
+            if dynamic or unknown_params:
+                gaps.append(
+                    _gap("check_placeholder_param_mismatch", _REASON_DYNAMIC_SQL, name, line)
+                )
+
+            sql_affine = _sql_affine(sql_node, analyzer.sql_ast_vars)
+            if sql_affine is None:
+                gaps.append(
+                    _gap("check_dynamic_placeholder_arity", _REASON_SYMBOLIC, name, line)
+                )
+                continue
+            if not sql_affine.syms:
+                # Static SQL: placeholder_param_mismatch owns it.
+                continue
+            sql_symbols = _single_symbols(sql_affine)
+            if not sql_symbols:
+                gaps.append(
+                    _gap("check_dynamic_placeholder_arity", _REASON_SYMBOLIC, name, line)
+                )
+                continue
+            params_affine = _params_affine(params_node, param_affines)
+            if params_affine is None:
+                gaps.append(
+                    _gap("check_dynamic_placeholder_arity", _REASON_SYMBOLIC, name, line)
+                )
+                continue
+            params_symbols = _resolve_symbols(params_affine, set(sql_symbols))
+            if params_symbols is None or set(params_symbols) != set(sql_symbols):
+                gaps.append(
+                    _gap("check_dynamic_placeholder_arity", _REASON_SYMBOLIC, name, line)
+                )
+
+        for sql, reads in analyzer.row_reads.items():
+            if not reads:
+                continue
+            if find_select_column_count(sql) is None:
+                _, line = max(reads, key=lambda item: item[0])
+                gaps.append(
+                    _gap("check_row_indices", _REASON_ROW_INDEX, name, line)
+                )
+
+    return gaps
 
 def _extract_function_ast_map(source: Optional[str]) -> Dict[str, ast.AST]:
     if not source:
@@ -199,7 +387,12 @@ def _resolve_region_node(ast_map: Dict[str, ast.AST], region: Optional[str]) -> 
             return node
     return None
 
-def verify_contract(original_source: str, optimized_source: str, contract: RewriteContract) -> VerificationResult:
+def verify_contract(
+    original_source: str,
+    optimized_source: str,
+    contract: RewriteContract,
+    gaps: Optional[List[dict]] = None,
+) -> VerificationResult:
     violations: List[VerificationViolation] = []
     checks: List[VerificationCheck] = []
     
@@ -361,6 +554,20 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             target_regions.add(t.qualified_function)
         if t.function:
             target_regions.add(t.function)
+
+    # Verification gaps: record where a deterministic check skipped its input
+    # (inside the target regions only). Never raises: gaps are evidence, not
+    # a reason to fail verification.
+    collected_gaps: List[dict] = []
+    try:
+        collected_gaps = dedupe_gaps(
+            _collect_gap_candidates(optimized_source, target_regions),
+            MAX_GAPS_PER_CONTRACT,
+        )
+    except Exception:
+        collected_gaps = []
+    if gaps is not None:
+        gaps.extend(collected_gaps)
 
     if is_n1 and target_regions:
         target_orig_funcs = [f for f in _get_all_functions(orig_ast) if (f.qualified_name in target_regions or f.name in target_regions)]
@@ -720,7 +927,9 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
         expected_targets=coverage_result.expected_targets,
         transformed_targets=coverage_result.transformed_targets,
         missing_targets=coverage_result.missing_targets,
-        rewrite_coverage=coverage_result.rewrite_coverage
+        rewrite_coverage=coverage_result.rewrite_coverage,
+        gaps=[VerificationGap(**gap) for gap in collected_gaps],
+        verification_status="PARTIAL" if collected_gaps else "FULL",
     )
 
 def _get_all_functions(ast: FileAnalysis) -> List[FunctionAnalysis]:
