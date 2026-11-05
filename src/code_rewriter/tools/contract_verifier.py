@@ -1,4 +1,5 @@
 import ast
+import functools
 import re
 from typing import Dict, List, Optional
 
@@ -24,12 +25,14 @@ from .sql_analysis import (
     duplicate_where_sql,
     unknown_query_key_sql,
     placeholder_param_mismatch_sql,
+    dynamic_placeholder_arity_sql,
     duplicate_column_predicate_sql,
     fragile_composite_agg_sql,
     composite_any_array_sql,
     lookup_key_not_selected_sql,
 )
 from .python_analysis import (
+    _bound_names,
     percent_format_arity_violations,
     undefined_name_violations,
     slow_executemany_violations,
@@ -54,6 +57,36 @@ def _extract_function_ast_map(source: Optional[str]) -> Dict[str, ast.AST]:
                     if child.name not in res:
                         res[child.name] = child
     return res
+
+def _mentioned_names(source: Optional[str]) -> set[str]:
+    """Every identifier occurring anywhere in *source* (a lenient allowlist).
+
+    Used to keep star-import-provided names that the original file already
+    mentions from being reported as undefined in a rewrite.
+    """
+    if not source:
+        return set()
+    try:
+        tree = ast.parse(source)
+    except Exception:
+        return set()
+    names: set[str] = set()
+    for node in tree.body:
+        names |= _bound_names(node)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.alias):
+            names.add(node.asname or node.name.split(".")[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+    return names
 
 def _is_n1(contract: RewriteContract) -> bool:
     """True when the contract targets an N+1 / batching / combining rewrite."""
@@ -551,6 +584,25 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
         ))
 
     for site in _new_sites(
+        dynamic_placeholder_arity_sql,
+        lambda v: (v["function"], v["line"]),
+    ):
+        violations.append(VerificationViolation(
+            code="DYNAMIC_PLACEHOLDER_ARITY",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} builds SQL with {site['placeholders']} "
+                f"placeholder(s) but passes {site['params']} parameter(s) "
+                f"({site['sql_shape']}). The two counts only agree for a batch of one "
+                "element, so any n >= 2 raises at runtime (psycopg2 applies `%` itself: "
+                "'TypeError: not all arguments converted during string formatting'). "
+                "Hoist the scalar placeholder out of the per-row parameter list so it is "
+                "passed once, or use execute_batch. Fix the counts so they match for every "
+                "batch size, not just n=1."
+            ),
+        ))
+
+    for site in _new_sites(
         percent_format_arity_violations,
         lambda v: (v["function"], v["template"], v["line"]),
     ):
@@ -572,8 +624,11 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             actual=site["actual"],
         ))
 
+    original_identifiers = _mentioned_names(original_source)
     for site in _new_sites(
-        undefined_name_violations,
+        functools.partial(
+            undefined_name_violations, allowed_extra=original_identifiers
+        ),
         lambda v: (v["function"], v["name"]),
     ):
         violations.append(VerificationViolation(
@@ -581,8 +636,9 @@ def verify_contract(original_source: str, optimized_source: str, contract: Rewri
             severity="ERROR",
             message=(
                 f"Function {site['function']} references name '{site['name']}' which is never "
-                "bound in the function, an enclosing scope, the module, or builtins; this "
-                "raises `NameError` at runtime. Bind it — a comprehension must include its "
+                "bound in the function, an enclosing scope, the module, or builtins, and does "
+                "not appear anywhere in the original file; this raises `NameError` at runtime. "
+                "Bind it — a comprehension must include its "
                 f"`for {site['name']} in <iterable>` clause; otherwise add the missing "
                 "assignment or parameter."
             ),

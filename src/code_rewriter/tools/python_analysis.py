@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import builtins
 import re
+import symtable
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .sql_analysis import _FUNCTION_NODES, _FunctionAnalyzer, _iter_analyzed, _iter_functions
@@ -249,91 +250,6 @@ def _bound_names(node: ast.AST) -> Set[str]:
     return names
 
 
-def _collect(
-    node: Optional[ast.AST],
-    bound: Set[str],
-    referenced: Set[str],
-    ref_lines: Dict[str, int],
-) -> None:
-    """Collect bound/referenced names without descending into nested scopes."""
-    if node is None:
-        return
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        bound.add(node.name)
-        return
-    if isinstance(node, ast.Lambda):
-        return
-    if isinstance(node, ast.Name):
-        if isinstance(node.ctx, ast.Load):
-            referenced.add(node.id)
-            ref_lines.setdefault(node.id, node.lineno)
-        else:
-            bound.add(node.id)
-        return
-    if isinstance(node, (ast.Global, ast.Nonlocal)):
-        bound.update(node.names)
-        return
-    if isinstance(node, ast.Assign):
-        for target in node.targets:
-            _collect(target, bound, referenced, ref_lines)
-        _collect(node.value, bound, referenced, ref_lines)
-        return
-    if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-        _collect(node.target, bound, referenced, ref_lines)
-        _collect(node.value, bound, referenced, ref_lines)
-        return
-    if isinstance(node, (ast.For, ast.AsyncFor)):
-        _collect(node.target, bound, referenced, ref_lines)
-        _collect(node.iter, bound, referenced, ref_lines)
-        for child in list(node.body) + list(node.orelse):
-            _collect(child, bound, referenced, ref_lines)
-        return
-    if isinstance(node, (ast.With, ast.AsyncWith)):
-        for item in node.items:
-            _collect(item.context_expr, bound, referenced, ref_lines)
-            _collect(item.optional_vars, bound, referenced, ref_lines)
-        for child in node.body:
-            _collect(child, bound, referenced, ref_lines)
-        return
-    if isinstance(node, ast.Try):
-        for child in list(node.body) + list(node.orelse) + list(node.finalbody):
-            _collect(child, bound, referenced, ref_lines)
-        for handler in node.handlers:
-            _collect(handler.type, bound, referenced, ref_lines)
-            if handler.name:
-                bound.add(handler.name)
-            for child in handler.body:
-                _collect(child, bound, referenced, ref_lines)
-        return
-    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
-        for generator in node.generators:
-            _collect(generator.iter, bound, referenced, ref_lines)
-            _collect(generator.target, bound, referenced, ref_lines)
-            for condition in generator.ifs:
-                _collect(condition, bound, referenced, ref_lines)
-        if isinstance(node, ast.DictComp):
-            _collect(node.key, bound, referenced, ref_lines)
-            _collect(node.value, bound, referenced, ref_lines)
-        else:
-            _collect(node.elt, bound, referenced, ref_lines)
-        return
-    if isinstance(node, ast.NamedExpr):
-        _collect(node.target, bound, referenced, ref_lines)
-        _collect(node.value, bound, referenced, ref_lines)
-        return
-    if isinstance(node, ast.Import):
-        for alias in node.names:
-            bound.add(alias.asname or alias.name.split(".")[0])
-        return
-    if isinstance(node, ast.ImportFrom):
-        for alias in node.names:
-            if alias.name != "*":
-                bound.add(alias.asname or alias.name)
-        return
-    for child in ast.iter_child_nodes(node):
-        _collect(child, bound, referenced, ref_lines)
-
-
 def _has_star_import(tree: ast.Module) -> bool:
     for node in tree.body:
         if isinstance(node, ast.ImportFrom):
@@ -343,9 +259,14 @@ def _has_star_import(tree: ast.Module) -> bool:
 
 
 def _is_dynamic_scope(node: ast.AST) -> bool:
+    """Return True when *node*'s name bindings cannot be resolved statically.
+
+    ``globals``/``locals``/``eval``/``exec`` invent bindings the symtable cannot
+    see, so any scope that calls one is skipped. Match statements, class
+    bodies, comprehensions and lambdas are all modelled by ``symtable`` and are
+    therefore analysed normally.
+    """
     for child in ast.walk(node):
-        if isinstance(child, ast.Match):
-            return True
         if (
             isinstance(child, ast.Call)
             and isinstance(child.func, ast.Name)
@@ -355,50 +276,150 @@ def _is_dynamic_scope(node: ast.AST) -> bool:
     return False
 
 
-def undefined_name_violations(source: str) -> List[dict]:
+def _qualify(prefix: str, name: str) -> str:
+    return f"{prefix}.{name}" if prefix else name
+
+
+def _index_scope_nodes(
+    node: ast.AST,
+    prefix: str,
+    index: Dict[Tuple[str, int, str], Tuple[ast.AST, str]],
+) -> None:
+    """Index defining AST nodes by the key ``symtable`` uses to describe them."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        qualified = _qualify(prefix, node.name)
+        index[("def", node.lineno, node.name)] = (node, qualified)
+        for stmt in node.body:
+            _index_scope_nodes(stmt, qualified, index)
+        return
+    if isinstance(node, ast.ClassDef):
+        qualified = _qualify(prefix, node.name)
+        for stmt in node.body:
+            _index_scope_nodes(stmt, qualified, index)
+        return
+    if isinstance(node, ast.Lambda):
+        qualified = _qualify(prefix, "<lambda>")
+        index[("lambda", node.lineno, "lambda")] = (node, qualified)
+        for child in ast.iter_child_nodes(node.body):
+            _index_scope_nodes(child, qualified, index)
+        return
+    for child in ast.iter_child_nodes(node):
+        _index_scope_nodes(child, prefix, index)
+
+
+def _walk_local(node: ast.AST):
+    """Yield descendants of *node* without entering nested scopes."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, _FUNCTION_NODES):
+            continue
+        yield child
+        yield from _walk_local(child)
+
+
+def _first_load_line(node: ast.AST, name: str) -> Optional[int]:
+    """Return the first line inside *node* that loads *name*, if any."""
+    lines = [
+        child.lineno
+        for child in _walk_local(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load) and child.id == name
+    ]
+    return min(lines) if lines else None
+
+
+def _module_scope_names(table: symtable.SymbolTable) -> Set[str]:
+    """Return names the module itself binds (assigned, imported or parameter)."""
+    return {
+        symbol.get_name()
+        for symbol in table.get_symbols()
+        if symbol.is_assigned() or symbol.is_imported() or symbol.is_parameter()
+    }
+
+
+def undefined_name_violations(
+    source: str, allowed_extra: Set[str] | None = None
+) -> List[dict]:
     """Return names loaded inside a function but never bound in any scope.
 
     Each violation is ``{"function", "line", "name"}``.
+
+    Scope resolution comes from :mod:`symtable`, so comprehension, lambda,
+    generator-expression and class-body bindings are modelled exactly as the
+    compiler models them. A name is reported when the compiler marks it as a
+    global reference inside a function/lambda scope and nothing defines it at
+    module scope or in builtins. Class bodies themselves are never reported
+    (they execute in module scope) but their methods are.
+
+    Two modes:
+
+    * ``allowed_extra is None`` — a file-level star import disables the check
+      entirely (``[]``), because the star module may bind any name and callers
+      without the original source cannot tell.
+    * ``allowed_extra`` is a set of names — the check still runs on a
+      star-importing file and those names are unioned into the allowlist. A
+      star import may legitimately supply module-level names, so the only
+      sound signal without resolving the star module is "a NEW identifier
+      that nothing defines and that the caller's reference set never
+      mentions".
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return []
-    if _has_star_import(tree):
+    if allowed_extra is None and _has_star_import(tree):
         return []
-    module_bound: Set[str] = set()
-    for node in tree.body:
-        module_bound |= _bound_names(node)
-    allowed = module_bound | set(dir(builtins)) | _ALLOWED_DUNDERS
+    try:
+        top = symtable.symtable(source, "<verify>", "exec")
+    except SyntaxError:  # pragma: no cover - ast.parse already succeeded
+        return []
+    allowed = _module_scope_names(top) | set(dir(builtins)) | _ALLOWED_DUNDERS
+    if allowed_extra:
+        allowed |= allowed_extra
+    index: Dict[Tuple[str, int, str], Tuple[ast.AST, str]] = {}
+    _index_scope_nodes(tree, "", index)
     violations: List[dict] = []
-    seen = set()
-    for name, node in _iter_functions(tree):
-        if _is_dynamic_scope(node):
-            continue
-        bound: Set[str] = set()
-        referenced: Set[str] = set()
-        ref_lines: Dict[str, int] = {}
-        args = node.args
-        for arg in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
-            bound.add(arg.arg)
-        if args.vararg:
-            bound.add(args.vararg.arg)
-        if args.kwarg:
-            bound.add(args.kwarg.arg)
-        for stmt in node.body:
-            _collect(stmt, bound, referenced, ref_lines)
-        for undefined in sorted(referenced - bound - allowed):
-            key = (name, undefined)
+    seen: Set[Tuple[str, str]] = set()
+
+    def record(scope: symtable.SymbolTable, node: Optional[ast.AST], qualified: str) -> None:
+        for symbol in scope.get_symbols():
+            name = symbol.get_name()
+            if not (symbol.is_referenced() and symbol.is_global()):
+                continue
+            if name in allowed:
+                continue
+            key = (qualified, name)
             if key in seen:
                 continue
             seen.add(key)
+            line = _first_load_line(node, name) if node is not None else None
             violations.append(
                 {
-                    "function": name,
-                    "line": ref_lines.get(undefined),
-                    "name": undefined,
+                    "function": qualified,
+                    "line": line if line is not None else scope.get_lineno(),
+                    "name": name,
                 }
             )
+
+    def visit(table: symtable.SymbolTable) -> None:
+        for child in table.get_children():
+            scope_type = child.get_type()
+            if scope_type == "class":
+                # Class bodies run in module scope: never report from them, but
+                # their methods are ordinary function scopes.
+                visit(child)
+                continue
+            if scope_type != "function":
+                visit(child)
+                continue
+            entry = index.get(("lambda" if child.get_name() == "lambda" else "def",
+                                child.get_lineno(), child.get_name()))
+            node = entry[0] if entry is not None else None
+            if node is not None and _is_dynamic_scope(node):
+                continue
+            record(child, node, entry[1] if entry is not None else child.get_name())
+            visit(child)
+
+    visit(top)
+    violations.sort(key=lambda violation: (violation["function"], violation["name"]))
     return violations
 
 

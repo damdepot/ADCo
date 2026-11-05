@@ -321,6 +321,11 @@ class _FunctionAnalyzer:
         self.module_dicts = module_dicts
         self.local_vars: Dict[str, Any] = {}
         self.exact_vars: Dict[str, bool] = {}
+        # AST provenance for plain ``x = <string-building expr>`` assignments so
+        # placeholder arithmetic can follow names back to their expressions.
+        self.sql_ast_vars: Dict[str, ast.AST] = {}
+        self.sql_ast_ambiguous: set = set()
+        self.function_node: Optional[ast.AST] = None
         self.last_sql: Optional[str] = None
         self.row_bindings: Dict[str, str] = {}
         self.row_reads: Dict[str, List[tuple]] = {}
@@ -372,6 +377,7 @@ class _FunctionAnalyzer:
                         self.local_vars[stmt.target.id] = resolved
                         if isinstance(resolved, str):
                             self.exact_vars[stmt.target.id] = self.is_exact(stmt.value)
+                        self._record_sql_ast(stmt.target.id, stmt.value)
                 self.collect_row_reads(stmt.value)
         elif isinstance(stmt, ast.AugAssign):
             self.collect_row_reads(stmt.value)
@@ -435,8 +441,21 @@ class _FunctionAnalyzer:
                 self.local_vars[target.id] = self.last_sql if is_fetch else resolved
                 if isinstance(resolved, str) and not is_fetch:
                     self.exact_vars[target.id] = self.is_exact(value)
+                if not is_fetch:
+                    self._record_sql_ast(target.id, value)
         self.collect_row_reads(value)
         self._process_row_unpack(stmt)
+
+    def _record_sql_ast(self, name: str, value: ast.AST) -> None:
+        """Track the expression bound to *name*; drop it if rebound."""
+        if name in self.sql_ast_ambiguous:
+            return
+        if name in self.sql_ast_vars:
+            # Rebinding makes the value at execute() time ambiguous.
+            self.sql_ast_ambiguous.add(name)
+            self.sql_ast_vars.pop(name, None)
+            return
+        self.sql_ast_vars[name] = value
 
     def _process_for(self, stmt: ast.AST) -> None:
         sql = self._iter_sql(stmt.iter)
@@ -564,6 +583,7 @@ def _iter_analyzed(source: str, analyzer_cls: type = _FunctionAnalyzer):
     module_dicts = collect_module_dicts(tree)
     for name, node in _iter_functions(tree):
         analyzer = analyzer_cls(name, module_dicts)
+        analyzer.function_node = node
         analyzer.analyze(node.body)
         yield name, analyzer
 
@@ -764,6 +784,330 @@ def placeholder_param_mismatch_sql(source: str) -> List[dict]:
                     "line": line,
                     "placeholders": expected,
                     "params": actual,
+                }
+            )
+    return violations
+
+
+class _Affine:
+    """Affine count ``const + Σ coeff*len(symbol)`` of placeholders/params.
+
+    Symbol keys are ``frozenset`` sets of candidate iterable names: a plain
+    iterable yields one candidate, ``zip(A, B)`` yields both and is resolved
+    later against the SQL side's symbols.
+    """
+
+    __slots__ = ("const", "syms")
+
+    def __init__(self, const: int = 0, syms: Optional[Dict[frozenset, int]] = None) -> None:
+        self.const = const
+        self.syms = dict(syms or {})
+
+
+def _affine_add(left: _Affine, right: _Affine) -> _Affine:
+    out = _Affine(left.const + right.const, left.syms)
+    for key, coeff in right.syms.items():
+        out.syms[key] = out.syms.get(key, 0) + coeff
+    return out
+
+
+# Builtins that only wrap an iterable without changing its length/identity.
+_ITER_WRAPPERS = {"range", "len", "list", "tuple", "set", "sorted", "reversed", "iter"}
+_LIST_MUTATIONS = {"append", "extend", "insert", "pop", "remove", "clear", "sort", "reverse"}
+
+
+def _iter_symbols(node: Optional[ast.AST]) -> Optional[frozenset]:
+    """Normalised identity of the iterable an expression iterates over.
+
+    ``len(X)`` / ``range(len(X))`` / ``sorted(X)`` all normalise to ``X``;
+    ``zip(A, B)`` yields both candidates so the caller can pick the one that
+    also appears on the SQL side.
+    """
+    if isinstance(node, ast.Name):
+        return frozenset({node.id})
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        if node.func.id in _ITER_WRAPPERS and len(node.args) == 1:
+            return _iter_symbols(node.args[0])
+        if node.func.id == "zip":
+            symbols: set = set()
+            for arg in node.args:
+                sub = _iter_symbols(arg)
+                if sub is None:
+                    return None
+                symbols |= sub
+            return frozenset(symbols) if symbols else None
+    return None
+
+
+def _is_len_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "len"
+        and len(node.args) == 1
+    )
+
+
+def _join_pattern(node: ast.AST) -> Optional[str]:
+    if isinstance(node, (ast.List, ast.Tuple)) and len(node.elts) == 1:
+        node = node.elts[0]
+    return _const_str(node)
+
+
+def _join_affine(seq: ast.AST) -> Optional[_Affine]:
+    """Placeholder count of a ``join([pattern] * len(X))``-style fragment."""
+    pattern: Optional[str] = None
+    iterable: Optional[ast.AST] = None
+    if isinstance(seq, ast.BinOp) and isinstance(seq.op, ast.Mult):
+        if _is_len_call(seq.right):
+            pattern, iterable = _join_pattern(seq.left), seq.right.args[0]
+        elif _is_len_call(seq.left):
+            pattern, iterable = _join_pattern(seq.right), seq.left.args[0]
+    elif isinstance(seq, ast.ListComp) and len(seq.generators) == 1:
+        generator = seq.generators[0]
+        if not generator.ifs:
+            pattern, iterable = _const_str(seq.elt), generator.iter
+    if pattern is None or iterable is None:
+        return None
+    symbols = _iter_symbols(iterable)
+    if not symbols:
+        return None
+    return _Affine(0, {symbols: _placeholder_count(pattern)[0]})
+
+
+def _sql_affine(
+    node: Optional[ast.AST], sql_vars: Dict[str, ast.AST], depth: int = 0
+) -> Optional[_Affine]:
+    """Symbolic placeholder count of the SQL expression passed to execute()."""
+    if node is None or depth > 8:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return _Affine(_placeholder_count(node.value)[0])
+    if isinstance(node, ast.JoinedStr):
+        total = _Affine()
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                total.const += _placeholder_count(part.value)[0]
+            elif isinstance(part, ast.FormattedValue):
+                fragment = _sql_affine(part.value, sql_vars, depth + 1)
+                if fragment is None:
+                    return None
+                total = _affine_add(total, fragment)
+            else:
+                return None
+        return total
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _sql_affine(node.left, sql_vars, depth + 1)
+        right = _sql_affine(node.right, sql_vars, depth + 1)
+        if left is None or right is None:
+            return None
+        return _affine_add(left, right)
+    if isinstance(node, ast.Call) and len(node.args) == 1:
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "join":
+            return _join_affine(node.args[0])
+    if isinstance(node, ast.Name):
+        stored = sql_vars.get(node.id)
+        if stored is None:
+            return None
+        return _sql_affine(stored, sql_vars, depth + 1)
+    return None
+
+
+def _literal_arity(node: ast.AST) -> Optional[int]:
+    if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return None
+    if any(isinstance(elt, ast.Starred) for elt in node.elts):
+        return None
+    return len(node.elts)
+
+
+def _assigned_list_affine(value: ast.AST) -> Optional[_Affine]:
+    """Symbolic length of a list bound by a plain assignment."""
+    arity = _literal_arity(value)
+    if arity is not None:
+        return _Affine(arity)
+    if isinstance(value, ast.ListComp) and len(value.generators) == 1:
+        generator = value.generators[0]
+        if generator.ifs:
+            return None
+        arity = _literal_arity(value.elt)
+        symbols = _iter_symbols(generator.iter)
+        if arity is None or not symbols:
+            return None
+        return _Affine(0, {symbols: arity})
+    return None
+
+
+def _param_list_affines(function: Optional[ast.AST]) -> Dict[str, Optional[_Affine]]:
+    """Symbolic lengths of the parameter lists built inside *function*.
+
+    A name maps to ``None`` as soon as its construction is not fully
+    understood (mutated conditionally, inside nested loops, reassigned, or by
+    an unrecognised method), so callers bail instead of guessing.
+    """
+    counts: Dict[str, Optional[_Affine]] = {}
+    if function is None:
+        return counts
+
+    def record(name: str, value: Optional[_Affine]) -> None:
+        counts[name] = None if name in counts else value
+
+    def mutate(call: ast.Call, loops: tuple, conditional: bool) -> None:
+        func = call.func
+        if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
+            return
+        name = func.value.id
+        if name not in counts or func.attr not in _LIST_MUTATIONS:
+            return
+        if func.attr not in {"append", "extend"} or conditional or len(loops) > 1:
+            counts[name] = None
+            return
+        if len(call.args) != 1:
+            counts[name] = None
+            return
+        arity = _literal_arity(call.args[0])
+        current = counts[name]
+        if arity is None or current is None:
+            counts[name] = None
+            return
+        if loops:
+            symbols = loops[-1]
+            if not symbols:
+                counts[name] = None
+                return
+            current.syms[symbols] = current.syms.get(symbols, 0) + arity
+        else:
+            current.const += arity
+
+    def scan(body: List[ast.stmt], loops: tuple, conditional: bool) -> None:
+        for stmt in body:
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        record(target.id, _assigned_list_affine(stmt.value))
+            elif isinstance(stmt, ast.AnnAssign):
+                if isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                    record(stmt.target.id, _assigned_list_affine(stmt.value))
+            elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                mutate(stmt.value, loops, conditional)
+            elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                scan(stmt.body, loops + (_iter_symbols(stmt.iter),), conditional)
+                scan(stmt.orelse, loops, conditional)
+            elif isinstance(stmt, ast.While):
+                scan(stmt.body, loops, True)
+                scan(stmt.orelse, loops, True)
+            elif isinstance(stmt, ast.If):
+                scan(stmt.body, loops, True)
+                scan(stmt.orelse, loops, True)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                scan(stmt.body, loops, conditional)
+            elif isinstance(stmt, ast.Try):
+                scan(stmt.body, loops, True)
+                scan(stmt.orelse, loops, True)
+                scan(stmt.finalbody, loops, True)
+                for handler in stmt.handlers:
+                    scan(handler.body, loops, True)
+
+    scan(function.body, (), False)  # type: ignore[attr-defined]
+    return counts
+
+
+def _params_affine(
+    node: Optional[ast.AST], counts: Dict[str, Optional[_Affine]]
+) -> Optional[_Affine]:
+    if node is None:
+        return _Affine(0)
+    if isinstance(node, ast.Constant) and node.value is None:
+        return _Affine(0)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        arity = _literal_arity(node)
+        return None if arity is None else _Affine(arity)
+    if isinstance(node, ast.Name):
+        return counts.get(node.id)
+    return None
+
+
+def _resolve_symbols(affine: _Affine, available: set) -> Optional[Dict[str, int]]:
+    resolved: Dict[str, int] = {}
+    for candidates, coeff in affine.syms.items():
+        matches = candidates & available
+        if len(matches) != 1:
+            return None
+        name = next(iter(matches))
+        resolved[name] = resolved.get(name, 0) + coeff
+    return resolved
+
+
+def _affine_text(const: int, syms: Dict[str, int]) -> str:
+    parts = [str(const)] if const or not syms else []
+    for name in sorted(syms):
+        coeff = syms[name]
+        parts.append(f"len({name})" if coeff == 1 else f"{coeff}*len({name})")
+    return " + ".join(parts)
+
+
+def _single_symbols(affine: _Affine) -> Optional[Dict[str, int]]:
+    syms: Dict[str, int] = {}
+    for candidates, coeff in affine.syms.items():
+        if len(candidates) != 1:
+            return None
+        name = next(iter(candidates))
+        syms[name] = syms.get(name, 0) + coeff
+    return syms
+
+
+def dynamic_placeholder_arity_sql(source: str) -> List[dict]:
+    """execute() calls whose placeholder/param counts only agree at one row.
+
+    Resolves the batched-key pattern symbolically::
+
+        placeholders = ",".join(["(%s, %s, %s)"] * len(keys))   # 3*len(keys)
+        params = []
+        for k in keys:
+            params.extend([a, k, b, c])                          # 4*len(keys)
+
+    Equal only for a single element, so a batch of two or more raises at
+    runtime (psycopg2 applies ``%`` itself). Anything the analyzer cannot
+    resolve exactly — mismatched symbol sets, unknown fragments, conditional
+    mutation — is skipped rather than guessed.
+    """
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        counts = _param_list_affines(analyzer.function_node)
+        for _sql, line, sql_node, params_node, method in analyzer.execute_calls:
+            if method != "execute":
+                continue
+            sql_affine = _sql_affine(sql_node, analyzer.sql_ast_vars)
+            if sql_affine is None or not sql_affine.syms:
+                # Exact/static SQL stays the job of placeholder_param_mismatch_sql.
+                continue
+            sql_syms = _single_symbols(sql_affine)
+            if not sql_syms:
+                continue
+            params_affine = _params_affine(params_node, counts)
+            if params_affine is None:
+                continue
+            params_syms = _resolve_symbols(params_affine, set(sql_syms))
+            if params_syms is None or set(params_syms) != set(sql_syms):
+                continue
+            if sql_affine.const == params_affine.const and sql_syms == params_syms:
+                continue
+            key = (name, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            shape = " ".join(ast.unparse(sql_node).split())
+            if len(shape) > 160:
+                shape = shape[:157] + "..."
+            violations.append(
+                {
+                    "function": name,
+                    "line": line,
+                    "sql_shape": shape,
+                    "placeholders": _affine_text(sql_affine.const, sql_syms),
+                    "params": _affine_text(params_affine.const, params_syms),
                 }
             )
     return violations

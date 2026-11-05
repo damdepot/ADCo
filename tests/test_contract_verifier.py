@@ -581,6 +581,49 @@ def get_stock(self, stock_rows):
     )
 
 
+def test_verify_rejects_undefined_name_with_star_import():
+    """A star import must not hide a new undefined name (tpcc production bug)."""
+    orig = """
+from .abstractdriver import *
+
+
+class PostgresDriver(Driver):
+    def doNewOrder(self, item_rows):
+        item_map = {row[0]: (row[1], row[2], row[3]) for row in item_rows}
+        return item_map
+"""
+    opt = """
+from .abstractdriver import *
+
+
+class PostgresDriver(Driver):
+    def doNewOrder(self, item_rows):
+        item_map = {row[0]: (row[1], row[2], row[3]) for row in item_rows}
+        self.cursor.execute('SELECT 1', item_tuple)
+        return item_map
+"""
+    contract = RewriteContract(
+        rewrite_id="test_star_import",
+        target=RewriteTarget(
+            file="drivers/postgresdriver.py",
+            function="doNewOrder",
+            qualified_function="PostgresDriver.doNewOrder",
+        ),
+        pattern="N_PLUS_ONE_QUERY",
+        strategy="N_PLUS_ONE_QUERY_ELIMINATION",
+        allowed_regions=["PostgresDriver.doNewOrder"],
+    )
+    contract.targets = [contract.target]
+    result = verify_contract(orig, opt, contract)
+    assert result.status == "FAIL"
+    assert any(
+        v.code == "UNDEFINED_NAME"
+        and v.severity == "ERROR"
+        and "item_tuple" in v.message
+        for v in result.violations
+    )
+
+
 def test_verify_rejects_slow_executemany():
     orig = """
 def get_stock(self, rows):
@@ -752,4 +795,134 @@ def get_stock(self, item_ids):
 """
     result = verify_contract(orig, opt, _static_check_contract())
     assert not any(v.code == "LOOKUP_KEY_NOT_SELECTED" for v in result.violations)
+
+
+BATCHED_DELIVERY_BROKEN = """
+TXN_QUERIES = {
+    "DELIVERY": {
+        "updateOrders": "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+        "updateOrderLine": "UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE OL_O_ID = %s AND OL_D_ID = %s AND OL_W_ID = %s",
+    }
+}
+
+
+class Delivery:
+    def doDelivery(self, params):
+        active_d_ids = params["d_ids"]
+        no_o_ids = params["no_o_ids"]
+        w_id = params["w_id"]
+        o_carrier_id = params["o_carrier_id"]
+        ol_delivery_d = params["ol_delivery_d"]
+
+        placeholders = ",".join(["(%s, %s, %s)"] * len(active_d_ids))
+
+        update_orders_params = []
+        for no_o_id, d_id in zip(no_o_ids, active_d_ids):
+            update_orders_params.extend([o_carrier_id, no_o_id, d_id, w_id])
+        self.cursor.execute(
+            f"UPDATE ORDERS SET O_CARRIER_ID = %s WHERE (O_ID, O_D_ID, O_W_ID) IN ({placeholders})",
+            update_orders_params,
+        )
+
+        update_ol_params = []
+        for no_o_id, d_id in zip(no_o_ids, active_d_ids):
+            update_ol_params.extend([ol_delivery_d, no_o_id, d_id, w_id])
+        self.cursor.execute(
+            f"UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE (OL_O_ID, OL_D_ID, OL_W_ID) IN ({placeholders})",
+            update_ol_params,
+        )
+        return []
+"""
+
+BATCHED_DELIVERY_CORRECT = """
+TXN_QUERIES = {
+    "DELIVERY": {
+        "updateOrders": "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+        "updateOrderLine": "UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE OL_O_ID = %s AND OL_D_ID = %s AND OL_W_ID = %s",
+    }
+}
+
+
+class Delivery:
+    def doDelivery(self, params):
+        active_d_ids = params["d_ids"]
+        no_o_ids = params["no_o_ids"]
+        w_id = params["w_id"]
+        o_carrier_id = params["o_carrier_id"]
+        ol_delivery_d = params["ol_delivery_d"]
+
+        placeholders = ",".join(["(%s, %s, %s)"] * len(active_d_ids))
+
+        update_orders_params = [o_carrier_id]
+        for no_o_id, d_id in zip(no_o_ids, active_d_ids):
+            update_orders_params.extend([no_o_id, d_id, w_id])
+        self.cursor.execute(
+            f"UPDATE ORDERS SET O_CARRIER_ID = %s WHERE (O_ID, O_D_ID, O_W_ID) IN ({placeholders})",
+            update_orders_params,
+        )
+
+        update_ol_params = [ol_delivery_d]
+        for no_o_id, d_id in zip(no_o_ids, active_d_ids):
+            update_ol_params.extend([no_o_id, d_id, w_id])
+        self.cursor.execute(
+            f"UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE (OL_O_ID, OL_D_ID, OL_W_ID) IN ({placeholders})",
+            update_ol_params,
+        )
+        return []
+"""
+
+UNBATCHED_DELIVERY = """
+TXN_QUERIES = {
+    "DELIVERY": {
+        "updateOrders": "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+        "updateOrderLine": "UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE OL_O_ID = %s AND OL_D_ID = %s AND OL_W_ID = %s",
+    }
+}
+
+
+class Delivery:
+    def doDelivery(self, params):
+        active_d_ids = params["d_ids"]
+        no_o_ids = params["no_o_ids"]
+        w_id = params["w_id"]
+        o_carrier_id = params["o_carrier_id"]
+        ol_delivery_d = params["ol_delivery_d"]
+        for no_o_id, d_id in zip(no_o_ids, active_d_ids):
+            self.cursor.execute(
+                "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+                [o_carrier_id, no_o_id, d_id, w_id],
+            )
+            self.cursor.execute(
+                "UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE OL_O_ID = %s AND OL_D_ID = %s AND OL_W_ID = %s",
+                [ol_delivery_d, no_o_id, d_id, w_id],
+            )
+        return []
+"""
+
+
+def test_verify_reports_dynamic_placeholder_arity():
+    result = verify_contract(
+        UNBATCHED_DELIVERY, BATCHED_DELIVERY_BROKEN, _static_check_contract("doDelivery")
+    )
+    assert result.status == "FAIL"
+    arity = [v for v in result.violations if v.code == "DYNAMIC_PLACEHOLDER_ARITY"]
+    assert len(arity) == 2
+    assert all(v.severity == "ERROR" for v in arity)
+    assert all("1 + 3*len(active_d_ids)" in v.message for v in arity)
+    assert all("4*len(active_d_ids)" in v.message for v in arity)
+
+
+def test_verify_accepts_correct_dynamic_placeholder_arity():
+    result = verify_contract(
+        UNBATCHED_DELIVERY, BATCHED_DELIVERY_CORRECT, _static_check_contract("doDelivery")
+    )
+    assert not any(v.code == "DYNAMIC_PLACEHOLDER_ARITY" for v in result.violations)
+
+
+def test_verify_dedupes_preexisting_dynamic_placeholder_arity():
+    result = verify_contract(
+        BATCHED_DELIVERY_BROKEN, BATCHED_DELIVERY_BROKEN, _static_check_contract("doDelivery")
+    )
+    assert not any(v.code == "DYNAMIC_PLACEHOLDER_ARITY" for v in result.violations)
+
 

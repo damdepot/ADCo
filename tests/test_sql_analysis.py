@@ -1,7 +1,12 @@
+from pathlib import Path
+
+import pytest
+
 from src.code_rewriter.tools.sql_analysis import (
     composite_any_array_sql,
     duplicate_column_predicate_sql,
     duplicate_where_sql,
+    dynamic_placeholder_arity_sql,
     find_select_column_count,
     find_select_columns,
     fragile_composite_agg_sql,
@@ -440,4 +445,194 @@ def doNewOrder(self, i_ids):
     return item_map
 '''
     assert lookup_key_not_selected_sql(source) == []
+
+
+# The shipped doDelivery defect: 1 + 3N placeholders vs 4N parameters.
+DELIVERY_REPRO = '''
+TXN_QUERIES = {
+    "DELIVERY": {
+        "updateOrders": "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+        "updateOrderLine": "UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE OL_O_ID = %s AND OL_D_ID = %s AND OL_W_ID = %s",
+    }
+}
+
+
+class Reproduced:
+    def doDelivery(self, params):
+        active_d_ids = params["d_ids"]
+        no_o_ids = params["no_o_ids"]
+        w_id = params["w_id"]
+        o_carrier_id = params["o_carrier_id"]
+        ol_delivery_d = params["ol_delivery_d"]
+
+        placeholders_orders = ",".join(["(%s, %s, %s)"] * len(active_d_ids))
+
+        update_orders_params = []
+        for no_o_id, d_id in zip(no_o_ids, active_d_ids):
+            update_orders_params.extend([o_carrier_id, no_o_id, d_id, w_id])
+        self.cursor.execute(
+            f"UPDATE ORDERS SET O_CARRIER_ID = %s WHERE (O_ID, O_D_ID, O_W_ID) IN ({placeholders_orders})",
+            update_orders_params,
+        )
+
+        update_ol_params = []
+        for no_o_id, d_id in zip(no_o_ids, active_d_ids):
+            update_ol_params.extend([ol_delivery_d, no_o_id, d_id, w_id])
+        self.cursor.execute(
+            f"UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE (OL_O_ID, OL_D_ID, OL_W_ID) IN ({placeholders_orders})",
+            update_ol_params,
+        )
+        return []
+'''
+
+
+def test_dynamic_placeholder_arity_flags_shipped_delivery_defect():
+    violations = dynamic_placeholder_arity_sql(DELIVERY_REPRO)
+    assert len(violations) == 2
+    assert violations[0]["function"] == "Reproduced.doDelivery"
+    assert "UPDATE ORDERS" in violations[0]["sql_shape"]
+    assert "UPDATE ORDER_LINE" in violations[1]["sql_shape"]
+    assert violations[0]["placeholders"] == "1 + 3*len(active_d_ids)"
+    assert violations[0]["params"] == "4*len(active_d_ids)"
+
+
+def test_dynamic_placeholder_arity_missed_by_static_checks():
+    # The two pre-existing gates cannot see the defect at all.
+    assert placeholder_param_mismatch_sql(DELIVERY_REPRO) == []
+    assert dynamic_placeholder_arity_sql(DELIVERY_REPRO) != []
+
+
+def test_dynamic_placeholder_arity_hoisted_scalar_not_flagged():
+    # Correct form: the scalar is passed once, the per-row list is 3 wide.
+    source = '''
+def doDelivery(self, params):
+    d_ids = params["d_ids"]
+    no_o_ids = params["no_o_ids"]
+    w_id = params["w_id"]
+    o_carrier_id = params["o_carrier_id"]
+    placeholders = ",".join(["(%s, %s, %s)"] * len(d_ids))
+    update_orders_params = [o_carrier_id]
+    for no_o_id, d_id in zip(no_o_ids, d_ids):
+        update_orders_params.extend([no_o_id, d_id, w_id])
+    self.cursor.execute(
+        f"UPDATE ORDERS SET O_CARRIER_ID = %s WHERE (O_ID, O_D_ID, O_W_ID) IN ({placeholders})",
+        update_orders_params,
+    )
+'''
+    assert dynamic_placeholder_arity_sql(source) == []
+
+
+def test_dynamic_placeholder_arity_single_element_not_flagged():
+    # n=1 hides the bug, so the unbatched per-district version must stay clean.
+    source = '''
+def doDelivery(self, params):
+    for no_o_id, d_id in zip(params["no_o_ids"], params["d_ids"]):
+        self.cursor.execute(
+            "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+            [params["o_carrier_id"], no_o_id, d_id, params["w_id"]],
+        )
+'''
+    assert dynamic_placeholder_arity_sql(source) == []
+
+
+def test_dynamic_placeholder_arity_correct_insert_values_not_flagged():
+    source = '''
+def insert_rows(self, keys):
+    groups = ",".join(["(%s, %s)"] * len(keys))
+    params = []
+    for key in keys:
+        params.extend([key[0], key[1]])
+    self.cursor.execute(f"INSERT INTO t (a, b) VALUES {groups}", params)
+'''
+    assert dynamic_placeholder_arity_sql(source) == []
+
+
+def test_dynamic_placeholder_arity_execute_batch_not_flagged():
+    source = '''
+from psycopg2.extras import execute_batch
+
+
+def update_rows(self, keys, carrier_id):
+    groups = ",".join(["(%s, %s, %s)"] * len(keys))
+    params = []
+    for key in keys:
+        params.extend([carrier_id, key[0], key[1], key[2]])
+    execute_batch(self.cursor, f"UPDATE ORDERS SET O_CARRIER_ID = %s WHERE (A, B, C) IN ({groups})", params)
+    self.cursor.executemany(f"UPDATE ORDERS SET O_CARRIER_ID = %s WHERE (A, B, C) IN ({groups})", params)
+'''
+    assert dynamic_placeholder_arity_sql(source) == []
+
+
+def test_dynamic_placeholder_arity_comprehension_ok_not_flagged():
+    source = '''
+def insert_rows(self, keys):
+    groups = ",".join(["(%s, %s)"] * len(keys))
+    params = [(a, b) for a, b in keys]
+    self.cursor.execute(f"INSERT INTO t (a, b) VALUES {groups}", params)
+'''
+    assert dynamic_placeholder_arity_sql(source) == []
+
+
+def test_dynamic_placeholder_arity_comprehension_broken_flagged():
+    source = '''
+def insert_rows(self, keys):
+    groups = ",".join(["(%s, %s)"] * len(keys))
+    params = [(a, b, c) for a, b, c in keys]
+    self.cursor.execute(f"INSERT INTO t (a, b) VALUES {groups}", params)
+'''
+    violations = dynamic_placeholder_arity_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["placeholders"] == "2*len(keys)"
+    assert violations[0]["params"] == "3*len(keys)"
+
+
+def test_dynamic_placeholder_arity_unresolvable_not_flagged():
+    source = '''
+def update_rows(self, rows):
+    groups = ",".join(["(%s, %s)"] * len(rows))
+    self.cursor.execute(f"UPDATE ORDERS SET A = %s WHERE (B, C) IN ({groups})", build_params(rows))
+    self.cursor.execute(f"UPDATE ORDERS SET A = %s WHERE (B, C) IN ({make_groups(rows)})", rows)
+    self.cursor.execute(f"UPDATE ORDERS SET A = %s WHERE (B, C) IN ({groups})", [*rows])
+'''
+    assert dynamic_placeholder_arity_sql(source) == []
+
+
+def test_dynamic_placeholder_arity_mismatched_symbols_skipped():
+    source = '''
+def update_rows(self, keys, other_keys):
+    groups = ",".join(["(%s, %s)"] * len(keys))
+    params = []
+    for key in other_keys:
+        params.extend([key[0], key[1]])
+    self.cursor.execute(f"INSERT INTO t (a, b) VALUES {groups}", params)
+'''
+    assert dynamic_placeholder_arity_sql(source) == []
+
+
+def test_dynamic_placeholder_arity_conditional_mutation_skipped():
+    source = '''
+def update_rows(self, keys, flag):
+    groups = ",".join(["(%s, %s)"] * len(keys))
+    params = []
+    for key in keys:
+        if flag:
+            params.extend([key[0], key[1]])
+    self.cursor.execute(f"INSERT INTO t (a, b) VALUES {groups}", params)
+'''
+    assert dynamic_placeholder_arity_sql(source) == []
+
+
+def test_dynamic_placeholder_arity_syntax_error():
+    assert dynamic_placeholder_arity_sql("def f(:") == []
+
+
+# ponytail: artifact smoke test only; skipped when out/ is absent (e.g. CI).
+@pytest.mark.parametrize(
+    "name", ["tpcc_run1", "tpcc_run2", "tpcc_run3", "tpcc_rv", "tpcc_rv2", "tpcc_p1"]
+)
+def test_dynamic_placeholder_arity_real_artifacts_clean(name):
+    path = Path(__file__).resolve().parents[1] / "out" / name / "drivers" / "postgresdriver.py"
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    assert dynamic_placeholder_arity_sql(path.read_text()) == []
 

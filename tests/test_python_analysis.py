@@ -138,7 +138,174 @@ from os import *
 def build():
     return path
 '''
+    # Mode 1: no original source available -> lenient skip.
     assert undefined_name_violations(source) == []
+
+
+def test_undefined_name_star_import_reported_with_allowlist():
+    """Mode 2: with an original-file allowlist, star-import files are checked."""
+    source = '''
+from os import *
+
+def build():
+    return path, item_tuple
+'''
+    violations = undefined_name_violations(source, allowed_extra={"path"})
+    assert [v["name"] for v in violations] == ["item_tuple"]
+
+
+def test_undefined_name_star_import_allowlist_no_false_positive():
+    """Star-provided names present in the original file stay allowed."""
+    source = '''
+from .abstractdriver import *
+
+class MyDriver(Driver):
+    def run(self, txn):
+        return Driver, Transaction, txn
+'''
+    assert undefined_name_violations(
+        source, allowed_extra={"Driver", "Transaction"}
+    ) == []
+
+
+def test_undefined_name_comprehension_target_leaks():
+    source = '''
+def build(rows):
+    m = {k: v for k, v in rows}
+    return k
+'''
+    violations = undefined_name_violations(source)
+    assert [(v["function"], v["name"]) for v in violations] == [("build", "k")]
+    assert violations[0]["line"] is not None
+
+
+def test_undefined_name_lambda_parameter_leaks():
+    source = '''
+def build(rows):
+    g = lambda item: item
+    return item
+'''
+    violations = undefined_name_violations(source)
+    assert [v["name"] for v in violations] == ["item"]
+
+
+def test_undefined_name_generator_target_leaks():
+    source = '''
+def build(rows):
+    g = (x for x in rows)
+    return x
+'''
+    assert [v["name"] for v in undefined_name_violations(source)] == ["x"]
+
+
+def test_undefined_name_class_constant_bare_in_method_flagged():
+    source = '''
+class Driver:
+    QUERY_1 = "SELECT 1"
+
+    def run(self):
+        self.cursor.execute(QUERY_1)
+'''
+    violations = undefined_name_violations(source)
+    assert [(v["function"], v["name"]) for v in violations] == [("Driver.run", "QUERY_1")]
+
+
+def test_undefined_name_class_constant_via_self_not_flagged():
+    source = '''
+class Driver:
+    QUERY_1 = "SELECT 1"
+
+    def run(self):
+        self.cursor.execute(self.QUERY_1)
+'''
+    assert undefined_name_violations(source) == []
+
+
+def test_undefined_name_match_body_bound_but_missing_global_flagged():
+    source = '''
+def pick(p):
+    match p:
+        case 1:
+            v = 1
+    return v, missing_name
+'''
+    violations = undefined_name_violations(source)
+    assert [v["name"] for v in violations] == ["missing_name"]
+    assert violations[0]["function"] == "pick"
+
+
+def test_undefined_name_module_global_in_method_not_flagged():
+    source = '''
+STOCK_ROWS = []
+
+class Driver:
+    def run(self):
+        return STOCK_ROWS
+'''
+    assert undefined_name_violations(source) == []
+
+
+def test_undefined_name_global_declaration_not_flagged():
+    source = '''
+counter = 0
+
+def bump():
+    global counter
+    counter += 1
+    return counter
+'''
+    assert undefined_name_violations(source) == []
+
+
+def test_undefined_name_decorator_and_default_not_flagged():
+    source = '''
+LIMIT = 10
+
+def decorate(fn):
+    return fn
+
+@decorate
+def build(rows, limit=LIMIT):
+    return rows[:limit]
+'''
+    assert undefined_name_violations(source) == []
+
+
+def test_undefined_name_closure_and_module_helper_not_flagged():
+    source = '''
+def helper(value):
+    return value
+
+def build(rows):
+    base = 1
+    def inner():
+        return helper(base)
+    return inner
+'''
+    assert undefined_name_violations(source) == []
+
+
+def test_undefined_name_class_body_references_module_global():
+    source = '''
+DEFAULT = "SELECT 1"
+
+class Driver:
+    QUERY = DEFAULT
+'''
+    assert undefined_name_violations(source) == []
+
+
+def test_undefined_name_nested_scope_reported_with_qualified_name():
+    source = '''
+def outer():
+    def inner():
+        return missing_name
+    return inner
+'''
+    violations = undefined_name_violations(source)
+    assert [(v["function"], v["name"]) for v in violations] == [
+        ("outer.inner", "missing_name")
+    ]
 
 
 def test_undefined_name_dynamic_scope_skipped():
