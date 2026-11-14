@@ -1293,3 +1293,79 @@ def test_verify_accepts_all_paths_bound():
         _static_check_contract("doPayment"),
     )
     assert not any(v.code == "POSSIBLY_UNBOUND_LOCAL" for v in result.violations)
+
+
+DELIVERY_MOGRIFY_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "DELETE FROM NEW_ORDER WHERE NO_D_ID = %s AND NO_W_ID = %s AND NO_O_ID = %s",
+            [params["d_id"], params["w_id"], params["no_o_id"]],
+        )
+        return []
+"""
+
+DELIVERY_MOGRIFY_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        delete_params = params["deletes"]
+        args_str_del = ",".join(
+            self.cursor.mogrify("(%s, %s, %s)", p).decode("utf-8")
+            for p in delete_params
+        )
+        flat_del_params = [val for p in delete_params for val in p]
+        self.cursor.execute(
+            f"DELETE FROM NEW_ORDER WHERE (NO_D_ID, NO_W_ID, NO_O_ID) IN ({args_str_del})",
+            flat_del_params,
+        )
+        return []
+"""
+
+
+def test_verify_reports_mogrify_with_params():
+    result = verify_contract(
+        DELIVERY_MOGRIFY_ORIGINAL,
+        DELIVERY_MOGRIFY_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    mogrify = [v for v in result.violations if v.code == "MOGRIFY_WITH_PARAMS"]
+    assert len(mogrify) == 1
+    assert mogrify[0].severity == "ERROR"
+    assert "not all arguments converted" in mogrify[0].message
+
+
+DELIVERY_EMPTY_PARAMS_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+            [params["carrier"], params["no_o_id"], params["d_id"], params["w_id"]],
+        )
+        return []
+"""
+
+DELIVERY_EMPTY_PARAMS_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        order_tuples = params["orders"]
+        placeholders = ",".join(["(%s, %s, %s)"] * len(order_tuples))
+        self.cursor.execute(
+            f"UPDATE ORDERS SET O_CARRIER_ID = %s WHERE (O_ID, O_D_ID, O_W_ID) IN ({placeholders})",
+            [params["carrier"]] * len(order_tuples) if False else [],
+        )
+        return []
+"""
+
+
+def test_verify_reports_empty_params_with_placeholders():
+    result = verify_contract(
+        DELIVERY_EMPTY_PARAMS_ORIGINAL,
+        DELIVERY_EMPTY_PARAMS_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    empty = [v for v in result.violations if v.code == "EMPTY_PARAMS_WITH_PLACEHOLDERS"]
+    assert len(empty) == 1
+    assert empty[0].severity == "ERROR"
+    assert "list index out of range" in empty[0].message

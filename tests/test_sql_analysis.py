@@ -6,6 +6,8 @@ from src.code_rewriter.tools.sql_analysis import (
     composite_any_array_sql,
     ambiguous_values_alias_sql,
     composite_tuple_order_sql,
+    empty_params_with_placeholders_sql,
+    mogrify_with_params_sql,
     returned_row_widths_sql,
     statement_placeholder_sql,
     table_column_prefix_mismatch_sql,
@@ -970,3 +972,88 @@ def doPayment(self, params):
     )
 '''
     assert statement_placeholder_sql(source) == []
+
+
+def test_mogrify_with_params_flags_duplicate_values():
+    source = '''
+def doDelivery(self, params):
+    delete_params = params["deletes"]
+    args_str_del = ",".join(
+        self.cursor.mogrify("(%s, %s, %s)", p).decode("utf-8")
+        for p in delete_params
+    )
+    flat_del_params = [val for p in delete_params for val in p]
+    self.cursor.execute(
+        f"DELETE FROM NEW_ORDER WHERE (NO_D_ID, NO_W_ID, NO_O_ID) IN ({args_str_del})",
+        flat_del_params,
+    )
+'''
+    violations = mogrify_with_params_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["function"] == "doDelivery"
+
+
+def test_mogrify_with_params_flags_remaining_placeholder_plus_flattening():
+    source = '''
+def doDelivery(self, params):
+    cust_params = params["custs"]
+    args_str_cust = ",".join(
+        self.cursor.mogrify("(%s, %s, %s)", p).decode("utf-8")
+        for p in cust_params
+    )
+    flat_cust_params = [val for p in cust_params for val in p]
+    self.cursor.execute(
+        f"UPDATE CUSTOMER AS c SET C_BALANCE = C_BALANCE + v.amt "
+        f"FROM (VALUES {args_str_cust}) AS v(amt, c_id, c_w_id) "
+        f"WHERE c.C_ID = v.c_id AND c.C_D_ID = %s AND c.C_W_ID = v.c_w_id",
+        flat_cust_params + [params["d_id"]],
+    )
+'''
+    assert len(mogrify_with_params_sql(source)) == 1
+
+
+def test_mogrify_with_params_accepts_params_for_other_placeholders():
+    source = '''
+def doDelivery(self, params):
+    rows = params["rows"]
+    args_str = ",".join(
+        self.cursor.mogrify("(%s, %s, %s)", p).decode("utf-8")
+        for p in rows
+    )
+    self.cursor.execute(
+        f"DELETE FROM t WHERE (a, b, c) IN ({args_str}) AND w = %s",
+        [params["w"]],
+    )
+'''
+    assert mogrify_with_params_sql(source) == []
+
+
+def test_empty_params_with_placeholders_flags_dead_update():
+    source = '''
+def doDelivery(self, params):
+    order_tuples = params["orders"]
+    placeholders = ",".join(["(%s, %s, %s)"] * len(order_tuples))
+    self.cursor.execute(
+        f"UPDATE ORDERS SET O_CARRIER_ID = %s WHERE (O_ID, O_D_ID, O_W_ID) IN ({placeholders})",
+        [params["carrier"]] * len(order_tuples) if False else [],
+    )
+'''
+    violations = empty_params_with_placeholders_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["function"] == "doDelivery"
+
+
+def test_empty_params_with_placeholders_accepts_placeholder_free_sql():
+    source = '''
+def ping(self):
+    self.cursor.execute("SELECT 1", [])
+'''
+    assert empty_params_with_placeholders_sql(source) == []
+
+
+def test_empty_params_with_placeholders_accepts_real_params():
+    source = '''
+def update(self, a, b):
+    self.cursor.execute("UPDATE t SET x = %s WHERE y = %s", [a, b])
+'''
+    assert empty_params_with_placeholders_sql(source) == []

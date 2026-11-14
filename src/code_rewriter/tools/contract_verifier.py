@@ -32,6 +32,8 @@ from .sql_analysis import (
     table_column_prefix_mismatch_sql,
     ambiguous_values_alias_sql,
     statement_placeholder_sql,
+    mogrify_with_params_sql,
+    empty_params_with_placeholders_sql,
     returned_row_widths_sql,
     duplicate_column_predicate_sql,
     fragile_composite_agg_sql,
@@ -881,6 +883,37 @@ def verify_contract(
                 "table and the alias, so the statement raises 'column reference ... is "
                 "ambiguous' for every row. Qualify the target columns (e.g. ORDERS.O_ID) "
                 "or rename the VALUES alias columns."
+            ),
+        ))
+
+    for site in _new_sites(
+        empty_params_with_placeholders_sql,
+        lambda v: (v["function"], v["line"]),
+    ):
+        violations.append(VerificationViolation(
+            code="EMPTY_PARAMS_WITH_PLACEHOLDERS",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} calls execute() with an empty parameter list "
+                "while the SQL still contains placeholders. psycopg2 indexes the parameter "
+                "sequence for each placeholder and raises 'IndexError: list index out of "
+                "range'. Pass a value for every placeholder, or remove the statement."
+            ),
+        ))
+
+    for site in _new_sites(
+        mogrify_with_params_sql,
+        lambda v: (v["function"], v["line"]),
+    ):
+        violations.append(VerificationViolation(
+            code="MOGRIFY_WITH_PARAMS",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} builds SQL with cursor.mogrify() and also "
+                "passes the same values to execute() as parameters. mogrify() already "
+                "interpolates them, so psycopg2 raises 'not all arguments converted during "
+                "string formatting'. Either keep %s placeholders and pass the flattened "
+                "parameters, or mogrify and pass no parameters for that fragment."
             ),
         ))
 

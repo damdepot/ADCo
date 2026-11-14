@@ -1502,6 +1502,202 @@ _STATEMENT_PLACEHOLDER_RE = re.compile(
 )
 
 
+def _contains_mogrify(
+    node: Optional[ast.AST], sql_vars: Dict[str, ast.AST], depth: int = 0
+) -> bool:
+    if node is None or depth > 8:
+        return False
+    if isinstance(node, ast.Name):
+        stored = sql_vars.get(node.id)
+        return _contains_mogrify(stored, sql_vars, depth + 1)
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "mogrify":
+            return True
+        return _contains_mogrify(func, sql_vars, depth + 1) or any(
+            _contains_mogrify(arg, sql_vars, depth + 1)
+            for arg in list(node.args) + [kw.value for kw in node.keywords]
+        )
+    if isinstance(node, ast.Attribute):
+        return _contains_mogrify(node.value, sql_vars, depth + 1)
+    if isinstance(node, ast.JoinedStr):
+        return any(
+            _contains_mogrify(part.value, sql_vars, depth + 1)
+            for part in node.values
+            if isinstance(part, ast.FormattedValue)
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _contains_mogrify(node.left, sql_vars, depth + 1) or _contains_mogrify(
+            node.right, sql_vars, depth + 1
+        )
+    if isinstance(node, (ast.ListComp, ast.GeneratorExp)):
+        return _contains_mogrify(node.elt, sql_vars, depth + 1)
+    return False
+
+
+def _is_flatten_comprehension(node: Optional[ast.AST]) -> bool:
+    return (
+        isinstance(node, ast.ListComp)
+        and len(node.generators) == 2
+        and isinstance(node.generators[0].target, ast.Name)
+        and isinstance(node.generators[1].iter, ast.Name)
+        and node.generators[1].iter.id == node.generators[0].target.id
+    )
+
+
+def _params_include_flattening(
+    node: Optional[ast.AST], sql_vars: Dict[str, ast.AST], depth: int = 0
+) -> bool:
+    if node is None or depth > 8:
+        return False
+    if _is_flatten_comprehension(node):
+        return True
+    if isinstance(node, ast.Name):
+        stored = sql_vars.get(node.id)
+        return _is_flatten_comprehension(stored) or _params_include_flattening(
+            stored, sql_vars, depth + 1
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _params_include_flattening(
+            node.left, sql_vars, depth + 1
+        ) or _params_include_flattening(node.right, sql_vars, depth + 1)
+    return False
+
+
+_CONTAINER_MUTATIONS = {
+    "append",
+    "extend",
+    "insert",
+    "pop",
+    "remove",
+    "clear",
+    "sort",
+    "reverse",
+    "update",
+    "setdefault",
+}
+
+
+def _mutated_container_names(function: Optional[ast.AST]) -> set:
+    mutated: set = set()
+    if function is None:
+        return mutated
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.attr in _CONTAINER_MUTATIONS
+        ):
+            mutated.add(node.func.value.id)
+        elif (
+            isinstance(node, ast.AugAssign)
+            and isinstance(node.target, ast.Name)
+            and isinstance(node.op, ast.Add)
+        ):
+            mutated.add(node.target.id)
+    return mutated
+
+
+def _is_empty_params(
+    node: Optional[ast.AST],
+    sql_vars: Dict[str, ast.AST],
+    mutated: set,
+    depth: int = 0,
+) -> bool:
+    if node is None or depth > 6:
+        return False
+    if isinstance(node, (ast.List, ast.Tuple)) and not node.elts:
+        return True
+    if isinstance(node, ast.Dict) and not node.keys:
+        return True
+    if isinstance(node, ast.IfExp) and isinstance(node.test, ast.Constant):
+        branch = node.body if node.test.value else node.orelse
+        return _is_empty_params(branch, sql_vars, mutated, depth + 1)
+    if isinstance(node, ast.Name):
+        if node.id in mutated:
+            return False
+        return _is_empty_params(sql_vars.get(node.id), sql_vars, mutated, depth + 1)
+    return False
+
+
+def empty_params_with_placeholders_sql(source: str) -> List[dict]:
+    """``execute(sql, [])`` where *sql* still contains placeholders.
+
+    psycopg2 indexes the parameter sequence for every placeholder, so an empty
+    list raises ``IndexError: list index out of range`` (or a tuple index
+    error). Dynamic SQL is checked symbolically.
+    """
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        mutated = _mutated_container_names(analyzer.function_node)
+        for sql, line, sql_node, params_node, method in analyzer.execute_calls:
+            if method != "execute" or not _is_empty_params(
+                params_node, analyzer.sql_ast_vars, mutated
+            ):
+                continue
+            affine = _sql_affine(sql_node, analyzer.sql_ast_vars)
+            if affine is not None:
+                has_placeholders = affine.const > 0 or bool(affine.syms)
+            elif isinstance(sql, str):
+                has_placeholders = _placeholder_count(sql)[0] > 0 or SENTINEL in sql
+            else:
+                continue
+            if not has_placeholders:
+                continue
+            key = (name, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append({"function": name, "line": line})
+    return violations
+
+
+def mogrify_with_params_sql(source: str) -> List[dict]:
+    """Mogrified literal fragments also passed as ``execute()`` parameters.
+
+    ``cursor.mogrify("(%s, %s, %s)", row)`` already interpolates ``row`` into
+    the SQL; passing the same values again makes psycopg2 raise
+    ``not all arguments converted during string formatting`` (or the reverse).
+    """
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        for _sql, line, sql_node, params_node, method in analyzer.execute_calls:
+            if method != "execute" or params_node is None:
+                continue
+            if not _contains_mogrify(sql_node, analyzer.sql_ast_vars):
+                continue
+            parts = _fstring_parts(sql_node, analyzer.sql_ast_vars) or []
+            remaining = 0
+            unknown = False
+            for kind, value in parts:
+                if kind == "text":
+                    remaining += _placeholder_count(value)[0]
+                elif _contains_mogrify(value, analyzer.sql_ast_vars):
+                    continue
+                else:
+                    affine = _sql_affine(value, analyzer.sql_ast_vars)
+                    if affine is None or affine.syms:
+                        unknown = True
+                    else:
+                        remaining += affine.const
+            if not (
+                remaining == 0
+                or _params_include_flattening(params_node, analyzer.sql_ast_vars)
+            ):
+                continue
+            if unknown:
+                continue
+            key = (name, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append({"function": name, "line": line})
+    return violations
+
+
 def statement_placeholder_sql(source: str) -> List[dict]:
     """A SQL parameter used where a statement/subquery is required.
 
