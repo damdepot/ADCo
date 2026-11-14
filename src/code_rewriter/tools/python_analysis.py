@@ -423,6 +423,272 @@ def undefined_name_violations(
     return violations
 
 
+def _function_local_names(node: ast.AST) -> Tuple[Set[str], Set[str]]:
+    """Return ``(local_names, nonlocal_declarations)`` for one function."""
+    local: Set[str] = set()
+    declared: Set[str] = set()
+
+    def walk(current: ast.AST) -> None:
+        for child in ast.iter_child_nodes(current):
+            if isinstance(child, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                continue
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                local.add(child.name)
+                continue
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
+                for alias in child.names:
+                    local.add(alias.asname or alias.name.split(".")[0])
+                continue
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                local.add(child.id)
+            elif isinstance(child, ast.Global):
+                declared.update(child.names)
+            elif isinstance(child, ast.Nonlocal):
+                declared.update(child.names)
+            elif isinstance(child, ast.ExceptHandler) and child.name:
+                local.add(child.name)
+            walk(child)
+
+    walk(node)
+    args = getattr(node, "args", None)
+    if args is not None:
+        for arg in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
+            local.add(arg.arg)
+        if args.vararg:
+            local.add(args.vararg.arg)
+        if args.kwarg:
+            local.add(args.kwarg.arg)
+    return local - declared, declared
+
+
+class _DefiniteAssignments:
+    def __init__(
+        self,
+        function: ast.AST,
+        qualified: str,
+        local_names: Set[str],
+        record,
+    ) -> None:
+        self.function = function
+        self.qualified = qualified
+        self.local_names = local_names
+        self.record = record
+
+    def check(self, node: Optional[ast.AST], assigned: Set[str]) -> None:
+        if node is None:
+            return
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, ast.Name):
+                if isinstance(current.ctx, ast.Load) and current.id in self.local_names:
+                    if current.id not in assigned:
+                        self.record(current.id, getattr(current, "lineno", 0))
+                continue
+            if isinstance(
+                current,
+                (
+                    ast.Lambda,
+                    ast.ListComp,
+                    ast.SetComp,
+                    ast.DictComp,
+                    ast.GeneratorExp,
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                ),
+            ):
+                continue
+            stack.extend(ast.iter_child_nodes(current))
+
+    def bind(self, target: ast.AST, assigned: Set[str]) -> None:
+        if isinstance(target, ast.Name):
+            assigned.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                self.bind(element, assigned)
+        elif isinstance(target, ast.Starred):
+            self.bind(target.value, assigned)
+        else:
+            self.check(target, assigned)
+
+    def unbind(self, target: ast.AST, assigned: Set[str]) -> None:
+        if isinstance(target, ast.Name):
+            assigned.discard(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                self.unbind(element, assigned)
+
+    def block(self, statements: List[ast.stmt], incoming: Set[str]) -> Tuple[Set[str], bool]:
+        assigned = set(incoming)
+        falls = True
+        for stmt in statements:
+            if not falls:
+                break
+            if isinstance(stmt, ast.Assign):
+                self.check(stmt.value, assigned)
+                for target in stmt.targets:
+                    self.bind(target, assigned)
+            elif isinstance(stmt, ast.AnnAssign):
+                if stmt.value is not None:
+                    self.check(stmt.value, assigned)
+                self.bind(stmt.target, assigned)
+            elif isinstance(stmt, ast.AugAssign):
+                self.check(stmt.target, assigned)
+                self.check(stmt.value, assigned)
+                self.bind(stmt.target, assigned)
+            elif isinstance(stmt, ast.Expr):
+                self.check(stmt.value, assigned)
+            elif isinstance(stmt, ast.If):
+                self.check(stmt.test, assigned)
+                body_state, body_falls = self.block(stmt.body, assigned)
+                else_state, else_falls = self.block(stmt.orelse, assigned)
+                if body_falls and else_falls:
+                    assigned = body_state & else_state
+                elif body_falls:
+                    assigned = body_state
+                elif else_falls:
+                    assigned = else_state
+                else:
+                    falls = False
+            elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                self.check(stmt.iter, assigned)
+                body_start = set(assigned)
+                self.bind(stmt.target, body_start)
+                self.block(stmt.body, body_start)
+                if stmt.orelse:
+                    self.block(stmt.orelse, assigned)
+            elif isinstance(stmt, ast.While):
+                self.check(stmt.test, assigned)
+                self.block(stmt.body, assigned)
+                if stmt.orelse:
+                    self.block(stmt.orelse, assigned)
+            elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                for item in stmt.items:
+                    self.check(item.context_expr, assigned)
+                inner = set(assigned)
+                for item in stmt.items:
+                    if item.optional_vars is not None:
+                        self.bind(item.optional_vars, inner)
+                body_state, body_falls = self.block(stmt.body, inner)
+                if body_falls:
+                    assigned = body_state
+                else:
+                    falls = False
+            elif isinstance(stmt, ast.Try):
+                assigned, falls = self.try_block(stmt, assigned)
+            elif isinstance(stmt, ast.Return):
+                self.check(stmt.value, assigned)
+                falls = False
+            elif isinstance(stmt, ast.Raise):
+                self.check(stmt.exc, assigned)
+                self.check(stmt.cause, assigned)
+                falls = False
+            elif isinstance(stmt, ast.Assert):
+                self.check(stmt.test, assigned)
+                self.check(stmt.msg, assigned)
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                for decorator in getattr(stmt, "decorator_list", []):
+                    self.check(decorator, assigned)
+                for base in getattr(stmt, "bases", []):
+                    self.check(base, assigned)
+                for keyword in getattr(stmt, "keywords", []):
+                    self.check(keyword.value, assigned)
+                assigned.add(stmt.name)
+            elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                for alias in stmt.names:
+                    assigned.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(stmt, ast.Delete):
+                for target in stmt.targets:
+                    self.check(target, assigned)
+                    self.unbind(target, assigned)
+            elif isinstance(stmt, ast.Match):
+                self.check(stmt.subject, assigned)
+                for case in stmt.cases:
+                    self.check(case.guard, assigned)
+                    self.block(case.body, set(assigned))
+            elif isinstance(stmt, (ast.Break, ast.Continue)):
+                falls = False
+            elif isinstance(stmt, (ast.Global, ast.Nonlocal, ast.Pass)):
+                continue
+            else:
+                for child in ast.iter_child_nodes(stmt):
+                    if isinstance(child, ast.expr):
+                        self.check(child, assigned)
+        return assigned, falls
+
+    def try_block(self, stmt: ast.Try, incoming: Set[str]) -> Tuple[Set[str], bool]:
+        body_state, body_falls = self.block(stmt.body, incoming)
+        candidates: List[Set[str]] = []
+        if body_falls:
+            candidates.append(body_state)
+        for handler in stmt.handlers:
+            handler_state = set(incoming)
+            self.check(handler.type, incoming)
+            if handler.name:
+                handler_state.add(handler.name)
+            handler_out, handler_falls = self.block(handler.body, handler_state)
+            if handler_falls:
+                candidates.append(handler_out)
+        if stmt.orelse and body_falls:
+            else_state, else_falls = self.block(stmt.orelse, body_state)
+            if else_falls:
+                candidates.append(else_state)
+        if not candidates:
+            return set(incoming), False
+        assigned = set(candidates[0])
+        for candidate in candidates[1:]:
+            assigned &= candidate
+        if stmt.finalbody:
+            final_state, final_falls = self.block(stmt.finalbody, assigned)
+            if not final_falls:
+                return assigned, False
+            assigned = final_state
+        return assigned, True
+
+    def run(self) -> None:
+        args = getattr(self.function, "args", None)
+        assigned: Set[str] = set()
+        if args is not None:
+            for arg in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
+                assigned.add(arg.arg)
+            if args.vararg:
+                assigned.add(args.vararg.arg)
+            if args.kwarg:
+                assigned.add(args.kwarg.arg)
+        self.block(getattr(self.function, "body", []), assigned)
+
+
+def possibly_unbound_violations(source: str) -> List[dict]:
+    """Locals loaded on a path where they may not have been assigned yet.
+
+    Catches the branch-local binding followed by an unconditional read, which
+    raises ``UnboundLocalError`` (e.g. ``row`` assigned only in the ``c_id is
+    not None`` branch but read in the merged condition below).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    violations: List[dict] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    for qualified, node in _iter_functions(tree):
+        local_names, _declared = _function_local_names(node)
+        if not local_names:
+            continue
+
+        def record(name: str, line: int, qualified: str = qualified) -> None:
+            key = (qualified, name)
+            if key in seen:
+                return
+            seen.add(key)
+            violations.append({"function": qualified, "line": line, "name": name})
+
+        _DefiniteAssignments(node, qualified, local_names, record).run()
+    return violations
+
+
 def _imports_psycopg2(tree: ast.Module) -> bool:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

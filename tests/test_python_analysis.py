@@ -1,5 +1,6 @@
 from src.code_rewriter.tools.python_analysis import (
     percent_format_arity_violations,
+    possibly_unbound_violations,
     slow_executemany_violations,
     undefined_name_violations,
 )
@@ -379,3 +380,61 @@ def bulk_insert(cursor, rows):
 
 def test_slow_executemany_syntax_error():
     assert slow_executemany_violations("def f(:") == []
+
+
+def test_possibly_unbound_flags_branch_local_read():
+    source = '''
+def doPayment(self, params):
+    c_id = params["c_id"]
+    if c_id is not None:
+        row = self.cursor.fetchone()
+        customer = row[:18]
+    else:
+        customer = self.cursor.fetchall()[0]
+        c_id = customer[0]
+    if customer and len(row) > 0:
+        pass
+    return customer
+'''
+    violations = possibly_unbound_violations(source)
+    assert violations == [{"function": "doPayment", "line": 10, "name": "row"}]
+
+
+def test_possibly_unbound_accepts_all_paths():
+    source = '''
+def doPayment(self, params):
+    c_id = params["c_id"]
+    if c_id is not None:
+        row = self.cursor.fetchone()
+        customer = row[:18]
+    else:
+        customer = self.cursor.fetchall()[0]
+        c_id = customer[0]
+        row = ()
+    if customer and len(row) > 0:
+        pass
+    return customer
+'''
+    assert possibly_unbound_violations(source) == []
+
+
+def test_possibly_unbound_accepts_early_return():
+    source = '''
+def parse(self, value):
+    if value is None:
+        return None
+    row = [value]
+    return row[0]
+'''
+    assert possibly_unbound_violations(source) == []
+
+
+def test_possibly_unbound_ignores_parameters_and_globals():
+    source = '''
+LIMIT = 3
+
+
+def parse(self, value):
+    return value + LIMIT
+'''
+    assert possibly_unbound_violations(source) == []

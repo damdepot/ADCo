@@ -1238,3 +1238,58 @@ def test_verify_accepts_inlined_cte_statement():
         _static_check_contract("doPayment"),
     )
     assert not any(v.code == "STATEMENT_AS_PARAMETER" for v in result.violations)
+
+
+PAYMENT_ROW_ORIGINAL = """
+class Payment:
+    def doPayment(self, params):
+        c_id = params["c_id"]
+        if c_id is not None:
+            customer = self.cursor.fetchone()
+        else:
+            customer = self.cursor.fetchall()[0]
+            c_id = customer[0]
+        return [customer]
+"""
+
+PAYMENT_ROW_BROKEN = """
+class Payment:
+    def doPayment(self, params):
+        c_id = params["c_id"]
+        if c_id is not None:
+            row = self.cursor.fetchone()
+            customer = row[:18]
+        else:
+            customer = self.cursor.fetchall()[0]
+            c_id = customer[0]
+        if customer and len(row) > 0:
+            pass
+        return [customer]
+"""
+
+
+def test_verify_reports_possibly_unbound_local():
+    result = verify_contract(
+        PAYMENT_ROW_ORIGINAL,
+        PAYMENT_ROW_BROKEN,
+        _static_check_contract("doPayment"),
+    )
+    assert result.status == "FAIL"
+    unbound = [v for v in result.violations if v.code == "POSSIBLY_UNBOUND_LOCAL"]
+    assert len(unbound) == 1
+    assert unbound[0].severity == "ERROR"
+    assert "'row'" in unbound[0].message
+    assert "UnboundLocalError" in unbound[0].message
+
+
+def test_verify_accepts_all_paths_bound():
+    fixed = PAYMENT_ROW_BROKEN.replace(
+        '            c_id = customer[0]\n',
+        '            c_id = customer[0]\n            row = ()\n',
+    )
+    result = verify_contract(
+        PAYMENT_ROW_ORIGINAL,
+        fixed,
+        _static_check_contract("doPayment"),
+    )
+    assert not any(v.code == "POSSIBLY_UNBOUND_LOCAL" for v in result.violations)

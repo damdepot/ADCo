@@ -51,6 +51,7 @@ from .python_analysis import (
     _bound_names,
     percent_format_arity_violations,
     undefined_name_violations,
+    possibly_unbound_violations,
     slow_executemany_violations,
     _ModFormatAnalyzer,
     _raw_string,
@@ -963,6 +964,22 @@ def verify_contract(
                 "Bind it — a comprehension must include its "
                 f"`for {site['name']} in <iterable>` clause; otherwise add the missing "
                 "assignment or parameter."
+            ),
+        ))
+
+    for site in _new_sites(
+        possibly_unbound_violations,
+        lambda v: (v["function"], v["name"]),
+    ):
+        violations.append(VerificationViolation(
+            code="POSSIBLY_UNBOUND_LOCAL",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} reads local '{site['name']}' on a path where "
+                "it may not be assigned yet; Python raises UnboundLocalError "
+                f"(\"local variable '{site['name']}' referenced before assignment\"). "
+                "Assign it on every branch before the read, or move the read inside the "
+                "branch that binds it."
             ),
         ))
 
