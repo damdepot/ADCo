@@ -1400,6 +1400,102 @@ def composite_tuple_order_sql(source: str) -> List[dict]:
     return violations
 
 
+def _width_from_fetch(
+    value: ast.AST,
+    bindings: Dict[str, set],
+    executes: List[tuple],
+    lineno: int,
+) -> Optional[set]:
+    if _is_fetch_call(value):
+        previous = [sql for line, sql in executes if line < lineno]
+        if not previous:
+            return None
+        width = find_select_column_count(previous[-1])
+        return None if width is None else {width}
+    if isinstance(value, ast.Name):
+        widths = bindings.get(value.id)
+        return set(widths) if widths else None
+    if isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
+        widths = bindings.get(value.value.id)
+        if not widths:
+            return None
+        slice_node = value.slice
+        if not isinstance(slice_node, ast.Slice):
+            # ``rows[index]`` selects a row; the row width is unchanged.
+            return set(widths)
+        lower = 0 if slice_node.lower is None else _const_int(slice_node.lower)
+        upper = None if slice_node.upper is None else _const_int(slice_node.upper)
+        if lower is None or (slice_node.upper is not None and upper is None):
+            return None
+        if slice_node.step is not None:
+            step = _const_int(slice_node.step)
+            if step != 1:
+                return None
+        sliced: set = set()
+        for width in widths:
+            high = width if upper is None else upper
+            if 0 <= lower <= high <= width:
+                sliced.add(high - lower)
+            else:
+                return None
+        return sliced
+    return None
+
+
+def returned_row_widths_sql(source: str) -> Dict[str, Dict[str, List[int]]]:
+    """SELECT width of every fetched row that the function returns.
+
+    ``customer = self.cursor.fetchone()`` then ``return [customer, ...]`` is a
+    transaction payload: widening its SELECT projection changes the returned
+    row (and the wire output) even though the return statement itself is
+    unchanged. Maps ``function -> returned variable -> sorted widths``.
+    """
+    result: Dict[str, Dict[str, List[int]]] = {}
+    for name, analyzer in _iter_analyzed(source):
+        function = analyzer.function_node
+        if function is None:
+            continue
+        executes = sorted(
+            (line, sql)
+            for sql, line, _node, _params, method in analyzer.execute_calls
+            if isinstance(sql, str) and method == "execute"
+        )
+        bindings: Dict[str, set] = {}
+        assigns = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None
+        ]
+        assigns.sort(key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)))
+        for node in assigns:
+            widths = _width_from_fetch(node.value, bindings, executes, node.lineno)
+            if widths is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    bindings.setdefault(target.id, set()).update(widths)
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    for element in target.elts:
+                        if isinstance(element, ast.Name):
+                            bindings.setdefault(element.id, set()).update(widths)
+
+        returned: set = set()
+        for node in ast.walk(function):
+            if isinstance(node, ast.Return) and node.value is not None:
+                for child in ast.walk(node.value):
+                    if isinstance(child, ast.Name):
+                        returned.add(child.id)
+        widths_by_var = {
+            var: sorted(bindings[var])
+            for var in returned
+            if var in bindings and bindings[var]
+        }
+        if widths_by_var:
+            result[name] = widths_by_var
+    return result
+
+
 def table_column_prefix_mismatch_sql(source: str) -> List[dict]:
     """Single-table SQL whose column prefix is a truncated table prefix.
 

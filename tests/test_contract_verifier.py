@@ -1081,3 +1081,55 @@ def test_verify_accepts_full_order_line_prefix():
         _static_check_contract("doDelivery"),
     )
     assert not any(v.code == "TABLE_COLUMN_PREFIX_MISMATCH" for v in result.violations)
+
+
+ORDER_STATUS_ORIGINAL = """
+TXN_QUERIES = {"ORDER_STATUS": {
+    "getCustomerByCustomerId": "SELECT C_ID, C_FIRST, C_MIDDLE, C_LAST, C_BALANCE FROM CUSTOMER WHERE C_W_ID = %s AND C_D_ID = %s AND C_ID = %s",
+    "getLastOrder": "SELECT O_ID, O_CARRIER_ID, O_ENTRY_D FROM ORDERS WHERE O_W_ID = %s AND O_D_ID = %s AND O_C_ID = %s ORDER BY O_ID DESC LIMIT 1",
+    "getOrderLines": "SELECT OL_SUPPLY_W_ID, OL_I_ID, OL_QUANTITY, OL_AMOUNT, OL_DELIVERY_D FROM ORDER_LINE WHERE OL_W_ID = %s AND OL_D_ID = %s AND OL_O_ID = %s",
+}}
+
+class Status:
+    def doOrderStatus(self, params):
+        q = TXN_QUERIES["ORDER_STATUS"]
+        c_id = params["c_id"]
+        self.cursor.execute(q["getCustomerByCustomerId"], [1, 2, c_id])
+        customer = self.cursor.fetchone()
+        self.cursor.execute(q["getLastOrder"], [1, 2, c_id])
+        order = self.cursor.fetchone()
+        if order:
+            self.cursor.execute(q["getOrderLines"], [1, 2, order[0]])
+            orderLines = self.cursor.fetchall()
+        else:
+            orderLines = []
+        return [customer, order, orderLines]
+"""
+
+ORDER_STATUS_WIDENED = ORDER_STATUS_ORIGINAL.replace(
+    'q["getCustomerByCustomerId"], [1, 2, c_id]',
+    '"SELECT C_ID, C_FIRST, C_MIDDLE, C_LAST, C_BALANCE, C_STREET_1, C_CITY, C_BALANCE, C_DATA FROM CUSTOMER WHERE C_W_ID = %s AND C_D_ID = %s AND C_ID = %s", [1, 2, c_id]',
+)
+
+
+def test_verify_reports_returned_row_width_changed():
+    result = verify_contract(
+        ORDER_STATUS_ORIGINAL,
+        ORDER_STATUS_WIDENED,
+        _static_check_contract("doOrderStatus"),
+    )
+    assert result.status == "FAIL"
+    width = [v for v in result.violations if v.code == "RETURNED_ROW_WIDTH_CHANGED"]
+    assert len(width) == 1
+    assert width[0].severity == "ERROR"
+    assert "'customer'" in width[0].message
+    assert "original returned [5]" in width[0].message
+
+
+def test_verify_accepts_unchanged_returned_row_width():
+    result = verify_contract(
+        ORDER_STATUS_ORIGINAL,
+        ORDER_STATUS_ORIGINAL,
+        _static_check_contract("doOrderStatus"),
+    )
+    assert not any(v.code == "RETURNED_ROW_WIDTH_CHANGED" for v in result.violations)

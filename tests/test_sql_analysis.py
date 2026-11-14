@@ -5,6 +5,7 @@ import pytest
 from src.code_rewriter.tools.sql_analysis import (
     composite_any_array_sql,
     composite_tuple_order_sql,
+    returned_row_widths_sql,
     table_column_prefix_mismatch_sql,
     duplicate_column_predicate_sql,
     duplicate_where_sql,
@@ -806,3 +807,72 @@ def doDelivery(self, params):
     )
 '''
     assert table_column_prefix_mismatch_sql(source) == []
+
+
+ORDER_STATUS_ROWS = '''
+TXN_QUERIES = {"ORDER_STATUS": {
+  "getCustomerByCustomerId": "SELECT C_ID, C_FIRST, C_MIDDLE, C_LAST, C_BALANCE FROM CUSTOMER WHERE C_W_ID = %s",
+  "getCustomersByLastName": "SELECT C_ID, C_FIRST, C_MIDDLE, C_LAST, C_BALANCE FROM CUSTOMER WHERE C_W_ID = %s",
+  "getLastOrder": "SELECT O_ID, O_CARRIER_ID, O_ENTRY_D FROM ORDERS WHERE O_W_ID = %s",
+  "getOrderLines": "SELECT OL_SUPPLY_W_ID, OL_I_ID, OL_QUANTITY, OL_AMOUNT, OL_DELIVERY_D FROM ORDER_LINE WHERE OL_W_ID = %s",
+}}
+
+class D:
+    def doOrderStatus(self, params):
+        q = TXN_QUERIES["ORDER_STATUS"]
+        c_id = params["c_id"]
+        if c_id is not None:
+            self.cursor.execute(q["getCustomerByCustomerId"], [1])
+            customer = self.cursor.fetchone()
+        else:
+            self.cursor.execute(q["getCustomersByLastName"], [1])
+            all_customers = self.cursor.fetchall()
+            customer = all_customers[0]
+        self.cursor.execute(q["getLastOrder"], [1])
+        order = self.cursor.fetchone()
+        if order:
+            self.cursor.execute(q["getOrderLines"], [1])
+            orderLines = self.cursor.fetchall()
+        else:
+            orderLines = []
+        return [customer, order, orderLines]
+'''
+
+ORDER_STATUS_WIDENED = ORDER_STATUS_ROWS.replace(
+    'q["getCustomerByCustomerId"], [1]',
+    '"SELECT C_ID, C_FIRST, C_MIDDLE, C_LAST, C_BALANCE, C_STREET_1, C_CITY, C_BALANCE, C_DATA FROM CUSTOMER", [1]',
+).replace(
+    'q["getCustomersByLastName"], [1]',
+    '"SELECT C_ID, C_FIRST, C_MIDDLE, C_LAST, C_BALANCE, C_STREET_1, C_CITY, C_BALANCE, C_DATA FROM CUSTOMER", [1]',
+)
+
+
+def test_returned_row_widths_tracks_fetched_rows():
+    widths = returned_row_widths_sql(ORDER_STATUS_ROWS)["D.doOrderStatus"]
+    assert widths == {"customer": [5], "order": [3], "orderLines": [5]}
+
+
+def test_returned_row_widths_detects_widened_projection():
+    widths = returned_row_widths_sql(ORDER_STATUS_WIDENED)["D.doOrderStatus"]
+    assert widths["customer"] == [9]
+    assert widths["order"] == [3]
+    assert widths["orderLines"] == [5]
+
+
+def test_returned_row_widths_respects_slices():
+    source = '''
+class D:
+    def doPayment(self, params):
+        self.cursor.execute(
+            "SELECT W_NAME, W_STREET_1, W_STREET_2, W_CITY, W_STATE, W_ZIP, "
+            "D_NAME, D_STREET_1, D_STREET_2, D_CITY, D_STATE, D_ZIP "
+            "FROM WAREHOUSE, DISTRICT",
+            [],
+        )
+        res = self.cursor.fetchone()
+        warehouse = res[0:6]
+        district = res[6:12]
+        return [warehouse, district]
+'''
+    widths = returned_row_widths_sql(source)["D.doPayment"]
+    assert widths == {"warehouse": [6], "district": [6]}

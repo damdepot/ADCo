@@ -30,6 +30,7 @@ from .sql_analysis import (
     values_alias_arity_sql,
     composite_tuple_order_sql,
     table_column_prefix_mismatch_sql,
+    returned_row_widths_sql,
     duplicate_column_predicate_sql,
     fragile_composite_agg_sql,
     composite_any_array_sql,
@@ -862,6 +863,31 @@ def verify_contract(
                 "row. Use the table's full column name."
             ),
         ))
+
+    original_row_widths = returned_row_widths_sql(original_source)
+    optimized_row_widths = returned_row_widths_sql(optimized_source)
+    for fn_name, variables in optimized_row_widths.items():
+        if not _in_target_regions(fn_name):
+            continue
+        original_variables = original_row_widths.get(fn_name, {})
+        for variable, widths in variables.items():
+            original_widths = original_variables.get(variable)
+            if not original_widths or set(original_widths) == set(widths):
+                continue
+            violations.append(VerificationViolation(
+                code="RETURNED_ROW_WIDTH_CHANGED",
+                severity="ERROR",
+                message=(
+                    f"Function {fn_name} returns '{variable}' fetched from a SELECT with "
+                    f"{widths} column(s), but the original returned {original_widths}. A "
+                    "fetched row that is part of the transaction output must keep its "
+                    "projection: extra/fewer columns change the returned row and the wire "
+                    "result even when the return statement is unchanged. Keep the SELECT "
+                    "list identical, or build a separate local row for internal use."
+                ),
+                expected=original_widths,
+                actual=widths,
+            ))
 
     for site in _new_sites(
         percent_format_arity_violations,
