@@ -4,6 +4,8 @@ import pytest
 
 from src.code_rewriter.tools.sql_analysis import (
     composite_any_array_sql,
+    composite_tuple_order_sql,
+    table_column_prefix_mismatch_sql,
     duplicate_column_predicate_sql,
     duplicate_where_sql,
     dynamic_placeholder_arity_sql,
@@ -708,3 +710,99 @@ def test_values_alias_arity_real_delivery_defect():
     assert len(violations) == 1
     assert violations[0]["function"] == "PostgresDriver.doDelivery"
     assert (violations[0]["row_width"], violations[0]["alias_columns"]) == (3, 4)
+
+
+# The second shipped DELIVERY regression: valid_orders is (d_id, no_o_id) but
+# the batched predicates are (O_ID, O_D_ID) / (OL_O_ID, OL_D_ID).
+DELIVERY_TUPLE_ORDER_REPRO = '''
+def doDelivery(self, params):
+    w_id = params["w_id"]
+    d_ids = list(range(1, 11))
+
+    self.cursor.execute(
+        "SELECT NO_D_ID, MIN(NO_O_ID) FROM NEW_ORDER WHERE NO_D_ID = ANY(%s) AND NO_W_ID = %s GROUP BY NO_D_ID",
+        [d_ids, w_id],
+    )
+    new_order_map = {row[0]: row[1] for row in self.cursor.fetchall()}
+
+    valid_orders = []
+    for d_id in d_ids:
+        no_o_id = new_order_map.get(d_id)
+        if no_o_id is None:
+            continue
+        valid_orders.append((d_id, no_o_id))
+
+    self.cursor.execute(
+        "SELECT O_ID, O_D_ID, O_C_ID FROM ORDERS WHERE O_W_ID = %s AND (O_ID, O_D_ID) IN (%s)"
+        % ("%s", ",".join(["(%s,%s)" for _ in valid_orders])),
+        [w_id] + [val for pair in valid_orders for val in pair],
+    )
+    order_map = {(row[0], row[1]): row[2] for row in self.cursor.fetchall()}
+    for d_id, no_o_id in valid_orders:
+        assert order_map.get((no_o_id, d_id)) is not None
+'''
+
+
+def test_composite_tuple_order_flags_swapped_delivery_key():
+    violations = composite_tuple_order_sql(DELIVERY_TUPLE_ORDER_REPRO)
+    assert len(violations) == 1
+    assert violations[0]["function"] == "doDelivery"
+    assert violations[0]["columns"] == ["o_id", "o_d_id"]
+    assert violations[0]["tuple_order"] == ["d_id", "no_o_id"]
+    assert violations[0]["expected_order"] == ["o_d_id", "o_id"]
+
+
+def test_composite_tuple_order_accepts_correct_order():
+    source = DELIVERY_TUPLE_ORDER_REPRO.replace(
+        'valid_orders.append((d_id, no_o_id))',
+        'valid_orders.append((no_o_id, d_id))',
+    )
+    assert composite_tuple_order_sql(source) == []
+
+
+def test_composite_tuple_order_ignores_unresolvable_names():
+    source = '''
+def f(self, rows):
+    self.cursor.execute(
+        "SELECT O_ID FROM ORDERS WHERE (O_ID, O_D_ID) IN (%s)",
+        [val for pair in rows for val in pair],
+    )
+'''
+    assert composite_tuple_order_sql(source) == []
+
+
+def test_table_column_prefix_mismatch_flags_truncated_order_line_column():
+    source = '''
+def doDelivery(self, params):
+    self.cursor.execute(
+        "UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE O_W_ID = %s AND (OL_O_ID, OL_D_ID) IN (%s)",
+        [],
+    )
+'''
+    violations = table_column_prefix_mismatch_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["function"] == "doDelivery"
+    assert violations[0]["column"] == "O_W_ID"
+    assert violations[0]["expected_prefix"] == "OL"
+
+
+def test_table_column_prefix_mismatch_accepts_full_prefix():
+    source = '''
+def doDelivery(self, params):
+    self.cursor.execute(
+        "UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE OL_W_ID = %s AND (OL_O_ID, OL_D_ID) IN (%s)",
+        [],
+    )
+'''
+    assert table_column_prefix_mismatch_sql(source) == []
+
+
+def test_table_column_prefix_mismatch_skips_joins():
+    source = '''
+def doDelivery(self, params):
+    self.cursor.execute(
+        "SELECT O_ID FROM ORDERS JOIN ORDER_LINE ON O_ID = OL_O_ID WHERE O_W_ID = %s",
+        [],
+    )
+'''
+    assert table_column_prefix_mismatch_sql(source) == []

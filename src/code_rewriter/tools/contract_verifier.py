@@ -28,6 +28,8 @@ from .sql_analysis import (
     placeholder_param_mismatch_sql,
     dynamic_placeholder_arity_sql,
     values_alias_arity_sql,
+    composite_tuple_order_sql,
+    table_column_prefix_mismatch_sql,
     duplicate_column_predicate_sql,
     fragile_composite_agg_sql,
     composite_any_array_sql,
@@ -824,6 +826,40 @@ def verify_contract(
                 "(\"table has N columns available but M columns specified\"), so the "
                 "transaction fails at runtime. Make the row width match the alias column "
                 "list, or write one row per tuple."
+            ),
+        ))
+
+    for site in _new_sites(
+        composite_tuple_order_sql,
+        lambda v: (v["function"], v["line"]),
+    ):
+        violations.append(VerificationViolation(
+            code="COMPOSITE_TUPLE_ORDER",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} flattens tuple "
+                f"({', '.join(site['tuple_order'])}) into the composite predicate "
+                f"({', '.join(site['columns'])}) IN (...), but its names match "
+                f"({', '.join(site['expected_order'])}). A swapped composite key makes the "
+                "batched predicate match nothing, so the lookup map is empty and any "
+                "downstream index/assert fails. Keep the SQL column order, the tuple order, "
+                "the dict key, and the flattened parameters identical."
+            ),
+        ))
+
+    for site in _new_sites(
+        table_column_prefix_mismatch_sql,
+        lambda v: (v["function"], v["line"], v["column"]),
+    ):
+        violations.append(VerificationViolation(
+            code="TABLE_COLUMN_PREFIX_MISMATCH",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} references column {site['column']} in a "
+                f"single-table statement whose other columns use the {site['expected_prefix']}_ "
+                f"prefix. {site['column']} looks like a truncated {site['expected_prefix']}_ "
+                "column and does not exist, so PostgreSQL raises UndefinedColumn for every "
+                "row. Use the table's full column name."
             ),
         ))
 

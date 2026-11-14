@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import re
+from itertools import permutations
 from typing import Any, Dict, List, Optional
 
 from .sql_resolver import SENTINEL, collect_module_dicts, resolve
@@ -1202,6 +1203,264 @@ def values_alias_arity_sql(source: str) -> List[dict]:
                         "alias_columns": len(columns),
                     }
                 )
+    return violations
+
+
+def _tuple_element_names(node: Optional[ast.AST]) -> Optional[tuple]:
+    if isinstance(node, (ast.Tuple, ast.List)) and node.elts:
+        if all(isinstance(elt, ast.Name) for elt in node.elts):
+            return tuple(elt.id for elt in node.elts)
+    return None
+
+
+def _param_tuple_names(
+    node: Optional[ast.AST], orders: Dict[str, tuple]
+) -> Optional[tuple]:
+    """Element names of the tuple list flattened into a parameter expression."""
+    if node is None:
+        return None
+    if isinstance(node, ast.Name):
+        return orders.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _param_tuple_names(node.right, orders) or _param_tuple_names(node.left, orders)
+    if isinstance(node, ast.ListComp) and len(node.generators) == 2:
+        first, second = node.generators
+        if (
+            isinstance(first.target, ast.Name)
+            and isinstance(second.iter, ast.Name)
+            and second.iter.id == first.target.id
+        ):
+            return _iter_tuple_names(first.iter, orders)
+    return None
+
+
+def _iter_tuple_names(
+    node: Optional[ast.AST], orders: Dict[str, tuple]
+) -> Optional[tuple]:
+    if node is None:
+        return None
+    if isinstance(node, ast.Name):
+        return orders.get(node.id)
+    if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
+        shapes = {_tuple_element_names(elt) for elt in node.elts}
+        if len(shapes) == 1 and None not in shapes:
+            return shapes.pop()
+        return None
+    if isinstance(node, ast.ListComp) and len(node.generators) == 1:
+        generator = node.generators[0]
+        if generator.ifs:
+            return None
+        direct = _tuple_element_names(node.elt)
+        if direct is not None:
+            return direct
+        base = _iter_tuple_names(generator.iter, orders)
+        if base is None or not isinstance(node.elt, ast.Tuple) or not isinstance(generator.target, ast.Name):
+            return None
+        projected = []
+        for elt in node.elt.elts:
+            if (
+                isinstance(elt, ast.Subscript)
+                and isinstance(elt.value, ast.Name)
+                and elt.value.id == generator.target.id
+                and isinstance(elt.slice, ast.Constant)
+                and isinstance(elt.slice.value, int)
+                and 0 <= elt.slice.value < len(base)
+            ):
+                projected.append(base[elt.slice.value])
+            else:
+                return None
+        return tuple(projected)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "zip":
+        if all(isinstance(arg, ast.Name) for arg in node.args):
+            return tuple(arg.id for arg in node.args)
+    return None
+
+
+def _list_tuple_orders(function: Optional[ast.AST]) -> Dict[str, tuple]:
+    """Tuple element order of every list built by append/extend in *function*."""
+    if function is None:
+        return {}
+    orders: Dict[str, tuple] = {}
+    ambiguous: set = set()
+
+    def record(name: str, names: tuple) -> None:
+        if name in ambiguous:
+            return
+        if name in orders:
+            if orders[name] != names:
+                ambiguous.add(name)
+                orders.pop(name, None)
+            return
+        orders[name] = names
+
+    for stmt in ast.walk(function):
+        target = None
+        value = None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            target = stmt.targets[0].id
+            value = stmt.value
+        elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+            if (
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.attr in {"append", "extend"}
+                and len(call.args) == 1
+            ):
+                target = call.func.value.id
+                value = call.args[0]
+        if target is None or value is None:
+            continue
+        names = _tuple_element_names(value)
+        if names is None:
+            names = _param_tuple_names(value, orders)
+        if names is not None:
+            record(target, names)
+    return orders
+
+
+_COMPOSITE_IN_RE = re.compile(
+    r"\(\s*([A-Za-z_][\w.]*\s*(?:,\s*[A-Za-z_][\w.]*\s*)+)\)\s+IN\s*\(",
+    re.I,
+)
+
+
+def _name_matches_column(name: str, column: str) -> bool:
+    name = name.lower()
+    column = column.lower()
+    if name == column:
+        return True
+    if len(name) >= 3 and name in column:
+        return True
+    if len(column) >= 3 and column in name:
+        return True
+    for value, other in ((name, column), (column, name)):
+        if "_" in value:
+            tail = value.split("_", 1)[1]
+            if len(tail) >= 3 and tail in other:
+                return True
+    return False
+
+
+def composite_tuple_order_sql(source: str) -> List[dict]:
+    """Composite ``(col, ...) IN ((%s, ...), ...)`` whose tuple order is swapped.
+
+    Resolves the list appended as ``(d_id, no_o_id)`` and compares it with the
+    SQL column tuple ``(O_ID, O_D_ID)``. A perfect name match in a different
+    order means the batched predicate matches nothing: the lookup dict is empty
+    and the next index/assert fails. Ambiguous names are skipped.
+    """
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        orders = _list_tuple_orders(analyzer.function_node)
+        for sql, line, _sql_node, params_node, method in analyzer.execute_calls:
+            if method != "execute" or not isinstance(sql, str):
+                continue
+            found = list(_COMPOSITE_IN_RE.finditer(sql))
+            if len(found) != 1:
+                continue
+            columns = [
+                col.strip().split(".")[-1].strip('"`').lower()
+                for col in found[0].group(1).split(",")
+            ]
+            if (
+                len(columns) < 2
+                or len(columns) > 6
+                or any(not re.fullmatch(r"[a-z_]\w*", col) for col in columns)
+            ):
+                continue
+            names = _param_tuple_names(params_node, orders)
+            if names is None or len(names) != len(columns):
+                continue
+            matches = [
+                [j for j, col in enumerate(columns) if _name_matches_column(n, col)]
+                for n in names
+            ]
+            solutions = [
+                perm
+                for perm in permutations(range(len(columns)))
+                if all(perm[i] in matches[i] for i in range(len(columns)))
+            ]
+            if len(solutions) != 1 or solutions[0] == tuple(range(len(columns))):
+                continue
+            key = (name, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(
+                {
+                    "function": name,
+                    "line": line,
+                    "columns": columns,
+                    "tuple_order": list(names),
+                    "expected_order": [columns[j] for j in solutions[0]],
+                }
+            )
+    return violations
+
+
+def table_column_prefix_mismatch_sql(source: str) -> List[dict]:
+    """Single-table SQL whose column prefix is a truncated table prefix.
+
+    Catches ``UPDATE ORDER_LINE ... WHERE O_W_ID = %s``: every other column in
+    the statement is ``OL_*``, so ``O_W_ID`` is a truncation of ``OL_W_ID`` and
+    the column does not exist. PostgreSQL raises UndefinedColumn for every row.
+    Joined statements, subqueries, and ambiguous prefix sets are skipped.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:  # pragma: no cover - declared dependency
+        return []
+
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        for sql, line in analyzer.execute_sqls:
+            normalized = sql.replace("%s", "0").replace("%%", "%")
+            try:
+                tree = sqlglot.parse_one(normalized, read="postgres")
+            except Exception:
+                continue
+            if tree is None:
+                continue
+            if len(list(tree.find_all(exp.Table))) != 1:
+                continue
+            if list(tree.find_all(exp.Subquery)):
+                continue
+            columns = [col.name for col in tree.find_all(exp.Column) if col.name]
+            prefixes: Dict[str, int] = {}
+            for col in columns:
+                if "_" in col:
+                    prefix = col.split("_", 1)[0]
+                    prefixes[prefix] = prefixes.get(prefix, 0) + 1
+            if len(prefixes) < 2:
+                continue
+            dominant, count = max(prefixes.items(), key=lambda item: item[1])
+            if count < 2:
+                continue
+            for col in columns:
+                if "_" not in col:
+                    continue
+                prefix = col.split("_", 1)[0]
+                if (
+                    prefix != dominant
+                    and len(prefix) < len(dominant)
+                    and dominant.startswith(prefix)
+                ):
+                    key = (name, line, col)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    violations.append(
+                        {
+                            "function": name,
+                            "line": line,
+                            "column": col,
+                            "expected_prefix": dominant,
+                        }
+                    )
     return violations
 
 

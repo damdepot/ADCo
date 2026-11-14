@@ -980,3 +980,104 @@ def test_verify_accepts_matching_values_alias_arity():
         _static_check_contract("doDelivery"),
     )
     assert not any(v.code == "VALUES_ALIAS_ARITY" for v in result.violations)
+
+
+DELIVERY_TUPLE_ORDER_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        for d_id, no_o_id in params["orders"]:
+            self.cursor.execute(
+                "SELECT O_C_ID FROM ORDERS WHERE O_ID = %s AND O_D_ID = %s",
+                [no_o_id, d_id],
+            )
+        return []
+"""
+
+DELIVERY_TUPLE_ORDER_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        w_id = params["w_id"]
+        valid_orders = []
+        for d_id, no_o_id in params["orders"]:
+            valid_orders.append((d_id, no_o_id))
+        self.cursor.execute(
+            "SELECT O_ID, O_D_ID, O_C_ID FROM ORDERS WHERE O_W_ID = %s AND (O_ID, O_D_ID) IN (%s)"
+            % ("%s", ",".join(["(%s,%s)" for _ in valid_orders])),
+            [w_id] + [val for pair in valid_orders for val in pair],
+        )
+        return []
+"""
+
+
+def test_verify_reports_composite_tuple_order():
+    result = verify_contract(
+        DELIVERY_TUPLE_ORDER_ORIGINAL,
+        DELIVERY_TUPLE_ORDER_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    order = [v for v in result.violations if v.code == "COMPOSITE_TUPLE_ORDER"]
+    assert len(order) == 1
+    assert order[0].severity == "ERROR"
+    assert "(d_id, no_o_id)" in order[0].message
+    assert "(o_d_id, o_id)" in order[0].message
+
+
+def test_verify_accepts_correct_composite_tuple_order():
+    fixed = DELIVERY_TUPLE_ORDER_BROKEN.replace(
+        "valid_orders.append((d_id, no_o_id))",
+        "valid_orders.append((no_o_id, d_id))",
+    )
+    result = verify_contract(
+        DELIVERY_TUPLE_ORDER_ORIGINAL,
+        fixed,
+        _static_check_contract("doDelivery"),
+    )
+    assert not any(v.code == "COMPOSITE_TUPLE_ORDER" for v in result.violations)
+
+
+DELIVERY_PREFIX_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "UPDATE ORDER_LINE SET OL_DELIVERY_D = %s "
+            "WHERE OL_O_ID = %s AND OL_D_ID = %s AND OL_W_ID = %s",
+            [params["ol_delivery_d"], params["no_o_id"], params["d_id"], params["w_id"]],
+        )
+        return []
+"""
+
+DELIVERY_PREFIX_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "UPDATE ORDER_LINE SET OL_DELIVERY_D = %s "
+            "WHERE O_W_ID = %s AND (OL_O_ID, OL_D_ID) IN (%s)",
+            [params["ol_delivery_d"], params["w_id"], params["keys"]],
+        )
+        return []
+"""
+
+
+def test_verify_reports_table_column_prefix_mismatch():
+    result = verify_contract(
+        DELIVERY_PREFIX_ORIGINAL,
+        DELIVERY_PREFIX_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    prefix = [v for v in result.violations if v.code == "TABLE_COLUMN_PREFIX_MISMATCH"]
+    assert len(prefix) == 1
+    assert prefix[0].severity == "ERROR"
+    assert "O_W_ID" in prefix[0].message
+    assert "OL_" in prefix[0].message
+
+
+def test_verify_accepts_full_order_line_prefix():
+    fixed = DELIVERY_PREFIX_BROKEN.replace("WHERE O_W_ID", "WHERE OL_W_ID")
+    result = verify_contract(
+        DELIVERY_PREFIX_ORIGINAL,
+        fixed,
+        _static_check_contract("doDelivery"),
+    )
+    assert not any(v.code == "TABLE_COLUMN_PREFIX_MISMATCH" for v in result.violations)
