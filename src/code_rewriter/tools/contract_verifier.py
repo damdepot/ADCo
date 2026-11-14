@@ -31,6 +31,7 @@ from .sql_analysis import (
     composite_tuple_order_sql,
     table_column_prefix_mismatch_sql,
     ambiguous_values_alias_sql,
+    statement_placeholder_sql,
     returned_row_widths_sql,
     duplicate_column_predicate_sql,
     fragile_composite_agg_sql,
@@ -879,6 +880,22 @@ def verify_contract(
                 "table and the alias, so the statement raises 'column reference ... is "
                 "ambiguous' for every row. Qualify the target columns (e.g. ORDERS.O_ID) "
                 "or rename the VALUES alias columns."
+            ),
+        ))
+
+    for site in _new_sites(
+        statement_placeholder_sql,
+        lambda v: (v["function"], v["line"]),
+    ):
+        violations.append(VerificationViolation(
+            code="STATEMENT_AS_PARAMETER",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} passes SQL text through a value placeholder "
+                f"({site['fragment']}). Placeholders are for values: the driver quotes the "
+                "statement as a string literal and PostgreSQL raises a syntax error at the "
+                "first keyword. Inline the statement into the SQL string, or execute it as a "
+                "separate statement."
             ),
         ))
 

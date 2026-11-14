@@ -1496,6 +1496,43 @@ def returned_row_widths_sql(source: str) -> Dict[str, Dict[str, List[int]]]:
     return result
 
 
+_STATEMENT_PLACEHOLDER_RE = re.compile(
+    r"\b(?:AS|FROM|JOIN)\s*\(\s*%(?:s|\(\w+\)s)(?=\s|$|\))",
+    re.I,
+)
+
+
+def statement_placeholder_sql(source: str) -> List[dict]:
+    """A SQL parameter used where a statement/subquery is required.
+
+    Catches ``u3 AS (%s RETURNING 1)``: placeholders carry values, so the
+    driver quotes the statement text and PostgreSQL raises a syntax error at
+    the first keyword. The statement must be inlined into the SQL string (or
+    executed separately).
+    """
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        for sql, line in analyzer.execute_sqls:
+            match = _STATEMENT_PLACEHOLDER_RE.search(sql)
+            if match is None:
+                continue
+            key = (name, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            start = max(0, match.start() - 40)
+            fragment = " ".join(sql[start : match.end() + 40].split())
+            violations.append(
+                {
+                    "function": name,
+                    "line": line,
+                    "fragment": fragment[:160],
+                }
+            )
+    return violations
+
+
 def ambiguous_values_alias_sql(source: str) -> List[dict]:
     """``VALUES`` alias columns colliding with unqualified target columns.
 

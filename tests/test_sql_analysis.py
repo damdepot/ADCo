@@ -7,6 +7,7 @@ from src.code_rewriter.tools.sql_analysis import (
     ambiguous_values_alias_sql,
     composite_tuple_order_sql,
     returned_row_widths_sql,
+    statement_placeholder_sql,
     table_column_prefix_mismatch_sql,
     duplicate_column_predicate_sql,
     duplicate_where_sql,
@@ -928,3 +929,44 @@ def doDelivery(self, params):
     )
 '''
     assert ambiguous_values_alias_sql(source) == []
+
+
+def test_statement_placeholder_flags_cte_body():
+    source = '''
+def doPayment(self, params):
+    self.cursor.execute(
+        "WITH u1 AS (UPDATE WAREHOUSE SET W_YTD = W_YTD + %s WHERE W_ID = %s RETURNING 1), "
+        "u2 AS (UPDATE DISTRICT SET D_YTD = D_YTD + %s WHERE D_W_ID = %s AND D_ID = %s RETURNING 1), "
+        "u3 AS (%s RETURNING 1) INSERT INTO HISTORY VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        params,
+    )
+'''
+    violations = statement_placeholder_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["function"] == "doPayment"
+    assert "AS (%s RETURNING" in violations[0]["fragment"]
+
+
+def test_statement_placeholder_accepts_inlined_cte():
+    source = '''
+def doPayment(self, params):
+    self.cursor.execute(
+        "WITH u1 AS (UPDATE WAREHOUSE SET W_YTD = W_YTD + %s WHERE W_ID = %s RETURNING 1), "
+        "u2 AS (UPDATE DISTRICT SET D_YTD = D_YTD + %s WHERE D_W_ID = %s AND D_ID = %s RETURNING 1), "
+        "u3 AS (UPDATE CUSTOMER SET C_BALANCE = %s WHERE C_ID = %s RETURNING 1) "
+        "INSERT INTO HISTORY VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        params,
+    )
+'''
+    assert statement_placeholder_sql(source) == []
+
+
+def test_statement_placeholder_ignores_values_list():
+    source = '''
+def doPayment(self, params):
+    self.cursor.execute(
+        "INSERT INTO HISTORY VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        params,
+    )
+'''
+    assert statement_placeholder_sql(source) == []

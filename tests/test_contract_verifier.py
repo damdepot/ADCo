@@ -1185,3 +1185,56 @@ def test_verify_accepts_qualified_values_alias():
         _static_check_contract("doDelivery"),
     )
     assert not any(v.code == "AMBIGUOUS_VALUES_ALIAS" for v in result.violations)
+
+
+PAYMENT_CTE_ORIGINAL = """
+class Payment:
+    def doPayment(self, params):
+        self.cursor.execute(
+            "UPDATE WAREHOUSE SET W_YTD = W_YTD + %s WHERE W_ID = %s",
+            [params["h_amount"], params["w_id"]],
+        )
+        return []
+"""
+
+PAYMENT_CTE_BROKEN = """
+class Payment:
+    def doPayment(self, params):
+        self.cursor.execute(
+            "WITH u1 AS (UPDATE WAREHOUSE SET W_YTD = W_YTD + %s WHERE W_ID = %s RETURNING 1), "
+            "u3 AS (%s RETURNING 1) INSERT INTO HISTORY VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            [params["h_amount"], params["w_id"], params["update_sql"],
+             params["c_id"], params["c_d_id"], params["c_w_id"], params["d_id"],
+             params["w_id"], params["h_date"], params["h_amount"], params["h_data"]],
+        )
+        return []
+"""
+
+
+def test_verify_reports_statement_as_parameter():
+    result = verify_contract(
+        PAYMENT_CTE_ORIGINAL,
+        PAYMENT_CTE_BROKEN,
+        _static_check_contract("doPayment"),
+    )
+    assert result.status == "FAIL"
+    stmt = [v for v in result.violations if v.code == "STATEMENT_AS_PARAMETER"]
+    assert len(stmt) == 1
+    assert stmt[0].severity == "ERROR"
+    assert "AS (%s RETURNING" in stmt[0].message
+
+
+def test_verify_accepts_inlined_cte_statement():
+    fixed = PAYMENT_CTE_BROKEN.replace(
+        "u3 AS (%s RETURNING 1)",
+        "u3 AS (UPDATE CUSTOMER SET C_BALANCE = %s WHERE C_ID = %s RETURNING 1)",
+    ).replace(
+        'params["update_sql"],',
+        'params["c_balance"], params["c_id"],',
+    )
+    result = verify_contract(
+        PAYMENT_CTE_ORIGINAL,
+        fixed,
+        _static_check_contract("doPayment"),
+    )
+    assert not any(v.code == "STATEMENT_AS_PARAMETER" for v in result.violations)
