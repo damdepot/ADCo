@@ -1133,3 +1133,55 @@ def test_verify_accepts_unchanged_returned_row_width():
         _static_check_contract("doOrderStatus"),
     )
     assert not any(v.code == "RETURNED_ROW_WIDTH_CHANGED" for v in result.violations)
+
+
+DELIVERY_ALIAS_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+            [params["carrier"], params["no_o_id"], params["d_id"], params["w_id"]],
+        )
+        return []
+"""
+
+DELIVERY_ALIAS_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        keys = params["keys"]
+        groups = ",".join(["(%s, %s, %s, %s)"] * len(keys))
+        flat = [val for tup in keys for val in tup]
+        self.cursor.execute(
+            f"UPDATE ORDERS SET O_CARRIER_ID = v.carrier_id "
+            f"FROM (VALUES {groups}) AS v(carrier_id, o_id, d_id, w_id) "
+            f"WHERE O_ID = v.o_id AND O_D_ID = v.d_id AND O_W_ID = v.w_id",
+            flat,
+        )
+        return []
+"""
+
+
+def test_verify_reports_ambiguous_values_alias():
+    result = verify_contract(
+        DELIVERY_ALIAS_ORIGINAL,
+        DELIVERY_ALIAS_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    alias = [v for v in result.violations if v.code == "AMBIGUOUS_VALUES_ALIAS"]
+    assert len(alias) == 1
+    assert alias[0].severity == "ERROR"
+    assert "o_id" in alias[0].message
+    assert "ambiguous" in alias[0].message
+
+
+def test_verify_accepts_qualified_values_alias():
+    fixed = DELIVERY_ALIAS_BROKEN.replace("WHERE O_ID =", "WHERE ORDERS.O_ID =").replace(
+        "AND O_D_ID =", "AND ORDERS.O_D_ID ="
+    ).replace("AND O_W_ID =", "AND ORDERS.O_W_ID =")
+    result = verify_contract(
+        DELIVERY_ALIAS_ORIGINAL,
+        fixed,
+        _static_check_contract("doDelivery"),
+    )
+    assert not any(v.code == "AMBIGUOUS_VALUES_ALIAS" for v in result.violations)

@@ -1496,6 +1496,71 @@ def returned_row_widths_sql(source: str) -> Dict[str, Dict[str, List[int]]]:
     return result
 
 
+def ambiguous_values_alias_sql(source: str) -> List[dict]:
+    """``VALUES`` alias columns colliding with unqualified target columns.
+
+    Catches ``UPDATE ORDERS ... FROM (VALUES ...) AS v(carrier_id, o_id, ...)
+    WHERE O_ID = v.o_id``: ``o_id`` and ``O_ID`` are the same unqualified name,
+    so PostgreSQL raises ``column reference "o_id" is ambiguous`` for every
+    row. Qualifying the target column (``ORDERS.O_ID``) or renaming the alias
+    column avoids the collision.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:  # pragma: no cover - declared dependency
+        return []
+
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        for sql, line in analyzer.execute_sqls:
+            normalized = sql.replace("%s", "0").replace("%%", "%")
+            try:
+                tree = sqlglot.parse_one(normalized, read="postgres")
+            except Exception:
+                continue
+            if tree is None:
+                continue
+            # SET targets are not column references; only expressions can be
+            # ambiguous against a FROM alias.
+            set_targets = {
+                id(assignment.this)
+                for assignment in getattr(tree, "expressions", [])
+                if isinstance(assignment, exp.EQ) and isinstance(assignment.this, exp.Column)
+            }
+            unqualified = {
+                col.name.lower()
+                for col in tree.find_all(exp.Column)
+                if col.name and not col.table and id(col) not in set_targets
+            }
+            if not unqualified:
+                continue
+            for values in tree.find_all(exp.Values):
+                alias_columns = values.alias_column_names
+                if not alias_columns and values.parent is not None:
+                    alias_columns = values.parent.alias_column_names
+                if not alias_columns:
+                    continue
+                clashes = sorted(
+                    {col.lower() for col in alias_columns} & unqualified
+                )
+                if not clashes:
+                    continue
+                key = (name, line, tuple(clashes))
+                if key in seen:
+                    continue
+                seen.add(key)
+                violations.append(
+                    {
+                        "function": name,
+                        "line": line,
+                        "columns": clashes,
+                    }
+                )
+    return violations
+
+
 def table_column_prefix_mismatch_sql(source: str) -> List[dict]:
     """Single-table SQL whose column prefix is a truncated table prefix.
 

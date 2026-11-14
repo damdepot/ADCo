@@ -4,6 +4,7 @@ import pytest
 
 from src.code_rewriter.tools.sql_analysis import (
     composite_any_array_sql,
+    ambiguous_values_alias_sql,
     composite_tuple_order_sql,
     returned_row_widths_sql,
     table_column_prefix_mismatch_sql,
@@ -876,3 +877,54 @@ class D:
 '''
     widths = returned_row_widths_sql(source)["D.doPayment"]
     assert widths == {"warehouse": [6], "district": [6]}
+
+
+def test_ambiguous_values_alias_flags_unqualified_target_column():
+    source = '''
+def doDelivery(self, params):
+    keys = params["keys"]
+    groups = ",".join(["(%s, %s, %s, %s)"] * len(keys))
+    flat = [val for tup in keys for val in tup]
+    self.cursor.execute(
+        f"UPDATE ORDERS SET O_CARRIER_ID = v.carrier_id "
+        f"FROM (VALUES {groups}) AS v(carrier_id, o_id, d_id, w_id) "
+        f"WHERE O_ID = v.o_id AND O_D_ID = v.d_id AND O_W_ID = v.w_id",
+        flat,
+    )
+'''
+    violations = ambiguous_values_alias_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["function"] == "doDelivery"
+    assert violations[0]["columns"] == ["o_id"]
+
+
+def test_ambiguous_values_alias_accepts_qualified_target_columns():
+    source = '''
+def doDelivery(self, params):
+    keys = params["keys"]
+    groups = ",".join(["(%s, %s, %s, %s)"] * len(keys))
+    flat = [val for tup in keys for val in tup]
+    self.cursor.execute(
+        f"UPDATE ORDERS SET O_CARRIER_ID = v.carrier_id "
+        f"FROM (VALUES {groups}) AS v(carrier_id, o_id, d_id, w_id) "
+        f"WHERE ORDERS.O_ID = v.o_id AND ORDERS.O_D_ID = v.d_id AND ORDERS.O_W_ID = v.w_id",
+        flat,
+    )
+'''
+    assert ambiguous_values_alias_sql(source) == []
+
+
+def test_ambiguous_values_alias_ignores_non_colliding_alias():
+    source = '''
+def doDelivery(self, params):
+    keys = params["keys"]
+    groups = ",".join(["(%s, %s, %s, %s)"] * len(keys))
+    flat = [val for tup in keys for val in tup]
+    self.cursor.execute(
+        f"UPDATE ORDER_LINE SET OL_DELIVERY_D = v.del_d "
+        f"FROM (VALUES {groups}) AS v(del_d, o_id, d_id, w_id) "
+        f"WHERE OL_O_ID = v.o_id AND OL_D_ID = v.d_id AND OL_W_ID = v.w_id",
+        flat,
+    )
+'''
+    assert ambiguous_values_alias_sql(source) == []

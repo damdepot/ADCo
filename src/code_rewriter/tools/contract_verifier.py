@@ -30,6 +30,7 @@ from .sql_analysis import (
     values_alias_arity_sql,
     composite_tuple_order_sql,
     table_column_prefix_mismatch_sql,
+    ambiguous_values_alias_sql,
     returned_row_widths_sql,
     duplicate_column_predicate_sql,
     fragile_composite_agg_sql,
@@ -861,6 +862,23 @@ def verify_contract(
                 f"prefix. {site['column']} looks like a truncated {site['expected_prefix']}_ "
                 "column and does not exist, so PostgreSQL raises UndefinedColumn for every "
                 "row. Use the table's full column name."
+            ),
+        ))
+
+    for site in _new_sites(
+        ambiguous_values_alias_sql,
+        lambda v: (v["function"], v["line"], tuple(v["columns"])),
+    ):
+        violations.append(VerificationViolation(
+            code="AMBIGUOUS_VALUES_ALIAS",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} references unqualified column(s) "
+                f"{', '.join(site['columns'])} while a VALUES alias declares the same "
+                "name(s). In PostgreSQL the unqualified reference matches both the target "
+                "table and the alias, so the statement raises 'column reference ... is "
+                "ambiguous' for every row. Qualify the target columns (e.g. ORDERS.O_ID) "
+                "or rename the VALUES alias columns."
             ),
         ))
 
