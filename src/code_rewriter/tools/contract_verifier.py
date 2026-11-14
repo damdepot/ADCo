@@ -27,6 +27,7 @@ from .sql_analysis import (
     unknown_query_key_sql,
     placeholder_param_mismatch_sql,
     dynamic_placeholder_arity_sql,
+    values_alias_arity_sql,
     duplicate_column_predicate_sql,
     fragile_composite_agg_sql,
     composite_any_array_sql,
@@ -806,6 +807,23 @@ def verify_contract(
                 "Hoist the scalar placeholder out of the per-row parameter list so it is "
                 "passed once, or use execute_batch. Fix the counts so they match for every "
                 "batch size, not just n=1."
+            ),
+        ))
+
+    for site in _new_sites(
+        values_alias_arity_sql,
+        lambda v: (v["function"], v["line"]),
+    ):
+        violations.append(VerificationViolation(
+            code="VALUES_ALIAS_ARITY",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} builds a VALUES row with {site['row_width']} "
+                f"expression(s) but the alias declares {site['alias_columns']} column(s) "
+                f"({site['sql_shape']}). Postgres rejects the statement for every input "
+                "(\"table has N columns available but M columns specified\"), so the "
+                "transaction fails at runtime. Make the row width match the alias column "
+                "list, or write one row per tuple."
             ),
         ))
 

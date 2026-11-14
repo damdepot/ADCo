@@ -17,6 +17,7 @@ from src.code_rewriter.tools.sql_analysis import (
     planner_unfriendly_sql,
     row_index_violations,
     unknown_query_key_sql,
+    values_alias_arity_sql,
 )
 
 STOCK_SELECT_6 = (
@@ -636,3 +637,74 @@ def test_dynamic_placeholder_arity_real_artifacts_clean(name):
         pytest.skip(f"{path} not present")
     assert dynamic_placeholder_arity_sql(path.read_text()) == []
 
+
+
+# The shipped DELIVERY regression: 3 placeholders per row, 4 alias columns.
+DELIVERY_VALUES_REPRO = '''
+def doDelivery(self, params):
+    customer_keys = params["customer_keys"]
+    flat_cust_params = []
+    for c_id, d_id in customer_keys:
+        flat_cust_params.append(1.0)
+    cust_placeholders = ",".join(["(%s, %s, %s)"] * len(customer_keys))
+    for ck in customer_keys:
+        flat_cust_params.extend(ck)
+    update_cust_sql = (
+        "UPDATE CUSTOMER AS c SET C_BALANCE = C_BALANCE + v.ol_total "
+        "FROM (VALUES " + cust_placeholders + ") AS v(c_id, c_d_id, c_w_id, ol_total) "
+        "WHERE c.C_ID = v.c_id"
+    )
+    self.cursor.execute(update_cust_sql, flat_cust_params)
+'''
+
+
+def test_values_alias_arity_flags_delivery_customer_update():
+    violations = values_alias_arity_sql(DELIVERY_VALUES_REPRO)
+    assert len(violations) == 1
+    assert violations[0]["function"] == "doDelivery"
+    assert violations[0]["row_width"] == 3
+    assert violations[0]["alias_columns"] == 4
+
+
+def test_values_alias_arity_accepts_matching_row_width():
+    source = '''
+def doDelivery(self, params):
+    keys = params["keys"]
+    placeholders = ",".join(["(%s, %s, %s)"] * len(keys))
+    update_sql = f"UPDATE t AS x SET v = s.v FROM (VALUES {placeholders}) AS s(a, b, c, v)"
+    self.cursor.execute(update_sql, [])
+'''
+    # Alias has 4 columns but the row carries 3 -> still a mismatch; use a
+    # literal 4-wide pattern for the positive control.
+    assert len(values_alias_arity_sql(source)) == 1
+    source = source.replace('["(%s, %s, %s)"]', '["(%s, %s, %s, %s)"]')
+    assert values_alias_arity_sql(source) == []
+
+
+def test_values_alias_arity_ignores_in_clause():
+    source = '''
+def doDelivery(self, params):
+    keys = params["keys"]
+    placeholders = ",".join(["(%s, %s, %s)"] * len(keys))
+    self.cursor.execute(
+        f"UPDATE t SET c = %s WHERE (a, b, c) IN ({placeholders})", []
+    )
+'''
+    assert values_alias_arity_sql(source) == []
+
+
+# ponytail: artifact smoke test only; skipped when out/ is absent (e.g. CI).
+def test_values_alias_arity_real_delivery_defect():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "out"
+        / "tpcc_p0p1"
+        / "drivers"
+        / "postgresdriver.py"
+    )
+    if not path.exists():
+        pytest.skip(f"{path} not present")
+    violations = values_alias_arity_sql(path.read_text())
+    assert len(violations) == 1
+    assert violations[0]["function"] == "PostgresDriver.doDelivery"
+    assert (violations[0]["row_width"], violations[0]["alias_columns"]) == (3, 4)

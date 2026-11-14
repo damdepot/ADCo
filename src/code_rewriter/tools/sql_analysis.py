@@ -1113,6 +1113,98 @@ def dynamic_placeholder_arity_sql(source: str) -> List[dict]:
     return violations
 
 
+_VALUES_TAIL_RE = re.compile(r"\bVALUES\s*$", re.I)
+_VALUES_ALIAS_RE = re.compile(r"^\s*\)\s*AS\s+[\w\".]+\s*\(([^)]*)\)", re.I | re.S)
+
+
+def _fstring_parts(
+    node: Optional[ast.AST], sql_vars: Dict[str, ast.AST], depth: int = 0
+) -> Optional[List[tuple]]:
+    """Flatten a SQL expression into ``("text", str)`` / ``("expr", node)`` parts."""
+    if node is None or depth > 8:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [("text", node.value)]
+    if isinstance(node, ast.JoinedStr):
+        parts: List[tuple] = []
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                parts.append(("text", part.value))
+            elif isinstance(part, ast.FormattedValue):
+                parts.append(("expr", part.value))
+            else:
+                return None
+        return parts
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _fstring_parts(node.left, sql_vars, depth + 1)
+        right = _fstring_parts(node.right, sql_vars, depth + 1)
+        if left is None or right is None:
+            return None
+        return left + right
+    if isinstance(node, ast.Name):
+        stored = sql_vars.get(node.id)
+        return None if stored is None else _fstring_parts(stored, sql_vars, depth + 1)
+    return [("expr", node)]
+
+
+def values_alias_arity_sql(source: str) -> List[dict]:
+    """``VALUES`` rows whose width disagrees with the derived-table column list.
+
+    Catches the batched-write shape::
+
+        f"... FROM (VALUES {rows}) AS v(c_id, c_d_id, c_w_id, ol_total) ..."
+
+    where ``rows`` expands to ``(%s, %s, %s)`` per row. Postgres rejects this
+    for every input ("table has 3 columns available but 4 columns specified"),
+    so the transaction fails deterministically at runtime.
+    """
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        for _sql, line, sql_node, _params, method in analyzer.execute_calls:
+            if method != "execute":
+                continue
+            parts = _fstring_parts(sql_node, analyzer.sql_ast_vars)
+            if not parts:
+                continue
+            for i, (kind, value) in enumerate(parts):
+                if kind != "expr":
+                    continue
+                prev = parts[i - 1][1] if i and parts[i - 1][0] == "text" else ""
+                nxt = parts[i + 1][1] if i + 1 < len(parts) and parts[i + 1][0] == "text" else ""
+                if not _VALUES_TAIL_RE.search(prev):
+                    continue
+                match = _VALUES_ALIAS_RE.match(nxt)
+                if match is None:
+                    continue
+                columns = [col for col in match.group(1).split(",") if col.strip()]
+                if not columns:
+                    continue
+                affine = _sql_affine(value, analyzer.sql_ast_vars)
+                if affine is None or affine.const or len(affine.syms) != 1:
+                    continue
+                width = next(iter(affine.syms.values()))
+                if width == len(columns):
+                    continue
+                key = (name, line)
+                if key in seen:
+                    continue
+                seen.add(key)
+                shape = " ".join(nxt.split())
+                if len(shape) > 160:
+                    shape = shape[:157] + "..."
+                violations.append(
+                    {
+                        "function": name,
+                        "line": line,
+                        "sql_shape": shape,
+                        "row_width": width,
+                        "alias_columns": len(columns),
+                    }
+                )
+    return violations
+
+
 def _normalize_column(col: str) -> str:
     return col.split(".")[-1].strip('"`').lower()
 

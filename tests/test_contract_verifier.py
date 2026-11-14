@@ -926,3 +926,57 @@ def test_verify_dedupes_preexisting_dynamic_placeholder_arity():
     assert not any(v.code == "DYNAMIC_PLACEHOLDER_ARITY" for v in result.violations)
 
 
+
+
+DELIVERY_VALUES_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        for c_id, d_id in params["customer_keys"]:
+            self.cursor.execute(
+                "UPDATE CUSTOMER SET C_BALANCE = C_BALANCE + %s "
+                "WHERE C_ID = %s AND C_D_ID = %s AND C_W_ID = %s",
+                [1.0, c_id, d_id, params["w_id"]],
+            )
+        return []
+"""
+
+DELIVERY_VALUES_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        keys = params["customer_keys"]
+        placeholders = ",".join(["(%s, %s, %s)"] * len(keys))
+        sql = (
+            "UPDATE CUSTOMER AS c SET C_BALANCE = C_BALANCE + v.ol_total "
+            "FROM (VALUES " + placeholders + ") AS v(c_id, c_d_id, c_w_id, ol_total) "
+            "WHERE c.C_ID = v.c_id"
+        )
+        self.cursor.execute(sql, [])
+        return []
+"""
+
+DELIVERY_VALUES_CORRECT = DELIVERY_VALUES_BROKEN.replace(
+    '["(%s, %s, %s)"]', '["(%s, %s, %s, %s)"]'
+)
+
+
+def test_verify_reports_values_alias_arity():
+    result = verify_contract(
+        DELIVERY_VALUES_ORIGINAL,
+        DELIVERY_VALUES_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    arity = [v for v in result.violations if v.code == "VALUES_ALIAS_ARITY"]
+    assert len(arity) == 1
+    assert arity[0].severity == "ERROR"
+    assert "3 expression(s)" in arity[0].message
+    assert "4 column(s)" in arity[0].message
+
+
+def test_verify_accepts_matching_values_alias_arity():
+    result = verify_contract(
+        DELIVERY_VALUES_ORIGINAL,
+        DELIVERY_VALUES_CORRECT,
+        _static_check_contract("doDelivery"),
+    )
+    assert not any(v.code == "VALUES_ALIAS_ARITY" for v in result.violations)
