@@ -506,3 +506,18 @@ def test_inactive_with_empty_history():
     assert ctx.state.get("excluded_knobs") == []
     assert ctx.state.get("required_phase") == ""
     assert ctx.state.get("max_knobs") == ""
+
+
+def test_prompt_constraints_change_phase_with_valid_phase():
+    ctx = _ctx()
+    _diagnose(ctx, "change_phase", ["refinement"])
+    assert ctx.state.get("required_phase") == "refinement"
+
+
+def test_prompt_constraints_change_phase_with_knob_name_ignored():
+    # A knob name in change_phase targets must never become required_phase:
+    # it would poison the candidate prompt and make the candidate agent emit
+    # an invalid phase (pydantic ValidationError killing the pipeline).
+    ctx = _ctx()
+    _diagnose(ctx, "change_phase", ["effective_cache_size"])
+    assert ctx.state.get("required_phase") == ""

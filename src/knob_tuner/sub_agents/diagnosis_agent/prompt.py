@@ -36,7 +36,7 @@ Decide FIRST whether the campaign should halt (correction `stop`, targets empty)
 - For every NEXT correction, `stop_reason` stays "futility" (it is only read on `stop`).
 - Otherwise NEXT: emit exactly one of shrink_set, change_phase, drop_knob, adjust_value, retry_same with the knob names it applies to (targets; empty list allowed only for retry_same):
   - shrink_set: the set was too broad to attribute; retry with fewer knobs.
-  - change_phase: the phase was wrong for this stage (e.g. screening when refinement was due).
+  - change_phase: the phase was wrong for this stage (e.g. screening when refinement was due). Targets MUST be exactly one phase name (screen, interaction, or refinement) — never a knob name; a knob name here breaks the next proposal.
   - drop_knob: one or more named knobs are hopeless or unsafe; exclude them next round.
   - adjust_value: named knobs moved in the wrong direction or with too large a step.
   - retry_same: the failure looks like noise/flake, not a design flaw; one retry is justified.

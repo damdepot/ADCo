@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.knob_tuner.contracts import VALID_EXPERIMENT_PHASES
 from src.knob_tuner.stages.evidence import build_evidence_bundle
 from src.knob_tuner.stages.models import (
     CorrectionType,
@@ -113,7 +114,12 @@ def _sync_prompt_constraints(state: Any) -> None:
         else:
             state["excluded_knobs"] = []
         if correction == "change_phase" and targets:
-            state["required_phase"] = str(targets[0]).strip().lower()
+            # Targets for change_phase must name a phase, not a knob: a knob
+            # name here would poison required_phase and make the candidate
+            # agent emit an invalid phase (pydantic ValidationError that kills
+            # the pipeline). Ignore invalid values instead of propagating.
+            want = str(targets[0]).strip().lower()
+            state["required_phase"] = want if want in VALID_EXPERIMENT_PHASES else ""
         else:
             state["required_phase"] = ""
         if correction == "shrink_set":
