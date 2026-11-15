@@ -40,6 +40,7 @@ from .sql_analysis import (
     wrong_table_column_sql,
     insert_column_values_arity_sql,
     unknown_values_column_sql,
+    group_by_consistency_sql,
     returned_select_modifiers_sql,
     table_column_prefix_mismatch_sql,
     ambiguous_values_alias_sql,
@@ -1102,6 +1103,21 @@ def verify_contract(
                 "PostgreSQL raises 'column does not exist' for every row. Add the "
                 "column to the alias list (and to every VALUES row), or reference a "
                 "declared alias column."
+            ),
+        ))
+
+    for site in _new_sites(
+        group_by_consistency_sql,
+        lambda v: (v["function"], v["line"], v["column"]),
+    ):
+        violations.append(VerificationViolation(
+            code="GROUP_BY_CONSISTENCY",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} selects bare column {site['column']} "
+                "while grouping by other columns. PostgreSQL raises 'column must "
+                "appear in the GROUP BY clause or be used in an aggregate function' "
+                "for every execution. Add the column to GROUP BY (or aggregate it)."
             ),
         ))
 

@@ -1726,3 +1726,37 @@ def test_verify_reports_hoisted_scalar_values_mismatch():
     assert len(unknown) == 1
     assert unknown[0].severity == "ERROR"
     assert "ol_delivery_d" in unknown[0].message
+
+
+DELIVERY_GROUP_BY_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "SELECT OL_O_ID, OL_D_ID, SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_W_ID = %s GROUP BY OL_O_ID, OL_D_ID",
+            [params["w_id"]],
+        )
+        return []
+"""
+
+DELIVERY_GROUP_BY_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "SELECT OL_D_ID, SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_W_ID = %s GROUP BY OL_O_ID",
+            [params["w_id"]],
+        )
+        return []
+"""
+
+
+def test_verify_reports_group_by_consistency():
+    result = verify_contract(
+        DELIVERY_GROUP_BY_ORIGINAL,
+        DELIVERY_GROUP_BY_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    consistency = [v for v in result.violations if v.code == "GROUP_BY_CONSISTENCY"]
+    assert len(consistency) == 1
+    assert consistency[0].severity == "ERROR"
+    assert "OL_D_ID" in consistency[0].message

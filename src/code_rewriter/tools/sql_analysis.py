@@ -2929,6 +2929,76 @@ def narrow_key_pick_sql(source: str) -> List[dict]:
     return violations
 
 
+def group_by_consistency_sql(source: str) -> List[dict]:
+    """Bare SELECT columns missing from the GROUP BY clause.
+
+    Catches ``SELECT OL_D_ID, SUM(OL_AMOUNT) ... GROUP BY OL_O_ID``: every
+    non-aggregated selected column must appear in GROUP BY, so PostgreSQL
+    raises ``column must appear in the GROUP BY clause`` for every execution.
+    Star projections and statements without GROUP BY are skipped.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:  # pragma: no cover - declared dependency
+        return []
+
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        for sql_node, line in _iter_call_sql_nodes(analyzer):
+            template = _resolve_sql(analyzer, sql_node)
+            if not isinstance(template, str):
+                continue
+            if "*" in template.split("FROM", 1)[0]:
+                continue
+            normalized = template.replace("%s", "0").replace("%%", "%")
+            try:
+                tree = sqlglot.parse_one(normalized, read="postgres")
+            except Exception:
+                continue
+            if tree is None:
+                continue
+            for select in tree.find_all(exp.Select):
+                group = select.args.get("group")
+                if group is None:
+                    continue
+                grouped = {
+                    col.name.lower()
+                    for col in group.find_all(exp.Column)
+                    if col.name
+                }
+                for proj in select.expressions:
+                    if isinstance(proj, exp.Star):
+                        break
+                    # Bare columns are those with no aggregate-function
+                    # ancestor within this projection.
+                    for col in proj.find_all(exp.Column):
+                        node = col
+                        under_agg = False
+                        while node is not None and node is not proj:
+                            node = node.parent
+                            if isinstance(node, exp.AggFunc):
+                                under_agg = True
+                                break
+                        if under_agg:
+                            continue
+                        if not col.name or col.name.lower() in grouped:
+                            continue
+                        key = (name, line, col.name.lower())
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        violations.append(
+                            {
+                                "function": name,
+                                "line": line,
+                                "column": col.name,
+                            }
+                        )
+    return violations
+
+
 def unknown_values_column_sql(source: str) -> List[dict]:
     """Qualified ``v.col`` references missing from the VALUES alias column list.
 

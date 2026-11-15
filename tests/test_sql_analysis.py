@@ -14,6 +14,7 @@ from src.code_rewriter.tools.sql_analysis import (
     wrong_table_column_sql,
     insert_column_values_arity_sql,
     unknown_values_column_sql,
+    group_by_consistency_sql,
     returned_select_modifiers_sql,
     mogrify_with_params_sql,
     returned_row_widths_sql,
@@ -1457,3 +1458,33 @@ def doDelivery(self, params):
     )
 '''
     assert unknown_values_column_sql(source) == []
+
+
+def test_group_by_consistency_flags_bare_column():
+    source = '''
+def doDelivery(self, params):
+    self.cursor.execute(
+        "SELECT OL_D_ID, SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_W_ID = %s GROUP BY OL_O_ID",
+        params["p"],
+    )
+'''
+    violations = group_by_consistency_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["column"] == "OL_D_ID"
+
+
+def test_group_by_consistency_accepts_full_grouping():
+    source = '''
+def doDelivery(self, params):
+    self.cursor.execute(
+        "SELECT OL_O_ID, OL_D_ID, SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_W_ID = %s GROUP BY OL_O_ID, OL_D_ID",
+        params["p"],
+    )
+    self.cursor.execute(
+        "SELECT NO_D_ID, MIN(NO_O_ID) FROM NEW_ORDER WHERE NO_W_ID = %s GROUP BY NO_D_ID",
+        params["p"],
+    )
+    self.cursor.execute("SELECT COUNT(*) FROM NEW_ORDER WHERE NO_W_ID = %s", params["p"])
+    self.cursor.execute("SELECT O_ID, O_C_ID FROM ORDERS WHERE O_W_ID = %s", params["p"])
+'''
+    assert group_by_consistency_sql(source) == []
