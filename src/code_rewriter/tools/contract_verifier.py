@@ -1046,6 +1046,25 @@ def verify_contract(
                         expected=original_mods,
                         actual=mods,
                     ))
+            if (
+                True not in original_mods.get("join", [])
+                and True in mods.get("join", [])
+                and True in mods.get("limit", [])
+            ):
+                violations.append(VerificationViolation(
+                    code="RETURN_JOIN_LIMIT_COLLAPSE",
+                    severity="ERROR",
+                    message=(
+                        f"Function {fn_name} returns '{variable}' from a JOIN query with a "
+                        "top-level LIMIT, but the original queried a single table. LIMIT "
+                        "applies to joined rows, so a 1:N join collapses to one joined row "
+                        "(e.g. one order line instead of all lines of the latest order). "
+                        "Move the LIMIT into a subquery/LATERAL that selects the single "
+                        "parent row first, then join the children without a top-level LIMIT."
+                    ),
+                    expected=original_mods,
+                    actual=mods,
+                ))
 
     original_row_widths = returned_row_widths_sql(original_source)
     optimized_row_widths = returned_row_widths_sql(optimized_source)

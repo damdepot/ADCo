@@ -1210,8 +1210,8 @@ class D:
         return [customer, order]
 '''
     mods = returned_select_modifiers_sql(source)["D.doOrderStatus"]
-    assert mods["order"] == {"order_by": [True], "limit": [True]}
-    assert mods["customer"] == {"order_by": [False], "limit": [False]}
+    assert mods["order"] == {"order_by": [True], "limit": [True], "join": [False]}
+    assert mods["customer"] == {"order_by": [False], "limit": [False], "join": [False]}
 
 
 def test_wrong_table_column_flags_orders_key_in_order_line():
@@ -1276,3 +1276,39 @@ def doNewOrder(self, params):
     )
 '''
     assert insert_column_values_arity_sql(source) == []
+
+
+def test_returned_modifiers_traces_comprehension_to_join():
+    source = '''
+class D:
+    def doOrderStatus(self, params):
+        self.cursor.execute(
+            "SELECT O_ID FROM ORDERS WHERE O_W_ID = %s ORDER BY O_ID DESC LIMIT 1",
+            params["p"],
+        )
+        rows = self.cursor.fetchall()
+        order = (rows[0][0], rows[0][1])
+        orderLines = [(r[2], r[3]) for r in rows]
+        return [order, orderLines]
+'''
+    mods = returned_select_modifiers_sql(source)["D.doOrderStatus"]
+    assert mods["orderLines"]["join"] == [False]
+    assert mods["orderLines"]["limit"] == [True]
+    assert mods["order"]["limit"] == [True]
+
+
+def test_return_modifiers_join_flag_on_explicit_join():
+    source = '''
+class D:
+    def f(self, params):
+        self.cursor.execute(
+            "SELECT O.O_ID, OL.OL_I_ID FROM ORDERS O "
+            "JOIN ORDER_LINE OL ON OL.OL_O_ID = O.O_ID "
+            "WHERE O.O_W_ID = %s ORDER BY O.O_ID DESC LIMIT 1",
+            params["p"],
+        )
+        rows = self.cursor.fetchall()
+        return [rows]
+'''
+    mods = returned_select_modifiers_sql(source)["D.f"]
+    assert mods["rows"] == {"order_by": [True], "limit": [True], "join": [True]}

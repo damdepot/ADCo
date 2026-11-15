@@ -1591,6 +1591,24 @@ def _width_from_fetch(
             else:
                 return None
         return sliced
+    if isinstance(value, (ast.Tuple, ast.List)):
+        # A constructed row has exactly one element per position. An empty
+        # literal is the no-rows fallback, not a row shape: skip it.
+        if not value.elts or any(isinstance(elt, ast.Starred) for elt in value.elts):
+            return None
+        return {len(value.elts)}
+    if isinstance(value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        if len(value.generators) != 1 or value.generators[0].ifs:
+            return None
+        gen = value.generators[0]
+        iter_widths = _width_from_fetch(gen.iter, bindings, executes, lineno)
+        if not iter_widths:
+            return None
+        inner = dict(bindings)
+        targets = [n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+        for target in targets:
+            inner[target] = set(iter_widths)
+        return _width_from_fetch(value.elt, inner, executes, lineno)
     return None
 
 
@@ -1689,32 +1707,78 @@ def _producer_sqls(value: ast.AST, bindings: Dict[str, set], executes: List[tupl
     if isinstance(value, ast.Name):
         sqls = bindings.get(value.id)
         return set(sqls) if sqls else None
-    if isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
-        sqls = bindings.get(value.value.id)
-        return set(sqls) if sqls else None
+    if isinstance(value, ast.Subscript):
+        # Indexing/slicing a fetched row does not change its producer query.
+        return _producer_sqls(value.value, bindings, executes, lineno)
+    if isinstance(value, ast.Starred):
+        return _producer_sqls(value.value, bindings, executes, lineno)
+    if isinstance(value, (ast.Tuple, ast.List)):
+        out: set = set()
+        for elt in value.elts:
+            sqls = _producer_sqls(elt, bindings, executes, lineno)
+            if sqls is None:
+                return None
+            out |= sqls
+        return out
+    if isinstance(value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        if len(value.generators) != 1 or value.generators[0].ifs:
+            return None
+        gen = value.generators[0]
+        iter_sqls = _producer_sqls(gen.iter, bindings, executes, lineno)
+        if not iter_sqls:
+            return None
+        inner = dict(bindings)
+        targets = [n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+        for target in targets:
+            inner[target] = set(iter_sqls)
+        return _producer_sqls(value.elt, inner, executes, lineno)
+    if isinstance(value, ast.DictComp):
+        if len(value.generators) != 1 or value.generators[0].ifs:
+            return None
+        gen = value.generators[0]
+        iter_sqls = _producer_sqls(gen.iter, bindings, executes, lineno)
+        if not iter_sqls:
+            return None
+        inner = dict(bindings)
+        targets = [n.id for n in ast.walk(gen.target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+        for target in targets:
+            inner[target] = set(iter_sqls)
+        key_sqls = _producer_sqls(value.key, inner, executes, lineno)
+        val_sqls = _producer_sqls(value.value, inner, executes, lineno)
+        if key_sqls is None or val_sqls is None:
+            return None
+        return key_sqls | val_sqls
     return None
 
 
 def _select_modifiers(sql: str) -> Optional[Dict[str, bool]]:
-    """Whether a SELECT has ORDER BY / LIMIT (top level only)."""
+    """Whether a SELECT has ORDER BY / LIMIT / JOIN (top level only)."""
     try:
         import sqlglot
         from sqlglot import exp
     except ImportError:
         return None
     if not isinstance(sql, str) or not sql.strip().upper().startswith("SELECT"):
-        return {"order_by": False, "limit": False}
+        return {"order_by": False, "limit": False, "join": False}
     normalized = sql.replace("%s", "0").replace("%%", "%")
     try:
         tree = sqlglot.parse_one(normalized, read="postgres")
     except Exception:
         upper = normalized.upper()
-        return {"order_by": "ORDER BY" in upper, "limit": "LIMIT" in upper}
+        return {
+            "order_by": "ORDER BY" in upper,
+            "limit": "LIMIT" in upper,
+            "join": "JOIN" in upper,
+        }
     if tree is None or not isinstance(tree, exp.Select):
-        return {"order_by": False, "limit": False}
+        return {"order_by": False, "limit": False, "join": False}
+    joins = tree.args.get("joins") or []
+    from_ = tree.args.get("from_")
+    comma_sources = len(from_.expressions) if from_ is not None and isinstance(from_, exp.From) else 1
     return {
         "order_by": tree.args.get("order") is not None,
         "limit": tree.args.get("limit") is not None,
+        "join": len(joins) > 0 or comma_sources > 1,
     }
 
 
@@ -1769,14 +1833,20 @@ def returned_select_modifiers_sql(source: str) -> Dict[str, Dict[str, Dict[str, 
                 continue
             order_flags: set = set()
             limit_flags: set = set()
+            join_flags: set = set()
             for sql in bindings[var]:
                 mods = _select_modifiers(sql)
                 if mods is None:
                     continue
                 order_flags.add(mods["order_by"])
                 limit_flags.add(mods["limit"])
-            if order_flags or limit_flags:
-                shapes[var] = {"order_by": sorted(order_flags), "limit": sorted(limit_flags)}
+                join_flags.add(mods["join"])
+            if order_flags or limit_flags or join_flags:
+                shapes[var] = {
+                    "order_by": sorted(order_flags),
+                    "limit": sorted(limit_flags),
+                    "join": sorted(join_flags),
+                }
         if shapes:
             result[name] = shapes
     return result

@@ -1553,3 +1553,70 @@ def test_verify_reports_wrong_table_column():
     assert len(wrong) == 2
     assert all(v.severity == "ERROR" for v in wrong)
     assert all("ORDER_LINE" in v.message for v in wrong)
+
+
+ORDER_JOIN_ORIGINAL = """
+class Status:
+    def doOrderStatus(self, params):
+        self.cursor.execute(
+            "SELECT O_ID, O_CARRIER_ID, O_ENTRY_D FROM ORDERS WHERE O_W_ID = %s ORDER BY O_ID DESC LIMIT 1",
+            [params["w"]],
+        )
+        order = self.cursor.fetchone()
+        if order:
+            self.cursor.execute(
+                "SELECT OL_SUPPLY_W_ID, OL_I_ID FROM ORDER_LINE WHERE OL_O_ID = %s",
+                [order[0]],
+            )
+            orderLines = self.cursor.fetchall()
+        else:
+            orderLines = []
+        return [order, orderLines]
+"""
+
+ORDER_JOIN_COLLAPSED = """
+class Status:
+    def doOrderStatus(self, params):
+        self.cursor.execute(
+            "SELECT O.O_ID, O.O_CARRIER_ID, OL.OL_I_ID FROM ORDERS O "
+            "JOIN ORDER_LINE OL ON OL.OL_O_ID = O.O_ID "
+            "WHERE O.O_W_ID = %s ORDER BY O.O_ID DESC LIMIT 1",
+            [params["w"]],
+        )
+        rows = self.cursor.fetchall()
+        if rows:
+            order = (rows[0][0], rows[0][1])
+            orderLines = [(r[2],) for r in rows]
+        else:
+            order = None
+            orderLines = []
+        return [order, orderLines]
+"""
+
+
+def test_verify_reports_join_limit_collapse():
+    result = verify_contract(
+        ORDER_JOIN_ORIGINAL,
+        ORDER_JOIN_COLLAPSED,
+        _static_check_contract("doOrderStatus"),
+    )
+    assert result.status == "FAIL"
+    collapse = [v for v in result.violations if v.code == "RETURN_JOIN_LIMIT_COLLAPSE"]
+    assert len(collapse) == 2
+    assert all(v.severity == "ERROR" for v in collapse)
+
+
+def test_verify_accepts_lateral_join_without_top_limit():
+    lateral = ORDER_JOIN_COLLAPSED.replace(
+        '"JOIN ORDER_LINE OL ON OL.OL_O_ID = O.O_ID "',
+        '"LEFT JOIN LATERAL (SELECT OL_I_ID FROM ORDER_LINE WHERE OL_O_ID = O.O_ID) OL ON TRUE "',
+    ).replace(
+        '"WHERE O.O_W_ID = %s ORDER BY O.O_ID DESC LIMIT 1"',
+        '"WHERE O.O_W_ID = %s ORDER BY O.O_ID DESC"',
+    )
+    result = verify_contract(
+        ORDER_JOIN_ORIGINAL,
+        lateral,
+        _static_check_contract("doOrderStatus"),
+    )
+    assert not any(v.code == "RETURN_JOIN_LIMIT_COLLAPSE" for v in result.violations)
