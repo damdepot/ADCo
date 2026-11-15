@@ -39,6 +39,7 @@ from .sql_analysis import (
     aggregate_queries_sql,
     wrong_table_column_sql,
     insert_column_values_arity_sql,
+    unknown_values_column_sql,
     returned_select_modifiers_sql,
     table_column_prefix_mismatch_sql,
     ambiguous_values_alias_sql,
@@ -1085,6 +1086,22 @@ def verify_contract(
                 f"with {site['columns']} column(s) but {site['values']} value(s) per row. "
                 "The column count and the VALUES width disagree, so the statement fails "
                 "for every row. Make the VALUES row match the column list."
+            ),
+        ))
+
+    for site in _new_sites(
+        unknown_values_column_sql,
+        lambda v: (v["function"], v["line"], v["alias"], v["column"]),
+    ):
+        violations.append(VerificationViolation(
+            code="UNKNOWN_VALUES_COLUMN",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} references {site['alias']}.{site['column']} "
+                f"but the VALUES alias {site['alias']} declares no such column. "
+                "PostgreSQL raises 'column does not exist' for every row. Add the "
+                "column to the alias list (and to every VALUES row), or reference a "
+                "declared alias column."
             ),
         ))
 

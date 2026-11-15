@@ -928,15 +928,26 @@ def _assigned_list_affine(value: ast.AST) -> Optional[_Affine]:
     arity = _literal_arity(value)
     if arity is not None:
         return _Affine(arity)
-    if isinstance(value, ast.ListComp) and len(value.generators) == 1:
-        generator = value.generators[0]
-        if generator.ifs:
-            return None
-        arity = _literal_arity(value.elt)
-        symbols = _iter_symbols(generator.iter)
-        if arity is None or not symbols:
-            return None
-        return _Affine(0, {symbols: arity})
+    if isinstance(value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        if len(value.generators) == 1:
+            generator = value.generators[0]
+            if generator.ifs:
+                return None
+            arity = _literal_arity(value.elt)
+            symbols = _iter_symbols(generator.iter)
+            if arity is None or not symbols:
+                return None
+            return _Affine(0, {symbols: arity})
+        if len(value.generators) == 2:
+            # Flatten: [x for t in TS for x in (a, b, c)] is 3*len(TS).
+            first, second = value.generators
+            if first.ifs or second.ifs:
+                return None
+            width = _literal_arity(second.iter)
+            symbols = _iter_symbols(first.iter)
+            if width is None or not symbols:
+                return None
+            return _Affine(0, {symbols: width})
     return None
 
 
@@ -1024,6 +1035,15 @@ def _params_affine(
     if isinstance(node, (ast.List, ast.Tuple)):
         arity = _literal_arity(node)
         return None if arity is None else _Affine(arity)
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        return _assigned_list_affine(node)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        # [scalar] + flat_params: hoisted scalars plus a batched list.
+        left = _params_affine(node.left, counts)
+        right = _params_affine(node.right, counts)
+        if left is None or right is None:
+            return None
+        return _affine_add(left, right)
     if isinstance(node, ast.Name):
         return counts.get(node.id)
     return None
@@ -2906,6 +2926,68 @@ def narrow_key_pick_sql(source: str) -> List[dict]:
                     "sqls": sorted(pick["sqls"]),
                 }
             )
+    return violations
+
+
+def unknown_values_column_sql(source: str) -> List[dict]:
+    """Qualified ``v.col`` references missing from the VALUES alias column list.
+
+    Catches ``... FROM (VALUES ...) AS v(no_o_id, d_id, w_id) ... SET x =
+    v.ol_delivery_d``: the alias declares no such column, so PostgreSQL
+    raises ``column v.ol_delivery_d does not exist`` for every row. Table
+    aliases and unqualified columns are ignored.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:  # pragma: no cover - declared dependency
+        return []
+
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        for sql_node, line in _iter_call_sql_nodes(analyzer):
+            template = _resolve_sql(analyzer, sql_node)
+            if not isinstance(template, str):
+                continue
+            normalized = template.replace("%s", "0").replace("%%", "%")
+            try:
+                tree = sqlglot.parse_one(normalized, read="postgres")
+            except Exception:
+                continue
+            if tree is None:
+                continue
+            aliases: Dict[str, set] = {}
+            for values in tree.find_all(exp.Values):
+                cols = values.alias_column_names
+                if not cols:
+                    continue
+                try:
+                    alias = str(values.alias or "").lower()
+                except Exception:
+                    continue
+                if alias:
+                    aliases.setdefault(alias, set()).update(c.lower() for c in cols)
+            if not aliases:
+                continue
+            for col in tree.find_all(exp.Column):
+                if not col.name or not col.table:
+                    continue
+                known = aliases.get(col.table.lower())
+                if known is None or col.name.lower() in known:
+                    continue
+                key = (name, line, col.table.lower(), col.name.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                violations.append(
+                    {
+                        "function": name,
+                        "line": line,
+                        "alias": col.table,
+                        "column": col.name,
+                    }
+                )
     return violations
 
 

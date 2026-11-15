@@ -1685,3 +1685,44 @@ class Delivery:
     agg = [v for v in result.violations if v.code == "AGGREGATE_REDUCTION_DROPPED"]
     assert len(agg) == 1
     assert agg[0].severity == "ERROR"
+
+
+DELIVERY_VALUES_UPDATE_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "UPDATE ORDER_LINE SET OL_DELIVERY_D = %s WHERE OL_O_ID = %s AND OL_D_ID = %s AND OL_W_ID = %s",
+            [params["del_d"], params["no_o_id"], params["d_id"], params["w_id"]],
+        )
+        return []
+"""
+
+DELIVERY_VALUES_UPDATE_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        active = params["active"]
+        groups = ",".join(["(%s, %s, %s)"] * len(active))
+        self.cursor.execute(
+            f"UPDATE ORDER_LINE AS ol SET OL_DELIVERY_D = v.ol_delivery_d "
+            f"FROM (VALUES {groups}) AS v(no_o_id, d_id, w_id) "
+            f"WHERE ol.OL_O_ID = v.no_o_id AND ol.OL_D_ID = v.d_id AND ol.OL_W_ID = v.w_id",
+            [params["ol_delivery_d"]] + [v for d_id, no_o_id in active for v in (no_o_id, d_id, params["w"])],
+        )
+        return []
+"""
+
+
+def test_verify_reports_hoisted_scalar_values_mismatch():
+    result = verify_contract(
+        DELIVERY_VALUES_UPDATE_ORIGINAL,
+        DELIVERY_VALUES_UPDATE_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    arity = [v for v in result.violations if v.code == "DYNAMIC_PLACEHOLDER_ARITY"]
+    assert len(arity) == 1
+    assert arity[0].severity == "ERROR"
+    unknown = [v for v in result.violations if v.code == "UNKNOWN_VALUES_COLUMN"]
+    assert len(unknown) == 1
+    assert unknown[0].severity == "ERROR"
+    assert "ol_delivery_d" in unknown[0].message

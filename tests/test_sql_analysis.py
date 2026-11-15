@@ -13,6 +13,7 @@ from src.code_rewriter.tools.sql_analysis import (
     orig_identity_sql,
     wrong_table_column_sql,
     insert_column_values_arity_sql,
+    unknown_values_column_sql,
     returned_select_modifiers_sql,
     mogrify_with_params_sql,
     returned_row_widths_sql,
@@ -1393,3 +1394,66 @@ class D:
     identity = orig_identity_sql(source)
     assert identity["ORDERS"] == {"O_ID", "O_D_ID", "O_W_ID"}
     assert "NO_O_ID" not in identity.get("NEW_ORDER", set())
+
+
+def test_dynamic_placeholder_arity_flags_hoisted_scalar_with_values_rows():
+    source = '''
+def doDelivery(self, params):
+    active = params["active"]
+    groups = ",".join(["(%s, %s, %s)"] * len(active))
+    self.cursor.execute(
+        f"UPDATE ORDER_LINE AS ol SET OL_DELIVERY_D = v.del_d "
+        f"FROM (VALUES {groups}) AS v(no_o_id, d_id, w_id) "
+        f"WHERE ol.OL_O_ID = v.no_o_id",
+        [params["del_d"]] + [val for d_id, no_o_id in active for val in (no_o_id, d_id, params["w"])],
+    )
+'''
+    violations = dynamic_placeholder_arity_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["placeholders"] == "3*len(active)"
+    assert violations[0]["params"] == "1 + 3*len(active)"
+
+
+def test_dynamic_placeholder_arity_accepts_scalar_inside_values_rows():
+    source = '''
+def doDelivery(self, params):
+    active = params["active"]
+    groups = ",".join(["(%s, %s, %s, %s)"] * len(active))
+    flat = [val for t in params["rows"] for val in t]
+    self.cursor.execute(
+        f"UPDATE ORDERS SET O_CARRIER_ID = v.c FROM (VALUES {groups}) AS v(c, o, d, w)",
+        flat,
+    )
+'''
+    assert dynamic_placeholder_arity_sql(source) == []
+
+
+def test_unknown_values_column_flags_missing_alias_column():
+    source = '''
+def doDelivery(self, params):
+    groups = ",".join(["(%s, %s, %s)"] * len(params["active"]))
+    self.cursor.execute(
+        f"UPDATE ORDER_LINE AS ol SET OL_DELIVERY_D = v.ol_delivery_d "
+        f"FROM (VALUES {groups}) AS v(no_o_id, d_id, w_id) "
+        f"WHERE ol.OL_O_ID = v.no_o_id",
+        [],
+    )
+'''
+    violations = unknown_values_column_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["alias"] == "v"
+    assert violations[0]["column"] == "ol_delivery_d"
+
+
+def test_unknown_values_column_accepts_declared_columns():
+    source = '''
+def doDelivery(self, params):
+    groups = ",".join(["(%s, %s, %s, %s)"] * len(params["active"]))
+    self.cursor.execute(
+        f"UPDATE CUSTOMER AS c SET C_BALANCE = C_BALANCE + v.ol_total "
+        f"FROM (VALUES {groups}) AS v(ol_total, c_id, d_id, w_id) "
+        f"WHERE c.C_ID = v.c_id",
+        [],
+    )
+'''
+    assert unknown_values_column_sql(source) == []
