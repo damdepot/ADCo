@@ -1759,7 +1759,7 @@ def _select_modifiers(sql: str) -> Optional[Dict[str, bool]]:
     except ImportError:
         return None
     if not isinstance(sql, str) or not sql.strip().upper().startswith("SELECT"):
-        return {"order_by": False, "limit": False, "join": False}
+        return {"order_by": False, "limit": False, "join": False, "group_by": False}
     normalized = sql.replace("%s", "0").replace("%%", "%")
     try:
         tree = sqlglot.parse_one(normalized, read="postgres")
@@ -1769,9 +1769,10 @@ def _select_modifiers(sql: str) -> Optional[Dict[str, bool]]:
             "order_by": "ORDER BY" in upper,
             "limit": "LIMIT" in upper,
             "join": "JOIN" in upper,
+            "group_by": "GROUP BY" in upper,
         }
     if tree is None or not isinstance(tree, exp.Select):
-        return {"order_by": False, "limit": False, "join": False}
+        return {"order_by": False, "limit": False, "join": False, "group_by": False}
     joins = tree.args.get("joins") or []
     from_ = tree.args.get("from_")
     comma_sources = len(from_.expressions) if from_ is not None and isinstance(from_, exp.From) else 1
@@ -1779,6 +1780,7 @@ def _select_modifiers(sql: str) -> Optional[Dict[str, bool]]:
         "order_by": tree.args.get("order") is not None,
         "limit": tree.args.get("limit") is not None,
         "join": len(joins) > 0 or comma_sources > 1,
+        "group_by": tree.args.get("group") is not None,
     }
 
 
@@ -1834,6 +1836,7 @@ def returned_select_modifiers_sql(source: str) -> Dict[str, Dict[str, Dict[str, 
             order_flags: set = set()
             limit_flags: set = set()
             join_flags: set = set()
+            group_flags: set = set()
             for sql in bindings[var]:
                 mods = _select_modifiers(sql)
                 if mods is None:
@@ -1841,11 +1844,13 @@ def returned_select_modifiers_sql(source: str) -> Dict[str, Dict[str, Dict[str, 
                 order_flags.add(mods["order_by"])
                 limit_flags.add(mods["limit"])
                 join_flags.add(mods["join"])
-            if order_flags or limit_flags or join_flags:
+                group_flags.add(mods["group_by"])
+            if order_flags or limit_flags or join_flags or group_flags:
                 shapes[var] = {
                     "order_by": sorted(order_flags),
                     "limit": sorted(limit_flags),
                     "join": sorted(join_flags),
+                    "group_by": sorted(group_flags),
                 }
         if shapes:
             result[name] = shapes
@@ -2546,6 +2551,359 @@ def insert_column_values_arity_sql(source: str) -> List[dict]:
                     "table": table.upper(),
                     "columns": len(columns),
                     "values": next(iter(widths)),
+                }
+            )
+    return violations
+
+
+def _function_reducers(function: Optional[ast.AST]) -> bool:
+    """Whether the function reduces rows in Python (min/max/sum/sorted)."""
+    if function is None:
+        return False
+    for node in ast.walk(function):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in {"min", "max", "sum", "sorted"}:
+                return True
+    return False
+
+
+def aggregate_queries_sql(source: str) -> Dict[str, Dict[str, bool]]:
+    """Per-function GROUP BY presence and Python-side reduction.
+
+    Maps ``function -> {"has_group_by": bool, "has_reducer": bool}``. A query
+    with GROUP BY collapses many rows into one per key (e.g. MIN(NO_O_ID) per
+    district); a rewrite that fetches the raw rows must reproduce that
+    reduction, either with its own GROUP BY or with min/max/sum/sorted in
+    Python. Plain ``ORDER BY ... LIMIT 1`` single-row fetches are not
+    aggregations and are ignored.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:
+        return {}
+    result: Dict[str, Dict[str, bool]] = {}
+    for name, analyzer in _iter_analyzed(source):
+        function = analyzer.function_node
+        if function is None:
+            continue
+        has_group_by = False
+        for sql_node, _line in _iter_call_sql_nodes(analyzer):
+            template = _resolve_sql(analyzer, sql_node)
+            if not isinstance(template, str):
+                continue
+            normalized = template.replace("%s", "0").replace("%%", "%")
+            try:
+                tree = sqlglot.parse_one(normalized, read="postgres")
+            except Exception:
+                continue
+            if tree is None:
+                continue
+            for select in tree.find_all(exp.Select):
+                if select.args.get("group") is not None:
+                    has_group_by = True
+                    break
+            if has_group_by:
+                break
+        result[name] = {
+            "has_group_by": has_group_by,
+            "has_reducer": _function_reducers(function),
+        }
+    return result
+
+
+def _identity_columns(tree, exp) -> List[str]:
+    """WHERE columns that address specific rows (equality + range, no ORDER BY).
+
+    Point lookups and range-bounded fetches define a table's row identity:
+    ``getNewOrder`` pins (NO_D_ID, NO_W_ID) with a NO_O_ID range, ``getCId``
+    pins (O_ID, O_D_ID, O_W_ID). Scans (ORDER BY, OR, IN-lists) do not define
+    identity and are skipped.
+    """
+    if tree.args.get("order") is not None:
+        return []
+    where = tree.args.get("where")
+    if where is None or where.find(exp.Or) is not None or where.find(exp.In) is not None:
+        return []
+    where_sql = where.sql(dialect="postgres")
+    return [
+        match.group(1).split(".")[-1].strip('"`').lower()
+        for match in re.finditer(
+            r"([A-Za-z_][\w.\"]*)\s*(?:=|<>|!=|>=|<=|>|<)\s*(?:0|%s|\?|:\w+)", where_sql
+        )
+    ]
+
+
+def orig_identity_sql(source: str) -> Dict[str, set]:
+    """Row-identity columns per table, mined from the original's point queries."""
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:
+        return {}
+    identity: Dict[str, set] = {}
+    for _name, analyzer in _iter_analyzed(source):
+        for sql_node, _line in _iter_call_sql_nodes(analyzer):
+            template = _resolve_sql(analyzer, sql_node)
+            if not isinstance(template, str):
+                continue
+            normalized = template.replace("%s", "0").replace("%%", "%")
+            try:
+                tree = sqlglot.parse_one(normalized, read="postgres")
+            except Exception:
+                continue
+            if tree is None or not isinstance(tree, (exp.Select, exp.Update, exp.Delete)):
+                continue
+            parsed = _single_table_own_columns(template)
+            if parsed is None:
+                continue
+            table, _columns = parsed
+            cols = _identity_columns(tree, exp)
+            if cols:
+                identity.setdefault(table, set()).update(col.upper() for col in cols)
+    return identity
+
+
+def _value_names(value: ast.AST) -> set:
+    return {
+        n.id for n in ast.walk(value)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+    }
+
+
+def _contains_fetch_call(value: ast.AST) -> bool:
+    return any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr in {"fetchone", "fetchall", "fetchmany"}
+        for n in ast.walk(value)
+    )
+
+
+def _pinned_names(function: Optional[ast.AST]) -> set:
+    """Names bound once to a txn-constant (params attribute, not fetch results).
+
+    A name assigned exactly once from a call-free, comprehension-free RHS
+    (e.g. ``w_id = params["w_id"]``) holds one value for the txn. Excluded:
+    names stored inside loop bodies (``no_o_id`` rebound per district),
+    anything fetch-derived (``no_o_id = new_order_map[d_id]`` flows from
+    ``fetchall``), and loop/comprehension-bound names with no explicit
+    assignment (``d_id``, ``row``).
+    """
+    if function is None:
+        return set()
+    in_loop: set = set()
+    for node in ast.walk(function):
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            for child in list(node.body) + list(node.orelse):
+                for n in ast.walk(child):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                        in_loop.add(n.id)
+    stores: Dict[str, int] = {}
+    rhs_ok: Dict[str, bool] = {}
+    values: Dict[str, ast.AST] = {}
+    for node in ast.walk(function):
+        targets: List[ast.AST] = []
+        value: Optional[ast.AST] = None
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        names = [n.id for n in ast.walk(targets[0]) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)] if len(targets) == 1 else []
+        clean = value is not None and not any(
+            isinstance(child, (ast.Call, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.IfExp, ast.Lambda, ast.Yield, ast.YieldFrom, ast.Await))
+            for child in ast.walk(value)
+        )
+        for name in names:
+            stores[name] = stores.get(name, 0) + 1
+            rhs_ok[name] = rhs_ok.get(name, True) and clean
+            values[name] = value
+    tainted: set = set()
+    for name, value in values.items():
+        if _contains_fetch_call(value):
+            tainted.add(name)
+    for node in ast.walk(function):
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            if _value_names(node.iter) & tainted:
+                for n in ast.walk(node.target):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                        tainted.add(n.id)
+    changed = True
+    while changed:
+        changed = False
+        for name, value in values.items():
+            if name not in tainted and _value_names(value) & tainted:
+                tainted.add(name)
+                changed = True
+    return {
+        name
+        for name, count in stores.items()
+        if count == 1 and rhs_ok.get(name, False)
+        and name not in in_loop and name not in tainted
+    }
+
+
+def _key_columns(key: ast.AST, gen_target: str, select_cols: Optional[List[str]]) -> Optional[set]:
+    """Table columns used as a dict key, via SELECT-list positions."""
+    if select_cols is None:
+        return None
+    indices: List[int] = []
+    if isinstance(key, ast.Subscript) and isinstance(key.value, ast.Name) and key.value.id == gen_target:
+        if not isinstance(key.slice, ast.Constant) or not isinstance(key.slice.value, int):
+            return None
+        indices = [key.slice.value]
+    elif isinstance(key, (ast.Tuple, ast.List)):
+        for elt in key.elts:
+            if (
+                not isinstance(elt, ast.Subscript)
+                or not isinstance(elt.value, ast.Name)
+                or elt.value.id != gen_target
+                or not isinstance(elt.slice, ast.Constant)
+                or not isinstance(elt.slice.value, int)
+            ):
+                return None
+            indices.append(elt.slice.value)
+    else:
+        return None
+    if any(i < 0 or i >= len(select_cols) for i in indices):
+        return None
+    return {select_cols[i].upper() for i in indices}
+
+
+def _producer_table(sql: str) -> str:
+    """Uppercase table of a single-table statement, else ""."""
+    parsed = _single_table_own_columns(sql)
+    return parsed[0] if parsed else ""
+
+
+def narrow_key_pick_sql(source: str) -> List[dict]:
+    """Per-key dict picks from unordered multi-row fetches.
+
+    Catches ``{row[0]: row[1] for row in rows}`` over a SELECT with no GROUP
+    BY / ORDER BY / LIMIT and no min()/max()/sorted() in the function: the
+    surviving row per key is arbitrary (dict last-wins on unordered input),
+    so a later DELETE/UPDATE delivers the wrong order. Accumulations
+    (``d[k] += v``, ``append``, ``Counter``, self-referential updates) combine
+    every row and are safe.
+    """
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        function = analyzer.function_node
+        if function is None:
+            continue
+        if _function_reducers(function):
+            continue
+        executes = sorted(
+            (line, sql)
+            for sql, line, _node, _params, method in analyzer.execute_calls
+            if isinstance(sql, str) and method == "execute"
+        )
+        bindings: Dict[str, set] = {}
+        assigns = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None
+        ]
+        assigns.sort(key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)))
+        picks: List[dict] = []
+        for node in assigns:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            sqls = _producer_sqls(node.value, bindings, executes, node.lineno)
+            if sqls:
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        bindings.setdefault(target.id, set()).update(sqls)
+                    elif isinstance(target, (ast.Tuple, ast.List)):
+                        for element in target.elts:
+                            if isinstance(element, ast.Name):
+                                bindings.setdefault(element.id, set()).update(sqls)
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                continue
+            var = targets[0].id
+            value = node.value
+            if not (
+                isinstance(value, ast.DictComp)
+                and len(value.generators) == 1
+                and not value.generators[0].ifs
+                and isinstance(value.generators[0].target, ast.Name)
+            ):
+                continue
+            gen = value.generators[0]
+            if not sqls:
+                continue
+            keycols: Optional[set] = None
+            for sql in sqls:
+                cols = _key_columns(value.key, gen.target.id, find_select_columns(sql))
+                if cols is not None:
+                    keycols = (keycols or set()) | cols
+            picks.append({"var": var, "line": node.lineno, "sqls": set(sqls), "keycols": keycols})
+        for node in ast.walk(function):
+            if not isinstance(node, (ast.For, ast.AsyncFor)):
+                continue
+            if not isinstance(node.target, ast.Name):
+                continue
+            loop_var = node.target.id
+            iter_sqls = _producer_sqls(node.iter, bindings, executes, getattr(node, "lineno", 0))
+            if not iter_sqls:
+                continue
+            for stmt in ast.walk(node):
+                dictvar: Optional[str] = None
+                key_expr: Optional[ast.AST] = None
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Subscript)
+                    and isinstance(stmt.targets[0].value, ast.Name)
+                ):
+                    dictvar = stmt.targets[0].value.id
+                    key_expr = stmt.targets[0].slice
+                    if any(
+                        isinstance(n, ast.Name) and n.id == dictvar
+                        for n in ast.walk(stmt.value)
+                    ):
+                        continue
+                elif (
+                    isinstance(stmt, ast.Expr)
+                    and isinstance(stmt.value, ast.Call)
+                    and isinstance(stmt.value.func, ast.Attribute)
+                    and stmt.value.func.attr == "setdefault"
+                    and isinstance(stmt.value.func.value, ast.Name)
+                    and len(stmt.value.args) >= 1
+                ):
+                    dictvar = stmt.value.func.value.id
+                    key_expr = stmt.value.args[0]
+                else:
+                    continue
+                keycols = None
+                for sql in iter_sqls:
+                    cols = _key_columns(key_expr, loop_var, find_select_columns(sql))
+                    if cols is not None:
+                        keycols = (keycols or set()) | cols
+                picks.append({"var": dictvar, "line": getattr(stmt, "lineno", 0), "sqls": set(iter_sqls), "keycols": keycols})
+        for pick in picks:
+            if not pick["sqls"] or pick["keycols"] is None:
+                continue
+            if any(
+                (mods := _select_modifiers(sql)) is not None
+                and (mods.get("group_by") or mods.get("order_by") or mods.get("limit"))
+                for sql in pick["sqls"]
+            ):
+                continue
+            key = (name, pick["line"], pick["var"])
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(
+                {
+                    "function": name,
+                    "line": pick["line"],
+                    "variable": pick["var"],
+                    "keycols": sorted(pick["keycols"]),
+                    "sqls": sorted(pick["sqls"]),
                 }
             )
     return violations

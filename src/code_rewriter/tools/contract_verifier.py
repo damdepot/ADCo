@@ -31,6 +31,12 @@ from .sql_analysis import (
     composite_tuple_order_sql,
     batched_write_tuple_order_sql,
     write_tables_sql,
+    narrow_key_pick_sql,
+    orig_identity_sql,
+    _pinned_names,
+    _producer_table,
+    _name_matches_column,
+    aggregate_queries_sql,
     wrong_table_column_sql,
     insert_column_values_arity_sql,
     returned_select_modifiers_sql,
@@ -955,6 +961,67 @@ def verify_contract(
                 "separate statement."
             ),
         ))
+
+    original_agg = aggregate_queries_sql(original_source)
+    optimized_agg = aggregate_queries_sql(optimized_source)
+    for fn_name, opt_agg in optimized_agg.items():
+        if not _in_target_regions(fn_name):
+            continue
+        orig_agg = original_agg.get(fn_name)
+        if not orig_agg or not orig_agg.get("has_group_by"):
+            continue
+        if opt_agg.get("has_group_by") or opt_agg.get("has_reducer"):
+            continue
+        violations.append(VerificationViolation(
+            code="AGGREGATE_REDUCTION_DROPPED",
+            severity="ERROR",
+            message=(
+                f"Function {fn_name} replaced a GROUP BY query with a plain multi-row "
+                "fetch and no Python-side reduction. GROUP BY collapses many rows into "
+                "one per key (e.g. MIN(NO_O_ID) per district); picking one row per key in "
+                "Python without min()/max()/sorted() selects an arbitrary row, so the "
+                "txn delivers/deletes the wrong order and breaks contiguity (CC3). Keep "
+                "the GROUP BY in SQL, or reduce with min()/max() over the fetched rows."
+            ),
+            expected=orig_agg,
+            actual=opt_agg,
+        ))
+
+    orig_identity = orig_identity_sql(original_source)
+    for site in narrow_key_pick_sql(optimized_source):
+        if not _in_target_regions(site["function"]):
+            continue
+        tables = {_producer_table(sql) for sql in site["sqls"]}
+        tables.discard("")
+        if not tables:
+            continue
+        pinned = _pinned_names(_resolve_region_node(opt_ast_map, site["function"]))
+        for table in sorted(tables):
+            identity = orig_identity.get(table, set())
+            if not identity:
+                continue
+            covered = set(site["keycols"])
+            for param in pinned:
+                for col in identity:
+                    if _name_matches_column(param, col):
+                        covered.add(col)
+            dropped = sorted(identity - covered)
+            if dropped:
+                violations.append(VerificationViolation(
+                    code="NARROW_KEY_PICK",
+                    severity="ERROR",
+                    message=(
+                        f"Function {site['function']} picks one row per key into "
+                        f"'{site['variable']}' from unordered fetched rows, but the key "
+                        f"({', '.join(site['keycols']) or 'unknown'}) drops identity "
+                        f"column(s) {', '.join(dropped)} that the original uses to "
+                        f"address {table}. The surviving row per key is arbitrary, so a "
+                        "later DELETE/UPDATE delivers the wrong order and breaks "
+                        "contiguity (CC3). Keep the full row key, or pick with GROUP BY "
+                        "/ ORDER BY + first-row / min() / max()."
+                    ),
+                ))
+                break
 
     original_writes = write_tables_sql(original_source)
     optimized_writes = write_tables_sql(optimized_source)

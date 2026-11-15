@@ -9,6 +9,8 @@ from src.code_rewriter.tools.sql_analysis import (
     composite_tuple_order_sql,
     empty_params_with_placeholders_sql,
     write_tables_sql,
+    narrow_key_pick_sql,
+    orig_identity_sql,
     wrong_table_column_sql,
     insert_column_values_arity_sql,
     returned_select_modifiers_sql,
@@ -1210,8 +1212,8 @@ class D:
         return [customer, order]
 '''
     mods = returned_select_modifiers_sql(source)["D.doOrderStatus"]
-    assert mods["order"] == {"order_by": [True], "limit": [True], "join": [False]}
-    assert mods["customer"] == {"order_by": [False], "limit": [False], "join": [False]}
+    assert mods["order"] == {"order_by": [True], "limit": [True], "join": [False], "group_by": [False]}
+    assert mods["customer"] == {"order_by": [False], "limit": [False], "join": [False], "group_by": [False]}
 
 
 def test_wrong_table_column_flags_orders_key_in_order_line():
@@ -1311,4 +1313,83 @@ class D:
         return [rows]
 '''
     mods = returned_select_modifiers_sql(source)["D.f"]
-    assert mods["rows"] == {"order_by": [True], "limit": [True], "join": [True]}
+    assert mods["rows"] == {"order_by": [True], "limit": [True], "join": [True], "group_by": [False]}
+
+
+def test_narrow_key_pick_flags_last_wins_without_ordering():
+    source = '''
+class D:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "SELECT NO_D_ID, NO_O_ID FROM NEW_ORDER WHERE NO_W_ID = %s AND NO_O_ID > -1",
+            params["p"],
+        )
+        new_orders = self.cursor.fetchall()
+        new_order_map = {row[0]: row[1] for row in new_orders}
+        return [(d, new_order_map[d]) for d in new_order_map]
+'''
+    violations = narrow_key_pick_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["variable"] == "new_order_map"
+    assert violations[0]["keycols"] == ["NO_D_ID"]
+
+
+def test_narrow_key_pick_accepts_group_by_producer():
+    source = '''
+class D:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "SELECT NO_D_ID, MIN(NO_O_ID) FROM NEW_ORDER WHERE NO_W_ID = %s GROUP BY NO_D_ID",
+            params["p"],
+        )
+        new_orders = self.cursor.fetchall()
+        new_order_map = {row[0]: row[1] for row in new_orders}
+        return [(d, new_order_map[d]) for d in new_order_map]
+'''
+    assert narrow_key_pick_sql(source) == []
+
+
+def test_narrow_key_pick_accepts_order_by_first_pick():
+    source = '''
+class D:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "SELECT NO_D_ID, NO_O_ID FROM NEW_ORDER WHERE NO_W_ID = %s ORDER BY NO_D_ID, NO_O_ID",
+            params["p"],
+        )
+        new_order_map = {}
+        for row in self.cursor.fetchall():
+            new_order_map.setdefault(row[0], row[1])
+        return [(d, new_order_map[d]) for d in new_order_map]
+'''
+    assert narrow_key_pick_sql(source) == []
+
+
+def test_narrow_key_pick_accepts_python_min():
+    source = '''
+class D:
+    def doDelivery(self, params):
+        self.cursor.execute("SELECT NO_D_ID, NO_O_ID FROM NEW_ORDER WHERE NO_W_ID = %s", params["p"])
+        rows = self.cursor.fetchall()
+        best = min(r[1] for r in rows)
+        return [best]
+'''
+    assert narrow_key_pick_sql(source) == []
+
+
+def test_orig_identity_collects_point_lookup_keys():
+    source = '''
+class D:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "SELECT O_C_ID FROM ORDERS WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+            params["p"],
+        )
+        self.cursor.execute(
+            "SELECT NO_O_ID FROM NEW_ORDER WHERE NO_D_ID = %s AND NO_W_ID = %s LIMIT 1",
+            params["p"],
+        )
+'''
+    identity = orig_identity_sql(source)
+    assert identity["ORDERS"] == {"O_ID", "O_D_ID", "O_W_ID"}
+    assert "NO_O_ID" not in identity.get("NEW_ORDER", set())

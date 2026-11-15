@@ -1620,3 +1620,68 @@ def test_verify_accepts_lateral_join_without_top_limit():
         _static_check_contract("doOrderStatus"),
     )
     assert not any(v.code == "RETURN_JOIN_LIMIT_COLLAPSE" for v in result.violations)
+
+
+DELIVERY_NARROW_PICK_ORIGINAL = """
+TXN_QUERIES = {"DELIVERY": {
+    "getNewOrder": "SELECT NO_O_ID FROM NEW_ORDER WHERE NO_D_ID = %s AND NO_W_ID = %s AND NO_O_ID > -1 LIMIT 1",
+    "deleteNewOrder": "DELETE FROM NEW_ORDER WHERE NO_D_ID = %s AND NO_W_ID = %s AND NO_O_ID = %s",
+}}
+class Delivery:
+    def doDelivery(self, params):
+        q = TXN_QUERIES["DELIVERY"]
+        for d_id in params["d_ids"]:
+            self.cursor.execute(q["getNewOrder"], [d_id, params["w_id"]])
+            no_o_id = self.cursor.fetchone()[0]
+            self.cursor.execute(q["deleteNewOrder"], [d_id, params["w_id"], no_o_id])
+        return []
+"""
+
+DELIVERY_NARROW_PICK_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        w_id = params["w_id"]
+        self.cursor.execute(
+            "SELECT NO_D_ID, NO_O_ID FROM NEW_ORDER WHERE NO_W_ID = %s AND NO_O_ID > -1",
+            [w_id],
+        )
+        new_order_map = {row[0]: row[1] for row in self.cursor.fetchall()}
+        for d_id in params["d_ids"]:
+            no_o_id = new_order_map[d_id]
+            self.cursor.execute(
+                "DELETE FROM NEW_ORDER WHERE NO_D_ID = %s AND NO_W_ID = %s AND NO_O_ID = %s",
+                [d_id, w_id, no_o_id],
+            )
+        return []
+"""
+
+
+def test_verify_reports_narrow_key_pick():
+    result = verify_contract(
+        DELIVERY_NARROW_PICK_ORIGINAL,
+        DELIVERY_NARROW_PICK_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    picks = [v for v in result.violations if v.code == "NARROW_KEY_PICK"]
+    assert len(picks) == 1
+    assert picks[0].severity == "ERROR"
+    assert "NO_O_ID" in picks[0].message
+
+
+def test_verify_reports_aggregate_reduction_dropped():
+    orig = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "SELECT NO_D_ID, MIN(NO_O_ID) FROM NEW_ORDER WHERE NO_W_ID = %s GROUP BY NO_D_ID",
+            [params["w_id"]],
+        )
+        return self.cursor.fetchall()
+"""
+    bad = DELIVERY_NARROW_PICK_BROKEN
+    result = verify_contract(orig, bad, _static_check_contract("doDelivery"))
+    assert result.status == "FAIL"
+    agg = [v for v in result.violations if v.code == "AGGREGATE_REDUCTION_DROPPED"]
+    assert len(agg) == 1
+    assert agg[0].severity == "ERROR"
