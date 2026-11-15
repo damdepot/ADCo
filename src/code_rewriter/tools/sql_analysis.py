@@ -1206,10 +1206,21 @@ def values_alias_arity_sql(source: str) -> List[dict]:
     return violations
 
 
+def _element_name(node: ast.AST) -> Optional[str]:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Subscript):
+        return _const_str(node.slice)
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
 def _tuple_element_names(node: Optional[ast.AST]) -> Optional[tuple]:
     if isinstance(node, (ast.Tuple, ast.List)) and node.elts:
-        if all(isinstance(elt, ast.Name) for elt in node.elts):
-            return tuple(elt.id for elt in node.elts)
+        names = [_element_name(elt) for elt in node.elts]
+        if all(name is not None for name in names):
+            return tuple(names)
     return None
 
 
@@ -1293,29 +1304,54 @@ def _list_tuple_orders(function: Optional[ast.AST]) -> Dict[str, tuple]:
             return
         orders[name] = names
 
-    for stmt in ast.walk(function):
-        target = None
-        value = None
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
-            target = stmt.targets[0].id
-            value = stmt.value
-        elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            call = stmt.value
+    def collect_direct() -> None:
+        for stmt in ast.walk(function):
+            target = None
+            value = None
             if (
-                isinstance(call.func, ast.Attribute)
-                and isinstance(call.func.value, ast.Name)
-                and call.func.attr in {"append", "extend"}
-                and len(call.args) == 1
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
             ):
-                target = call.func.value.id
-                value = call.args[0]
-        if target is None or value is None:
-            continue
-        names = _tuple_element_names(value)
-        if names is None:
-            names = _param_tuple_names(value, orders)
-        if names is not None:
-            record(target, names)
+                target = stmt.targets[0].id
+                value = stmt.value
+            elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                call = stmt.value
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.attr in {"append", "extend"}
+                    and len(call.args) == 1
+                ):
+                    target = call.func.value.id
+                    value = call.args[0]
+            if target is None or value is None:
+                continue
+            names = _tuple_element_names(value)
+            if names is None:
+                names = _iter_tuple_names(value, orders)
+            if names is None:
+                names = _param_tuple_names(value, orders)
+            if names is not None:
+                record(target, names)
+
+    def collect_loop_bindings() -> bool:
+        """``for t in rows:`` where ``rows`` has a known tuple shape."""
+        changed = False
+        for node in ast.walk(function):
+            if not isinstance(node, (ast.For, ast.AsyncFor)):
+                continue
+            if not isinstance(node.target, ast.Name) or node.target.id in orders:
+                continue
+            names = _iter_tuple_names(node.iter, orders)
+            if names is not None:
+                orders[node.target.id] = names
+                changed = True
+        return changed
+
+    collect_direct()
+    while collect_loop_bindings():
+        collect_direct()
     return orders
 
 
@@ -1340,6 +1376,122 @@ def _name_matches_column(name: str, column: str) -> bool:
             if len(tail) >= 3 and tail in other:
                 return True
     return False
+
+
+def _swapped_order(names: tuple, columns: List[str]):
+    """``(used_names, expected_columns)`` when a unique non-identity match exists."""
+    if len(names) < len(columns) or not columns:
+        return None
+    candidates = []
+    for offset in (len(names) - len(columns), 0):
+        window = list(names[offset : offset + len(columns)])
+        matches = [
+            [j for j, col in enumerate(columns) if _name_matches_column(n, col)]
+            for n in window
+        ]
+        solutions = [
+            perm
+            for perm in permutations(range(len(columns)))
+            if all(perm[i] in matches[i] for i in range(len(columns)))
+        ]
+        if len(solutions) != 1:
+            continue
+        if solutions[0] == tuple(range(len(columns))):
+            return None
+        candidates.append((window, [columns[j] for j in solutions[0]]))
+    if not candidates:
+        return None
+    expected = candidates[0][1]
+    if any(candidate[1] != expected for candidate in candidates[1:]):
+        return None
+    return candidates[0]
+
+
+def _where_equality_columns(tree, exp) -> List[str]:
+    where = tree.args.get("where")
+    if where is None or where.find(exp.Or) is not None or where.find(exp.In) is not None:
+        return []
+    # ``find_all`` does not preserve source order; parse the rendered WHERE
+    # clause instead so tuple positions line up with placeholder positions.
+    where_sql = where.sql(dialect="postgres")
+    return [
+        match.group(1).split(".")[-1].strip('"`').lower()
+        for match in re.finditer(
+            r"([A-Za-z_][\w.\"]*)\s*=\s*(?:0|%s|\?|:\w+)", where_sql
+        )
+    ]
+
+
+def batched_write_tuple_order_sql(source: str) -> List[dict]:
+    """``execute_batch`` point writes whose tuple order mismatches the WHERE keys.
+
+    Catches reusing the ``ORDERS`` key order ``(no_o_id, d_id, w_id)`` for
+    ``DELETE FROM NEW_ORDER ... WHERE NO_D_ID, NO_W_ID, NO_O_ID``: the delete
+    silently removes nothing while the carrier update succeeds, leaving
+    delivered rows in ``NEW_ORDER`` (CC5).
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:  # pragma: no cover - declared dependency
+        return []
+
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        orders = _list_tuple_orders(analyzer.function_node)
+        for node in ast.walk(analyzer.function_node):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (
+                isinstance(func, ast.Attribute)
+                and func.attr in {"execute_batch", "executemany"}
+                and len(node.args) >= 3
+            ):
+                continue
+            sql = analyzer.eval(node.args[1])
+            if not isinstance(sql, str):
+                sql = _template_sql(node.args[1], analyzer.sql_ast_vars)
+            if not isinstance(sql, str):
+                continue
+            normalized = sql.replace("%s", "0").replace("%%", "%")
+            try:
+                tree = sqlglot.parse_one(normalized, read="postgres")
+            except Exception:
+                continue
+            if tree is None:
+                continue
+            if len(list(tree.find_all(exp.Table))) != 1:
+                continue
+            if list(tree.find_all(exp.Subquery)):
+                continue
+            columns = _where_equality_columns(tree, exp)
+            if len(columns) < 2 or len(columns) > 6:
+                continue
+            if any(not re.fullmatch(r"[a-z_]\w*", col) for col in columns):
+                continue
+            names = _param_tuple_names(node.args[2], orders)
+            if names is None:
+                continue
+            swapped = _swapped_order(names, columns)
+            if swapped is None:
+                continue
+            used_names, expected = swapped
+            key = (name, getattr(node, "lineno", 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            violations.append(
+                {
+                    "function": name,
+                    "line": getattr(node, "lineno", 0),
+                    "columns": columns,
+                    "tuple_order": used_names,
+                    "expected_order": expected,
+                }
+            )
+    return violations
 
 
 def composite_tuple_order_sql(source: str) -> List[dict]:
@@ -1440,6 +1592,194 @@ def _width_from_fetch(
                 return None
         return sliced
     return None
+
+
+def _write_verb_table(sql: str):
+    """(VERB, TABLE) for a single DML statement, else None.
+
+    Uses sqlglot locally so this module stays independent of db_interaction.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:
+        return None
+    if not isinstance(sql, str) or not sql.strip():
+        return None
+    normalized = sql.replace("%s", "0").replace("%%", "%")
+    try:
+        tree = sqlglot.parse_one(normalized, read="postgres")
+    except Exception:
+        return None
+    if tree is None or not isinstance(tree, (exp.Insert, exp.Update, exp.Delete)):
+        return None
+    target = tree.args.get("this")
+    table = ""
+    if isinstance(target, exp.Table):
+        table = target.name or ""
+    elif isinstance(target, exp.Schema) and isinstance(target.this, exp.Table):
+        table = target.this.name or ""
+    if not table:
+        return None
+    verb = "INSERT" if isinstance(tree, exp.Insert) else "UPDATE" if isinstance(tree, exp.Update) else "DELETE"
+    return (verb, table.upper())
+
+
+def _batch_sql_params(node: ast.Call):
+    """(sql_node, params_node) for execute/executemany/execute_batch."""
+    if isinstance(node.func, ast.Attribute):
+        attr = node.func.attr
+    elif isinstance(node.func, ast.Name):
+        attr = node.func.id
+    else:
+        return None
+    if attr in {"execute", "executemany"} and len(node.args) >= 1:
+        return (node.args[0], node.args[1] if len(node.args) > 1 else None)
+    if attr in {"execute_batch", "execute_values"} and len(node.args) >= 3:
+        return (node.args[1], node.args[2])
+    return None
+
+
+def write_tables_sql(source: str) -> Dict[str, set]:
+    """(VERB, TABLE) writes per function, including execute_batch.
+
+    The existing execute-call model only records execute/executemany, so
+    batched writes are invisible to it. This walks every call itself and
+    resolves the SQL through the analyzer env, so ``q["deleteNewOrder"]``
+    dict lookups keep working. Sets (not counts) are returned: batching
+    legitimately collapses N loop writes into one call.
+    """
+    result: Dict[str, set] = {}
+    for name, analyzer in _iter_analyzed(source):
+        function = analyzer.function_node
+        if function is None:
+            continue
+        writes: set = set()
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                attr = node.func.id
+            else:
+                continue
+            if attr not in {"execute", "executemany", "execute_batch", "execute_values"}:
+                continue
+            pair = _batch_sql_params(node)
+            if pair is None:
+                continue
+            sql = analyzer.eval(pair[0])
+            if not isinstance(sql, str):
+                sql = _template_sql(pair[0], analyzer.sql_ast_vars)
+            if not isinstance(sql, str):
+                continue
+            verb_table = _write_verb_table(sql)
+            if verb_table is not None:
+                writes.add(verb_table)
+        if writes:
+            result[name] = writes
+    return result
+
+
+def _producer_sqls(value: ast.AST, bindings: Dict[str, set], executes: List[tuple], lineno: int):
+    if _is_fetch_call(value):
+        previous = [sql for line, sql in executes if line < lineno]
+        return {previous[-1]} if previous else None
+    if isinstance(value, ast.Name):
+        sqls = bindings.get(value.id)
+        return set(sqls) if sqls else None
+    if isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
+        sqls = bindings.get(value.value.id)
+        return set(sqls) if sqls else None
+    return None
+
+
+def _select_modifiers(sql: str) -> Optional[Dict[str, bool]]:
+    """Whether a SELECT has ORDER BY / LIMIT (top level only)."""
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:
+        return None
+    if not isinstance(sql, str) or not sql.strip().upper().startswith("SELECT"):
+        return {"order_by": False, "limit": False}
+    normalized = sql.replace("%s", "0").replace("%%", "%")
+    try:
+        tree = sqlglot.parse_one(normalized, read="postgres")
+    except Exception:
+        upper = normalized.upper()
+        return {"order_by": "ORDER BY" in upper, "limit": "LIMIT" in upper}
+    if tree is None or not isinstance(tree, exp.Select):
+        return {"order_by": False, "limit": False}
+    return {
+        "order_by": tree.args.get("order") is not None,
+        "limit": tree.args.get("limit") is not None,
+    }
+
+
+def returned_select_modifiers_sql(source: str) -> Dict[str, Dict[str, Dict[str, List[bool]]]]:
+    """ORDER BY / LIMIT of every fetched row that the function returns.
+
+    Mirrors returned_row_widths_sql but tracks query shape instead of width:
+    ``getLastOrder`` (ORDER BY O_ID DESC LIMIT 1) must keep both, otherwise a
+    batched rewrite returns an arbitrary row. Maps
+    ``function -> returned variable -> {"order_by": [...], "limit": [...]}``
+    with sorted unique flags across the variable's producer SELECTs.
+    """
+    result: Dict[str, Dict[str, Dict[str, List[bool]]]] = {}
+    for name, analyzer in _iter_analyzed(source):
+        function = analyzer.function_node
+        if function is None:
+            continue
+        executes = sorted(
+            (line, sql)
+            for sql, line, _node, _params, method in analyzer.execute_calls
+            if isinstance(sql, str) and method == "execute"
+        )
+        bindings: Dict[str, set] = {}
+        assigns = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None
+        ]
+        assigns.sort(key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)))
+        for node in assigns:
+            sqls = _producer_sqls(node.value, bindings, executes, node.lineno)
+            if not sqls:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    bindings.setdefault(target.id, set()).update(sqls)
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    for element in target.elts:
+                        if isinstance(element, ast.Name):
+                            bindings.setdefault(element.id, set()).update(sqls)
+
+        returned: set = set()
+        for node in ast.walk(function):
+            if isinstance(node, ast.Return) and node.value is not None:
+                for child in ast.walk(node.value):
+                    if isinstance(child, ast.Name):
+                        returned.add(child.id)
+        shapes: Dict[str, Dict[str, List[bool]]] = {}
+        for var in returned:
+            if var not in bindings or not bindings[var]:
+                continue
+            order_flags: set = set()
+            limit_flags: set = set()
+            for sql in bindings[var]:
+                mods = _select_modifiers(sql)
+                if mods is None:
+                    continue
+                order_flags.add(mods["order_by"])
+                limit_flags.add(mods["limit"])
+            if order_flags or limit_flags:
+                shapes[var] = {"order_by": sorted(order_flags), "limit": sorted(limit_flags)}
+        if shapes:
+            result[name] = shapes
+    return result
 
 
 def returned_row_widths_sql(source: str) -> Dict[str, Dict[str, List[int]]]:
@@ -1794,6 +2134,55 @@ def ambiguous_values_alias_sql(source: str) -> List[dict]:
     return violations
 
 
+def _join_pattern_text(node: Optional[ast.AST]) -> Optional[str]:
+    """The constant row pattern of ``",".join([pattern] * len(X))``."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+    ):
+        return None
+    arg = node.args[0]
+    if isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Mult):
+        return _join_pattern(arg.left) or _join_pattern(arg.right)
+    if isinstance(arg, ast.ListComp) and len(arg.generators) == 1:
+        return _const_str(arg.elt)
+    return None
+
+
+def _template_sql(
+    node: Optional[ast.AST], sql_vars: Dict[str, ast.AST], depth: int = 0
+) -> Optional[str]:
+    """Reconstruct SQL with dynamic row fragments kept as their literal pattern."""
+    if node is None or depth > 8:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return _template_sql(sql_vars.get(node.id), sql_vars, depth + 1)
+    if isinstance(node, ast.JoinedStr):
+        parts: List[str] = []
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                parts.append(part.value)
+            elif isinstance(part, ast.FormattedValue):
+                value = part.value
+                stored = sql_vars.get(value.id) if isinstance(value, ast.Name) else value
+                pattern = _join_pattern_text(stored)
+                parts.append(pattern if pattern is not None else "0")
+            else:
+                return None
+        return "".join(parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _template_sql(node.left, sql_vars, depth + 1)
+        right = _template_sql(node.right, sql_vars, depth + 1)
+        if left is None or right is None:
+            return None
+        return left + right
+    return _join_pattern_text(node)
+
+
 def table_column_prefix_mismatch_sql(source: str) -> List[dict]:
     """Single-table SQL whose column prefix is a truncated table prefix.
 
@@ -1811,8 +2200,15 @@ def table_column_prefix_mismatch_sql(source: str) -> List[dict]:
     violations: List[dict] = []
     seen = set()
     for name, analyzer in _iter_analyzed(source):
-        for sql, line in analyzer.execute_sqls:
-            normalized = sql.replace("%s", "0").replace("%%", "%")
+        for sql, line, sql_node, _params, method in analyzer.execute_calls:
+            if method != "execute":
+                continue
+            template = _template_sql(sql_node, analyzer.sql_ast_vars)
+            if template is None:
+                template = sql if isinstance(sql, str) else None
+            if template is None:
+                continue
+            normalized = template.replace("%s", "0").replace("%%", "%")
             try:
                 tree = sqlglot.parse_one(normalized, read="postgres")
             except Exception:
@@ -1829,32 +2225,259 @@ def table_column_prefix_mismatch_sql(source: str) -> List[dict]:
                 if "_" in col:
                     prefix = col.split("_", 1)[0]
                     prefixes[prefix] = prefixes.get(prefix, 0) + 1
-            if len(prefixes) < 2:
-                continue
-            dominant, count = max(prefixes.items(), key=lambda item: item[1])
-            if count < 2:
-                continue
+            dominant, dominant_count = ("", 0)
+            if prefixes:
+                dominant, dominant_count = max(prefixes.items(), key=lambda item: item[1])
+            table_name = next(iter(tree.find_all(exp.Table))).name or ""
+            expected = "".join(part[0] for part in table_name.split("_") if part).upper()
+
             for col in columns:
                 if "_" not in col:
                     continue
                 prefix = col.split("_", 1)[0]
+                prefix_u = prefix.upper()
+                expected_prefix = None
                 if (
-                    prefix != dominant
-                    and len(prefix) < len(dominant)
-                    and dominant.startswith(prefix)
+                    dominant_count >= 2
+                    and prefix_u != dominant.upper()
+                    and len(prefix_u) < len(dominant)
+                    and dominant.upper().startswith(prefix_u)
                 ):
-                    key = (name, line, col)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    violations.append(
-                        {
-                            "function": name,
-                            "line": line,
-                            "column": col,
-                            "expected_prefix": dominant,
-                        }
-                    )
+                    expected_prefix = dominant
+                elif (
+                    prefix
+                    and expected
+                    and prefix_u != expected
+                    and len(prefix_u) < len(expected)
+                    and expected.startswith(prefix_u)
+                ):
+                    expected_prefix = expected
+                if expected_prefix is None:
+                    continue
+                key = (name, line, col)
+                if key in seen:
+                    continue
+                seen.add(key)
+                violations.append(
+                    {
+                        "function": name,
+                        "line": line,
+                        "column": col,
+                        "expected_prefix": expected_prefix,
+                    }
+                )
+    return violations
+
+
+def _iter_call_sql_nodes(analyzer):
+    """(sql_node, line) for execute/executemany/execute_batch/execute_values."""
+    for _sql, line, sql_node, _params, method in analyzer.execute_calls:
+        if method in {"execute", "executemany"}:
+            yield sql_node, line
+    function = analyzer.function_node
+    if function is None:
+        return
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+        elif isinstance(node.func, ast.Name):
+            attr = node.func.id
+        else:
+            continue
+        if attr not in {"execute_batch", "execute_values"}:
+            continue
+        if len(node.args) >= 3:
+            yield node.args[1], getattr(node, "lineno", 0)
+
+
+def _resolve_sql(analyzer, sql_node) -> Optional[str]:
+    """Template SQL if reconstructable, else the resolver's best effort."""
+    template = _template_sql(sql_node, analyzer.sql_ast_vars)
+    if isinstance(template, str):
+        return template
+    resolved = analyzer.eval(sql_node)
+    return resolved if isinstance(resolved, str) else None
+
+
+def _single_table_own_columns(template: Optional[str]):
+    """(TABLE, [columns]) for a single-table, subquery-free statement.
+
+    Only unqualified columns (or ones qualified with the table's own name)
+    are attributed to the table; alias-qualified references (``v.o_id``)
+    are skipped. Returns None when the statement is not analyzable.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:
+        return None
+    if not isinstance(template, str):
+        return None
+    normalized = template.replace("%s", "0").replace("%%", "%")
+    try:
+        tree = sqlglot.parse_one(normalized, read="postgres")
+    except Exception:
+        return None
+    if tree is None or len(list(tree.find_all(exp.Table))) != 1:
+        return None
+    if list(tree.find_all(exp.Subquery)):
+        return None
+    table = next(iter(tree.find_all(exp.Table))).name or ""
+    if not table:
+        return None
+    columns = [
+        col.name.upper()
+        for col in tree.find_all(exp.Column)
+        if col.name and (not col.table or col.table.upper() == table.upper())
+    ]
+    return (table.upper(), columns)
+
+
+def table_column_vocab_sql(source: str) -> Dict[str, set]:
+    """Every column ever mentioned per table (single-table statements only)."""
+    vocab: Dict[str, set] = {}
+    for _name, analyzer in _iter_analyzed(source):
+        for sql_node, _line in _iter_call_sql_nodes(analyzer):
+            parsed = _single_table_own_columns(
+                _resolve_sql(analyzer, sql_node)
+            )
+            if parsed is None:
+                continue
+            table, columns = parsed
+            vocab.setdefault(table, set()).update(columns)
+    return vocab
+
+
+def table_column_sites_sql(source: str) -> List[dict]:
+    """Every (function, line, table, column) reference, single-table only."""
+    sites: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        for sql_node, line in _iter_call_sql_nodes(analyzer):
+            parsed = _single_table_own_columns(
+                _resolve_sql(analyzer, sql_node)
+            )
+            if parsed is None:
+                continue
+            table, columns = parsed
+            for column in columns:
+                key = (name, line, table, column)
+                if key in seen:
+                    continue
+                seen.add(key)
+                sites.append(
+                    {"function": name, "line": line, "table": table, "column": column}
+                )
+    return sites
+
+
+def wrong_table_column_sql(original_source: str, optimized_source: str) -> List[dict]:
+    """Rewrite columns that belong to a different table than the one queried.
+
+    Catches ``... FROM ORDER_LINE WHERE ... (O_D_ID = %s AND O_ID = %s)``:
+    ``O_D_ID`` never appears for ``ORDER_LINE`` anywhere in the original, but
+    does appear for ``ORDERS`` — so the predicate references columns that do
+    not exist on the queried table and matches nothing (or raises). Only
+    flags confusion with a table the original knows; genuinely new columns
+    are skipped to allow legitimate projection widening.
+    """
+    orig_vocab = table_column_vocab_sql(original_source)
+    if not orig_vocab:
+        return []
+    known_elsewhere: Dict[str, set] = {}
+    for table, columns in orig_vocab.items():
+        for column in columns:
+            known_elsewhere.setdefault(column, set()).add(table)
+    violations: List[dict] = []
+    seen = set()
+    for site in table_column_sites_sql(optimized_source):
+        table, column = site["table"], site["column"]
+        if column in orig_vocab.get(table, set()):
+            continue
+        owners = known_elsewhere.get(column, set()) - {table}
+        if not owners:
+            continue
+        key = (site["function"], site["line"], table, column)
+        if key in seen:
+            continue
+        seen.add(key)
+        violations.append(
+            {
+                "function": site["function"],
+                "line": site["line"],
+                "table": table,
+                "column": column,
+                "belongs_to": sorted(owners),
+            }
+        )
+    return violations
+
+
+def insert_column_values_arity_sql(source: str) -> List[dict]:
+    """INSERT with an explicit column list whose VALUES row width differs.
+
+    Catches ``INSERT INTO t (a, b, c) VALUES (%s, %s)``: the column count and
+    the value count disagree, so the statement fails for every row. Statements
+    without a column list, ``INSERT ... SELECT``, and dynamic VALUES fragments
+    are skipped.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:
+        return []
+    violations: List[dict] = []
+    seen = set()
+    for name, analyzer in _iter_analyzed(source):
+        for sql_node, line in _iter_call_sql_nodes(analyzer):
+            template = _resolve_sql(analyzer, sql_node)
+            if not isinstance(template, str):
+                continue
+            normalized = template.replace("%s", "0").replace("%%", "%")
+            try:
+                tree = sqlglot.parse_one(normalized, read="postgres")
+            except Exception:
+                continue
+            if tree is None or not isinstance(tree, exp.Insert):
+                continue
+            schema = tree.args.get("this")
+            if not isinstance(schema, exp.Schema):
+                continue
+            columns = [
+                c.name
+                for c in schema.expressions
+                if isinstance(c, (exp.Column, exp.Identifier))
+            ]
+            if not columns:
+                continue
+            values = tree.args.get("expression")
+            if not isinstance(values, exp.Values):
+                continue
+            widths = set()
+            dynamic = False
+            for row in values.expressions:
+                if not isinstance(row, exp.Tuple):
+                    dynamic = True
+                    break
+                widths.add(len(row.expressions))
+            if dynamic or len(widths) != 1 or next(iter(widths)) == len(columns):
+                continue
+            key = (name, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            table = schema.this.name if isinstance(schema.this, exp.Table) else ""
+            violations.append(
+                {
+                    "function": name,
+                    "line": line,
+                    "table": table.upper(),
+                    "columns": len(columns),
+                    "values": next(iter(widths)),
+                }
+            )
     return violations
 
 

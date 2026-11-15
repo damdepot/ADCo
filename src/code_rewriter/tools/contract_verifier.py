@@ -29,6 +29,11 @@ from .sql_analysis import (
     dynamic_placeholder_arity_sql,
     values_alias_arity_sql,
     composite_tuple_order_sql,
+    batched_write_tuple_order_sql,
+    write_tables_sql,
+    wrong_table_column_sql,
+    insert_column_values_arity_sql,
+    returned_select_modifiers_sql,
     table_column_prefix_mismatch_sql,
     ambiguous_values_alias_sql,
     statement_placeholder_sql,
@@ -854,6 +859,24 @@ def verify_contract(
         ))
 
     for site in _new_sites(
+        batched_write_tuple_order_sql,
+        lambda v: (v["function"], v["line"]),
+    ):
+        violations.append(VerificationViolation(
+            code="BATCHED_WRITE_TUPLE_ORDER",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} passes batched tuples "
+                f"({', '.join(site['tuple_order'])}) to a statement whose WHERE keys are "
+                f"({', '.join(site['columns'])}); the matching order is "
+                f"({', '.join(site['expected_order'])}). A swapped key order makes the "
+                "write silently match no rows, so the paired update/delete diverges "
+                "(e.g. O_CARRIER_ID set but NEW_ORDER row still present). Use the key order "
+                "of the target statement."
+            ),
+        ))
+
+    for site in _new_sites(
         table_column_prefix_mismatch_sql,
         lambda v: (v["function"], v["line"], v["column"]),
     ):
@@ -932,6 +955,97 @@ def verify_contract(
                 "separate statement."
             ),
         ))
+
+    original_writes = write_tables_sql(original_source)
+    optimized_writes = write_tables_sql(optimized_source)
+    for fn_name, opt_tables in optimized_writes.items():
+        if not _in_target_regions(fn_name):
+            continue
+        orig_tables = original_writes.get(fn_name, set())
+        if not orig_tables:
+            continue
+        for missing in sorted(orig_tables - opt_tables):
+            violations.append(VerificationViolation(
+                code="WRITE_SET_CHANGED",
+                severity="ERROR",
+                message=(
+                    f"Function {fn_name} wrote {missing[0]} {missing[1]} in the original "
+                    "but has no such write in the rewrite. A dropped per-table write "
+                    "silently diverges state (e.g. O_CARRIER_ID set but the NEW_ORDER row "
+                    "still present). Restore the missing write for every table the "
+                    "original wrote."
+                ),
+                expected=sorted(f"{verb} {table}" for verb, table in orig_tables),
+                actual=sorted(f"{verb} {table}" for verb, table in opt_tables),
+            ))
+        for extra in sorted(opt_tables - orig_tables):
+            violations.append(VerificationViolation(
+                code="WRITE_SET_CHANGED",
+                severity="ERROR",
+                message=(
+                    f"Function {fn_name} writes {extra[0]} {extra[1]} but the original "
+                    "never wrote that table. An extra write corrupts state the original "
+                    "left untouched. Remove it or write only the original tables."
+                ),
+                expected=sorted(f"{verb} {table}" for verb, table in orig_tables),
+                actual=sorted(f"{verb} {table}" for verb, table in opt_tables),
+            ))
+
+    for site in wrong_table_column_sql(original_source, optimized_source):
+        if not _in_target_regions(site["function"]):
+            continue
+        violations.append(VerificationViolation(
+            code="WRONG_TABLE_COLUMN",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} references column {site['column']} on table "
+                f"{site['table']}, but the original never uses that column for that table "
+                f"(it uses it for {', '.join(site['belongs_to'])}). The column does not "
+                "exist on the queried table, so the predicate matches nothing or raises "
+                "UndefinedColumn. Use the queried table's own key columns."
+            ),
+        ))
+
+    for site in _new_sites(
+        insert_column_values_arity_sql,
+        lambda v: (v["function"], v["line"]),
+    ):
+        violations.append(VerificationViolation(
+            code="INSERT_COLUMN_VALUES_MISMATCH",
+            severity="ERROR",
+            message=(
+                f"Function {site['function']} inserts into {site['table'] or 'the table'} "
+                f"with {site['columns']} column(s) but {site['values']} value(s) per row. "
+                "The column count and the VALUES width disagree, so the statement fails "
+                "for every row. Make the VALUES row match the column list."
+            ),
+        ))
+
+    original_modifiers = returned_select_modifiers_sql(original_source)
+    optimized_modifiers = returned_select_modifiers_sql(optimized_source)
+    for fn_name, variables in optimized_modifiers.items():
+        if not _in_target_regions(fn_name):
+            continue
+        original_variables = original_modifiers.get(fn_name, {})
+        for variable, mods in variables.items():
+            original_mods = original_variables.get(variable)
+            if not original_mods:
+                continue
+            for key in ("order_by", "limit"):
+                if True in original_mods.get(key, []) and True not in mods.get(key, []):
+                    violations.append(VerificationViolation(
+                        code="RETURN_ORDER_CHANGED",
+                        severity="ERROR",
+                        message=(
+                            f"Function {fn_name} returns '{variable}' from a SELECT that "
+                            f"dropped {'ORDER BY' if key == 'order_by' else 'LIMIT'} present "
+                            "in the original. Without it the rewrite returns an arbitrary "
+                            "row (e.g. latest order per customer) instead of the "
+                            "deterministic one. Keep the ORDER BY / LIMIT clauses."
+                        ),
+                        expected=original_mods,
+                        actual=mods,
+                    ))
 
     original_row_widths = returned_row_widths_sql(original_source)
     optimized_row_widths = returned_row_widths_sql(optimized_source)

@@ -5,8 +5,13 @@ import pytest
 from src.code_rewriter.tools.sql_analysis import (
     composite_any_array_sql,
     ambiguous_values_alias_sql,
+    batched_write_tuple_order_sql,
     composite_tuple_order_sql,
     empty_params_with_placeholders_sql,
+    write_tables_sql,
+    wrong_table_column_sql,
+    insert_column_values_arity_sql,
+    returned_select_modifiers_sql,
     mogrify_with_params_sql,
     returned_row_widths_sql,
     statement_placeholder_sql,
@@ -1057,3 +1062,217 @@ def update(self, a, b):
     self.cursor.execute("UPDATE t SET x = %s WHERE y = %s", [a, b])
 '''
     assert empty_params_with_placeholders_sql(source) == []
+
+
+def test_table_column_prefix_mismatch_sees_dynamic_join_fragment():
+    source = '''
+def doDelivery(self, params):
+    order_keys = params["keys"]
+    placeholders = " OR ".join(["(O_D_ID = %s AND O_ID = %s)"] * len(order_keys))
+    self.cursor.execute(
+        f"SELECT SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_W_ID = %s AND ({placeholders})",
+        params["params"],
+    )
+'''
+    violations = table_column_prefix_mismatch_sql(source)
+    assert {v["column"] for v in violations} == {"O_D_ID", "O_ID"}
+    assert all(v["expected_prefix"] == "OL" for v in violations)
+
+
+def test_table_column_prefix_mismatch_dynamic_fragment_accepts_orders():
+    source = '''
+def doDelivery(self, params):
+    order_keys = params["keys"]
+    placeholders = " OR ".join(["(O_D_ID = %s AND O_ID = %s)"] * len(order_keys))
+    self.cursor.execute(
+        f"SELECT O_D_ID, O_ID, O_C_ID FROM ORDERS WHERE O_W_ID = %s AND ({placeholders})",
+        params["params"],
+    )
+'''
+    assert table_column_prefix_mismatch_sql(source) == []
+
+
+def test_composite_tuple_order_flags_loop_built_param_list():
+    source = '''
+def doDelivery(self, params):
+    order_tuples = [(no_o_id, d_id, w_id) for d_id, no_o_id in params["orders"]]
+    flat = []
+    for t in order_tuples:
+        flat.extend(t)
+    self.cursor.execute(
+        "DELETE FROM NEW_ORDER WHERE (NO_D_ID, NO_W_ID, NO_O_ID) IN (%s)",
+        flat,
+    )
+'''
+    violations = composite_tuple_order_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["tuple_order"] == ["no_o_id", "d_id", "w_id"]
+    assert violations[0]["expected_order"] == ["no_o_id", "no_d_id", "no_w_id"]
+
+
+def test_composite_tuple_order_accepts_loop_built_correct_delete():
+    source = '''
+def doDelivery(self, params):
+    delete_tuples = [(d_id, w_id, no_o_id) for d_id, no_o_id in params["orders"]]
+    flat = []
+    for t in delete_tuples:
+        flat.extend(t)
+    self.cursor.execute(
+        "DELETE FROM NEW_ORDER WHERE (NO_D_ID, NO_W_ID, NO_O_ID) IN (%s)",
+        flat,
+    )
+'''
+    assert composite_tuple_order_sql(source) == []
+
+
+BATCHED_DELIVERY_WRITES = '''
+TXN_QUERIES = {"DELIVERY": {
+    "deleteNewOrder": "DELETE FROM NEW_ORDER WHERE NO_D_ID = %s AND NO_W_ID = %s AND NO_O_ID = %s",
+    "updateOrders": "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+}}
+class D:
+    def doDelivery(self, params):
+        q = TXN_QUERIES["DELIVERY"]
+        __BODY__
+        self.cursor.execute_batch(self.cursor, q["deleteNewOrder"], deletes)
+        self.cursor.execute_batch(self.cursor, q["updateOrders"], updates)
+'''
+
+
+def test_batched_write_tuple_order_flags_reused_orders_key_order():
+    source = BATCHED_DELIVERY_WRITES.replace(
+        "__BODY__",
+        """
+        order_tuples = [(no_o_id, d_id, w_id) for d_id, no_o_id in params["orders"]]
+        deletes = order_tuples
+        updates = order_tuples
+""",
+    )
+    violations = batched_write_tuple_order_sql(source)
+    assert len(violations) == 1
+    assert violations[0]["columns"] == ["no_d_id", "no_w_id", "no_o_id"]
+    assert violations[0]["tuple_order"] == ["no_o_id", "d_id", "w_id"]
+    assert violations[0]["expected_order"] == ["no_o_id", "no_d_id", "no_w_id"]
+
+
+def test_batched_write_tuple_order_accepts_each_table_key_order():
+    source = BATCHED_DELIVERY_WRITES.replace(
+        "__BODY__",
+        """
+        deletes = [(d_id, w_id, no_o_id) for d_id, no_o_id in params["orders"]]
+        updates = [(params["carrier"], no_o_id, d_id, w_id) for d_id, no_o_id in params["orders"]]
+""",
+    )
+    assert batched_write_tuple_order_sql(source) == []
+
+
+def test_write_tables_includes_execute_batch():
+    source = '''
+TXN_QUERIES = {"DELIVERY": {
+    "deleteNewOrder": "DELETE FROM NEW_ORDER WHERE NO_D_ID = %s AND NO_W_ID = %s AND NO_O_ID = %s",
+    "updateOrders": "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+}}
+class D:
+    def doDelivery(self, params):
+        q = TXN_QUERIES["DELIVERY"]
+        from psycopg2.extras import execute_batch
+        execute_batch(self.cursor, q["deleteNewOrder"], params["deletes"])
+        execute_batch(self.cursor, q["updateOrders"], params["updates"])
+'''
+    assert write_tables_sql(source)["D.doDelivery"] == {
+        ("DELETE", "NEW_ORDER"), ("UPDATE", "ORDERS"),
+    }
+
+
+def test_write_tables_drops_are_visible_as_set_difference():
+    source = '''
+class D:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s",
+            [params["c"], params["o"]],
+        )
+'''
+    assert write_tables_sql(source)["D.doDelivery"] == {("UPDATE", "ORDERS")}
+
+
+def test_returned_modifiers_tracks_order_by_and_limit():
+    source = '''
+class D:
+    def doOrderStatus(self, params):
+        self.cursor.execute(
+            "SELECT O_ID, O_CARRIER_ID, O_ENTRY_D FROM ORDERS WHERE O_W_ID = %s ORDER BY O_ID DESC LIMIT 1",
+            [params["w"]],
+        )
+        order = self.cursor.fetchone()
+        self.cursor.execute("SELECT C_ID FROM CUSTOMER WHERE C_W_ID = %s", [params["w"]])
+        customer = self.cursor.fetchone()
+        return [customer, order]
+'''
+    mods = returned_select_modifiers_sql(source)["D.doOrderStatus"]
+    assert mods["order"] == {"order_by": [True], "limit": [True]}
+    assert mods["customer"] == {"order_by": [False], "limit": [False]}
+
+
+def test_wrong_table_column_flags_orders_key_in_order_line():
+    orig = '''
+class D:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "SELECT O_C_ID FROM ORDERS WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+            params["p"],
+        )
+        self.cursor.execute(
+            "SELECT SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_W_ID = %s AND OL_D_ID = %s",
+            params["p"],
+        )
+'''
+    bad = '''
+def doDelivery(self, params):
+    order_keys = params["keys"]
+    placeholders = " OR ".join(["(O_D_ID = %s AND O_ID = %s)"] * len(order_keys))
+    self.cursor.execute(
+        f"SELECT SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_W_ID = %s AND ({placeholders})",
+        params["p"],
+    )
+'''
+    violations = wrong_table_column_sql(orig, bad)
+    assert {v["column"] for v in violations} == {"O_D_ID", "O_ID"}
+    assert all(v["table"] == "ORDER_LINE" and v["belongs_to"] == ["ORDERS"] for v in violations)
+
+
+def test_wrong_table_column_accepts_own_columns():
+    orig = '''
+class D:
+    def f(self, params):
+        self.cursor.execute("SELECT O_C_ID FROM ORDERS WHERE O_ID = %s", params["p"])
+'''
+    good = '''
+def f(self, params):
+    self.cursor.execute("SELECT O_ID, O_C_ID FROM ORDERS WHERE O_W_ID = %s", params["p"])
+'''
+    assert wrong_table_column_sql(orig, good) == []
+
+
+def test_insert_column_values_arity_flags_short_row():
+    source = '''
+def doNewOrder(self, params):
+    self.cursor.execute(
+        "INSERT INTO ORDER_LINE (OL_O_ID, OL_D_ID, OL_W_ID) VALUES (%s, %s)",
+        params["p"],
+    )
+'''
+    violations = insert_column_values_arity_sql(source)
+    assert len(violations) == 1
+    assert (violations[0]["columns"], violations[0]["values"]) == (3, 2)
+
+
+def test_insert_column_values_arity_accepts_matching_row():
+    source = '''
+def doNewOrder(self, params):
+    self.cursor.execute(
+        "INSERT INTO ORDER_LINE (OL_O_ID, OL_D_ID, OL_W_ID) VALUES (%s, %s, %s)",
+        params["p"],
+    )
+'''
+    assert insert_column_values_arity_sql(source) == []

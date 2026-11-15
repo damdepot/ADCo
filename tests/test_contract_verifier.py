@@ -1369,3 +1369,187 @@ def test_verify_reports_empty_params_with_placeholders():
     assert len(empty) == 1
     assert empty[0].severity == "ERROR"
     assert "list index out of range" in empty[0].message
+
+
+DELIVERY_DYNAMIC_PREFIX_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "SELECT OL_D_ID, OL_O_ID, SUM(OL_AMOUNT) FROM ORDER_LINE "
+            "WHERE OL_W_ID = %s AND OL_D_ID = %s AND OL_O_ID = %s",
+            [params["w_id"], params["d_id"], params["no_o_id"]],
+        )
+        return []
+"""
+
+DELIVERY_DYNAMIC_PREFIX_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        order_keys = params["keys"]
+        placeholders = " OR ".join(["(O_D_ID = %s AND O_ID = %s)"] * len(order_keys))
+        self.cursor.execute(
+            f"SELECT SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_W_ID = %s AND ({placeholders})",
+            params["params"],
+        )
+        return []
+"""
+
+
+def test_verify_reports_dynamic_foreign_prefix():
+    result = verify_contract(
+        DELIVERY_DYNAMIC_PREFIX_ORIGINAL,
+        DELIVERY_DYNAMIC_PREFIX_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    prefix = [v for v in result.violations if v.code == "TABLE_COLUMN_PREFIX_MISMATCH"]
+    assert len(prefix) == 2
+    assert all(v.severity == "ERROR" for v in prefix)
+
+
+DELIVERY_BATCH_ORDER_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        for d_id, no_o_id in params["orders"]:
+            self.cursor.execute(
+                "DELETE FROM NEW_ORDER WHERE NO_D_ID = %s AND NO_W_ID = %s AND NO_O_ID = %s",
+                [d_id, params["w_id"], no_o_id],
+            )
+        return []
+"""
+
+DELIVERY_BATCH_ORDER_BROKEN = """
+TXN_QUERIES = {"DELIVERY": {
+    "deleteNewOrder": "DELETE FROM NEW_ORDER WHERE NO_D_ID = %s AND NO_W_ID = %s AND NO_O_ID = %s",
+}}
+class Delivery:
+    def doDelivery(self, params):
+        q = TXN_QUERIES["DELIVERY"]
+        order_tuples = [(no_o_id, d_id, params["w_id"]) for d_id, no_o_id in params["orders"]]
+        self.cursor.execute_batch(self.cursor, q["deleteNewOrder"], order_tuples)
+        return []
+"""
+
+
+def test_verify_reports_batched_write_tuple_order():
+    result = verify_contract(
+        DELIVERY_BATCH_ORDER_ORIGINAL,
+        DELIVERY_BATCH_ORDER_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    order = [v for v in result.violations if v.code == "BATCHED_WRITE_TUPLE_ORDER"]
+    assert len(order) == 1
+    assert order[0].severity == "ERROR"
+    assert "NO_D_ID" in order[0].message or "no_d_id" in order[0].message
+
+
+DELIVERY_WRITE_ORIGINAL = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "DELETE FROM NEW_ORDER WHERE NO_D_ID = %s AND NO_W_ID = %s AND NO_O_ID = %s",
+            [params["d"], params["w"], params["o"]],
+        )
+        self.cursor.execute(
+            "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s",
+            [params["c"], params["o"]],
+        )
+        return []
+"""
+
+DELIVERY_WRITE_DROPPED = """
+class Delivery:
+    def doDelivery(self, params):
+        self.cursor.execute(
+            "UPDATE ORDERS SET O_CARRIER_ID = %s WHERE O_ID = %s",
+            [params["c"], params["o"]],
+        )
+        return []
+"""
+
+ORDER_LIMIT_ORIGINAL = """
+class Status:
+    def doOrderStatus(self, params):
+        self.cursor.execute(
+            "SELECT O_ID, O_CARRIER_ID, O_ENTRY_D FROM ORDERS WHERE O_W_ID = %s ORDER BY O_ID DESC LIMIT 1",
+            [params["w"]],
+        )
+        order = self.cursor.fetchone()
+        return [order]
+"""
+
+ORDER_LIMIT_DROPPED = """
+class Status:
+    def doOrderStatus(self, params):
+        self.cursor.execute(
+            "SELECT O_ID, O_CARRIER_ID, O_ENTRY_D FROM ORDERS WHERE O_W_ID = %s",
+            [params["w"]],
+        )
+        order = self.cursor.fetchone()
+        return [order]
+"""
+
+
+def test_verify_reports_dropped_write_table():
+    result = verify_contract(
+        DELIVERY_WRITE_ORIGINAL,
+        DELIVERY_WRITE_DROPPED,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    writes = [v for v in result.violations if v.code == "WRITE_SET_CHANGED"]
+    assert len(writes) == 1
+    assert writes[0].severity == "ERROR"
+    assert "DELETE NEW_ORDER" in writes[0].message
+
+
+def test_verify_reports_dropped_order_by_limit():
+    result = verify_contract(
+        ORDER_LIMIT_ORIGINAL,
+        ORDER_LIMIT_DROPPED,
+        _static_check_contract("doOrderStatus"),
+    )
+    assert result.status == "FAIL"
+    shapes = [v for v in result.violations if v.code == "RETURN_ORDER_CHANGED"]
+    assert len(shapes) == 2
+    assert all(v.severity == "ERROR" for v in shapes)
+
+
+DELIVERY_WRONG_COLUMN_ORIGINAL = """
+TXN_QUERIES = {"DELIVERY": {
+    "getCId": "SELECT O_C_ID FROM ORDERS WHERE O_ID = %s AND O_D_ID = %s AND O_W_ID = %s",
+    "sumOLAmount": "SELECT SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_O_ID = %s AND OL_D_ID = %s AND OL_W_ID = %s",
+}}
+class Delivery:
+    def doDelivery(self, params):
+        q = TXN_QUERIES["DELIVERY"]
+        self.cursor.execute(q["getCId"], [params["o"], params["d"], params["w"]])
+        self.cursor.execute(q["sumOLAmount"], [params["o"], params["d"], params["w"]])
+        return []
+"""
+
+DELIVERY_WRONG_COLUMN_BROKEN = """
+class Delivery:
+    def doDelivery(self, params):
+        order_keys = params["keys"]
+        placeholders = " OR ".join(["(O_D_ID = %s AND O_ID = %s)"] * len(order_keys))
+        self.cursor.execute(
+            f"SELECT SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_W_ID = %s AND ({placeholders})",
+            params["p"],
+        )
+        return []
+"""
+
+
+def test_verify_reports_wrong_table_column():
+    result = verify_contract(
+        DELIVERY_WRONG_COLUMN_ORIGINAL,
+        DELIVERY_WRONG_COLUMN_BROKEN,
+        _static_check_contract("doDelivery"),
+    )
+    assert result.status == "FAIL"
+    wrong = [v for v in result.violations if v.code == "WRONG_TABLE_COLUMN"]
+    assert len(wrong) == 2
+    assert all(v.severity == "ERROR" for v in wrong)
+    assert all("ORDER_LINE" in v.message for v in wrong)
